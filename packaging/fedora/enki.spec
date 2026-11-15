@@ -6,7 +6,7 @@ Release:        1%{?dist}
 Summary:        Use your phone as a webcam, microphone and screen source
 
 License:        GPL-3.0-or-later
-URL:            https://github.com/oopnm/PhoneCam-Studio
+URL:            https://github.com/oopnm/Enki
 Source0:        %{name}-%{version}.tar.gz
 
 BuildRequires:  cargo rust gcc gtk4-devel pkgconfig

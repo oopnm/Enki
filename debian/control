@@ -4,7 +4,7 @@ Priority: optional
 Maintainer: Ahmed Al-Iraqi <ahmed@local>
 Build-Depends: debhelper-compat (= 13), cargo, rustc, libgtk-4-dev, libglib2.0-dev
 Standards-Version: 4.6.0
-Homepage: https://github.com/oopnm/PhoneCam-Studio
+Homepage: https://github.com/oopnm/Enki
 
 Package: enki
 Architecture: any
