@@ -50,6 +50,15 @@ After the preamble: a sequence of messages, each a `u32` length followed by that
 | `state` | phone → PC | current stream state and applied settings |
 | `error` | both | `{"type":"error","code":"camera_in_use","message":"..."}` |
 
+### Settings implemented so far
+
+| Key | Values | Behavior |
+|---|---|---|
+| `camera.facing` | `"back"`, `"front"` | Chooses the camera. The phone remembers it and uses it for the next media connection; if a media stream is running it switches camera at once (a new config + key frame follows). The phone confirms with `{"type":"state","key":"camera.facing","value":"front"}`, or answers `{"type":"error","code":"bad_value",...}`. |
+
+The PC opens the control connection first, sends `camera.facing`, waits briefly for the `state` reply
+(old phone apps never reply, so it gives up after 1 s), and only then opens the media connection.
+
 The desktop UI is built from `capabilities`; a setting the phone does not report is not shown.
 Unknown message types and unknown keys are ignored, so newer peers can talk to older ones.
 

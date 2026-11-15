@@ -20,6 +20,7 @@ import java.net.ServerSocket
 import java.net.Socket
 import java.util.Collections
 import java.util.concurrent.atomic.AtomicBoolean
+import org.json.JSONException
 import org.json.JSONObject
 
 /**
@@ -38,6 +39,47 @@ class LinkServer(
     private val mediaBusy = AtomicBoolean(false)
     private val clients: MutableSet<Socket> = Collections.synchronizedSet(HashSet())
     private var server: ServerSocket? = null
+
+    /** Which camera the next (or running) media session uses: "back" or "front". Guarded by [mediaLock]. */
+    private var facing = "back"
+    private val mediaLock = Any()
+    private var activeMedia: MediaSession? = null
+
+    /** Owns the camera pipeline of one media connection and can swap it for the other camera while streaming. */
+    private inner class MediaSession(private val queue: FrameQueue, private val onError: (String) -> Unit) {
+        private var streamer: CameraStreamer? = null
+        private var closed = false
+
+        fun start() {
+            synchronized(mediaLock) {
+                if (!closed) streamer = CameraStreamer(context, queue, facing, onError).also { it.start() }
+            }
+        }
+
+        fun switchCamera() {
+            synchronized(mediaLock) {
+                if (closed) return
+                streamer?.stop()
+                streamer = CameraStreamer(context, queue, facing, onError).also { it.start() }
+            }
+        }
+
+        fun stop() {
+            synchronized(mediaLock) {
+                closed = true
+                streamer?.stop()
+                streamer = null
+            }
+        }
+    }
+
+    /** Returns true if the setting changed. A running stream switches camera right away. */
+    private fun setFacing(value: String): Boolean = synchronized(mediaLock) {
+        if (facing == value) return false
+        facing = value
+        activeMedia?.switchCamera()
+        true
+    }
 
     /** Binds the port and starts accepting. Throws [IOException] if the port is taken. */
     fun start() {
@@ -100,20 +142,22 @@ class LinkServer(
         }
         val queue = FrameQueue(QUEUE_FRAMES)
         var cameraError: String? = null
-        val streamer = CameraStreamer(context, queue) { message ->
+        val session = MediaSession(queue) { message ->
             cameraError = message
             queue.close()
         }
+        synchronized(mediaLock) { activeMedia = session }
         try {
             status(STREAMING)
-            streamer.start()
+            session.start()
             val writer = MediaFrameWriter(out)
             while (true) {
                 val frame = queue.take() ?: break
                 writer.write(frame)
             }
         } finally {
-            streamer.stop()
+            synchronized(mediaLock) { if (activeMedia === session) activeMedia = null }
+            session.stop()
             queue.close()
             mediaBusy.set(false)
             val error = cameraError
@@ -121,7 +165,7 @@ class LinkServer(
         }
     }
 
-    /** Phase 1: say hello and read (and ignore) whatever the PC sends; capabilities and settings come later. */
+    /** Says hello, then handles `set camera.facing`; other messages are read and ignored (see docs/protocol.md). */
     private fun serveControl(input: DataInputStream, out: OutputStream) {
         val hello = JSONObject()
             .put("type", "hello")
@@ -133,8 +177,24 @@ class LinkServer(
         while (true) {
             val len = input.readInt()
             if (len < 0 || len > Link.MAX_CONTROL) throw ProtocolException("bad control message length $len")
-            input.readFully(ByteArray(len)) // Phase 1 ignores control messages
+            val body = ByteArray(len).also { input.readFully(it) }
+            val message = try { JSONObject(String(body, Charsets.UTF_8)) } catch (e: JSONException) { continue }
+            if (message.optString("type") == "set" && message.optString("key") == "camera.facing") {
+                val value = message.optString("value")
+                if (value == "front" || value == "back") {
+                    setFacing(value)
+                    reply(out, JSONObject().put("type", "state").put("key", "camera.facing").put("value", value))
+                } else {
+                    reply(out, JSONObject().put("type", "error").put("code", "bad_value")
+                        .put("message", "camera.facing must be \"front\" or \"back\""))
+                }
+            }
         }
+    }
+
+    private fun reply(out: OutputStream, json: JSONObject) {
+        out.write(encodeControlMessage(json.toString()))
+        out.flush()
     }
 
     companion object {

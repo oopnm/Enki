@@ -9,9 +9,10 @@
 use enki_protocol::{Channel, FrameHeader, Kind, Preamble, FLAG_DISCONTINUITY, FRAME_HEADER_LEN, PREAMBLE_LEN};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::net::tcp::OwnedWriteHalf;
 use tokio::net::TcpStream;
 use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot};
@@ -19,6 +20,38 @@ use tokio::sync::{mpsc, oneshot};
 pub const DEFAULT_PORT: u16 = 28200;
 const RETRY_DELAY: Duration = Duration::from_millis(1500);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3);
+/// How long to wait for the phone to confirm a setting before streaming anyway (older apps never confirm).
+const ACK_TIMEOUT: Duration = Duration::from_secs(1);
+const MAX_CONTROL: usize = 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Facing {
+    Back,
+    Front,
+}
+
+impl Facing {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Facing::Back => "back",
+            Facing::Front => "front",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Facing::Back => "الخلفية",
+            Facing::Front => "الأمامية",
+        }
+    }
+}
+
+/// Requests a UI can send to a running session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Control {
+    /// Switch the phone camera, also while streaming.
+    SetFacing(Facing),
+}
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -27,6 +60,12 @@ pub struct Config {
     pub port: u16,
     /// Frame rate the decoder assumes (the stream carries no reliable rate in the H.264 headers).
     pub fps: u32,
+    /// Which phone camera to use at the start (can be changed live with [`Control::SetFacing`]).
+    pub facing: Facing,
+    /// Rotate the picture clockwise: 0, 90, 180 or 270 degrees. Applied when the stream starts.
+    pub rotate: u16,
+    /// Mirror the picture horizontally. Applied when the stream starts.
+    pub mirror: bool,
     pub adb: String,
     pub ffmpeg: String,
     /// Run `adb forward` before connecting. Tests turn this off.
@@ -41,6 +80,9 @@ impl Config {
             device: device.into(),
             port: DEFAULT_PORT,
             fps: 30,
+            facing: Facing::Back,
+            rotate: 0,
+            mirror: false,
             adb: "adb".into(),
             ffmpeg: "ffmpeg".into(),
             setup_adb: true,
@@ -79,10 +121,38 @@ fn log(tx: &Tx, text: impl Into<String>) {
     let _ = tx.send(Event::Log(text.into()));
 }
 
+/// State shared between the session loop and the command task.
+struct Shared {
+    facing: Mutex<Facing>,
+    /// Write half of the current control connection (None while not connected).
+    writer: tokio::sync::Mutex<Option<OwnedWriteHalf>>,
+}
+
 /// Runs until `stop` fires. Always ends with `Event::State(State::Stopped)`.
 pub async fn run(cfg: Config, tx: Tx, stop: oneshot::Receiver<()>) {
+    let (_keep_open, cmds) = mpsc::unbounded_channel();
+    run_with_commands(cfg, tx, stop, cmds).await;
+}
+
+/// Like [`run`], and also applies [`Control`] messages (for example a live camera switch) while running.
+pub async fn run_with_commands(
+    cfg: Config,
+    tx: Tx,
+    stop: oneshot::Receiver<()>,
+    mut cmds: mpsc::UnboundedReceiver<Control>,
+) {
+    let shared = Arc::new(Shared { facing: Mutex::new(cfg.facing), writer: tokio::sync::Mutex::new(None) });
+    let command_task = {
+        let shared = shared.clone();
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            while let Some(Control::SetFacing(facing)) = cmds.recv().await {
+                apply_facing(&shared, &tx, facing).await;
+            }
+        })
+    };
     tokio::select! {
-        result = run_inner(&cfg, &tx) => {
+        result = run_inner(&cfg, &tx, &shared) => {
             if let Err(message) = result {
                 log(&tx, format!("❌ {message}\n"));
             }
@@ -90,10 +160,87 @@ pub async fn run(cfg: Config, tx: Tx, stop: oneshot::Receiver<()>) {
         _ = stop => log(&tx, "🛑 تم إيقاف البث.\n"),
     }
     // Dropping run_inner's future above also kills ffmpeg (kill_on_drop).
+    command_task.abort();
     let _ = tx.send(Event::State(State::Stopped));
 }
 
-async fn run_inner(cfg: &Config, tx: &Tx) -> Result<(), String> {
+async fn apply_facing(shared: &Shared, tx: &Tx, facing: Facing) {
+    *shared.facing.lock().unwrap() = facing;
+    let mut writer = shared.writer.lock().await;
+    if let Some(w) = writer.as_mut() {
+        match write_control(w, &set_facing_json(facing)).await {
+            Ok(()) => log(tx, format!("🔄 تبديل الكاميرا إلى {}\n", facing.label())),
+            Err(e) => {
+                *writer = None;
+                log(tx, format!("⚠️ تعذر إرسال تبديل الكاميرا إلى الهاتف: {e}\n"));
+            }
+        }
+    }
+    // Not connected yet: the new value is sent as soon as the next connection is made.
+}
+
+fn set_facing_json(facing: Facing) -> String {
+    format!(r#"{{"type":"set","key":"camera.facing","value":"{}"}}"#, facing.as_str())
+}
+
+/// Control messages are a big-endian u32 length followed by UTF-8 JSON (docs/protocol.md).
+async fn write_control<W: AsyncWriteExt + Unpin>(w: &mut W, json: &str) -> std::io::Result<()> {
+    let body = json.as_bytes();
+    let mut msg = Vec::with_capacity(4 + body.len());
+    msg.extend_from_slice(&(body.len() as u32).to_be_bytes());
+    msg.extend_from_slice(body);
+    w.write_all(&msg).await?;
+    w.flush().await
+}
+
+async fn read_control<R: AsyncReadExt + Unpin>(r: &mut R) -> std::io::Result<String> {
+    let mut len = [0u8; 4];
+    r.read_exact(&mut len).await?;
+    let len = u32::from_be_bytes(len) as usize;
+    if len > MAX_CONTROL {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "control message too large"));
+    }
+    let mut body = vec![0u8; len];
+    r.read_exact(&mut body).await?;
+    Ok(String::from_utf8_lossy(&body).into_owned())
+}
+
+/// Connects the control channel, tells the phone which camera to use and waits briefly for its
+/// confirmation, so the camera that opens next is the right one. Returns a task that reads (and logs
+/// errors from) the rest of the connection, or None if the phone app is not listening.
+async fn open_control(cfg: &Config, shared: &Arc<Shared>, tx: &Tx) -> Option<tokio::task::JoinHandle<()>> {
+    let mut s = TcpStream::connect(("127.0.0.1", cfg.port)).await.ok()?;
+    s.write_all(&Preamble::new(Channel::Control).encode()).await.ok()?;
+    let mut reply = [0u8; PREAMBLE_LEN];
+    // `adb forward` accepts the connection even if the phone app is not listening, then closes it.
+    tokio::time::timeout(HANDSHAKE_TIMEOUT, s.read_exact(&mut reply)).await.ok()?.ok()?;
+    Preamble::decode(&reply).ok().filter(|p| p.channel == Channel::Control)?;
+    tokio::time::timeout(HANDSHAKE_TIMEOUT, read_control(&mut s)).await.ok()?.ok()?; // phone's hello
+
+    let facing = *shared.facing.lock().unwrap();
+    write_control(&mut s, &set_facing_json(facing)).await.ok()?;
+    let _ = tokio::time::timeout(ACK_TIMEOUT, async {
+        while let Ok(message) = read_control(&mut s).await {
+            if message.contains("\"state\"") {
+                break;
+            }
+        }
+    })
+    .await;
+
+    let (mut read_half, write_half) = s.into_split();
+    *shared.writer.lock().await = Some(write_half);
+    let tx = tx.clone();
+    Some(tokio::spawn(async move {
+        while let Ok(message) = read_control(&mut read_half).await {
+            if message.contains("\"error\"") {
+                log(&tx, format!("⚠️ الهاتف: {message}\n"));
+            }
+        }
+    }))
+}
+
+async fn run_inner(cfg: &Config, tx: &Tx, shared: &Arc<Shared>) -> Result<(), String> {
     if cfg.setup_adb {
         adb_forward(cfg).await?;
         log(tx, format!("✓ adb forward على المنفذ {}\n", cfg.port));
@@ -101,21 +248,23 @@ async fn run_inner(cfg: &Config, tx: &Tx) -> Result<(), String> {
     let mut hinted = false;
     loop {
         let _ = tx.send(Event::State(State::Connecting));
-        match TcpStream::connect(("127.0.0.1", cfg.port)).await {
-            Ok(stream) => {
-                let frames = session(cfg, stream, tx).await?;
-                if frames > 0 {
-                    log(tx, "الهاتف أنهى البث. بانتظار اتصال جديد...\n");
-                    hinted = false;
-                } else if !hinted {
+        match open_control(cfg, shared, tx).await {
+            None => {
+                if !hinted {
                     log(tx, "بانتظار الهاتف: افتح تطبيق Enki واضغط Start.\n");
                     hinted = true;
                 }
             }
-            Err(e) => {
-                if !hinted {
-                    log(tx, format!("تعذر الاتصال بالمنفذ {} ({e}). أعيد المحاولة...\n", cfg.port));
-                    hinted = true;
+            Some(control_reader) => {
+                let outcome = match TcpStream::connect(("127.0.0.1", cfg.port)).await {
+                    Ok(stream) => session(cfg, stream, tx).await,
+                    Err(_) => Ok(0),
+                };
+                control_reader.abort();
+                *shared.writer.lock().await = None;
+                if outcome? > 0 {
+                    log(tx, "الهاتف أنهى البث. بانتظار اتصال جديد...\n");
+                    hinted = false;
                 }
             }
         }
@@ -289,25 +438,42 @@ async fn report_stats(counters: Arc<Counters>, tx: Tx) {
 fn sink_command(cfg: &Config) -> (String, Vec<String>) {
     match &cfg.sink_override {
         Some((program, args)) => (program.clone(), args.clone()),
-        None => (cfg.ffmpeg.clone(), ffmpeg_args(&cfg.device, cfg.fps)),
+        None => (cfg.ffmpeg.clone(), ffmpeg_args(&cfg.device, cfg.fps, cfg.rotate, cfg.mirror)),
     }
 }
 
 /// ffmpeg arguments tuned for live use: no probing delay and no decoder-side buffering.
 /// `-framerate` matters: without it ffmpeg cannot timestamp the raw H.264 and drops almost every frame.
-pub fn ffmpeg_args(device: &str, fps: u32) -> Vec<String> {
+/// The last filter pins the output size, so the picture size stays constant when the phone switches camera.
+pub fn ffmpeg_args(device: &str, fps: u32, rotate: u16, mirror: bool) -> Vec<String> {
     [
         "-hide_banner", "-loglevel", "warning",
         "-fflags", "nobuffer", "-flags", "low_delay",
         "-probesize", "200000", "-analyzeduration", "0",
         "-framerate", &fps.to_string(),
         "-f", "h264", "-i", "-",
+        "-vf", &video_filter(rotate, mirror),
         "-pix_fmt", "yuv420p", "-fps_mode", "passthrough",
         "-f", "v4l2", device,
     ]
     .iter()
     .map(|s| s.to_string())
     .collect()
+}
+
+fn video_filter(rotate: u16, mirror: bool) -> String {
+    let mut chain: Vec<&str> = Vec::new();
+    match rotate % 360 {
+        90 => chain.push("transpose=1"),
+        180 => chain.extend(["hflip", "vflip"]),
+        270 => chain.push("transpose=2"),
+        _ => {}
+    }
+    if mirror {
+        chain.push("hflip");
+    }
+    chain.push(if rotate % 180 == 90 { "scale=720:1280" } else { "scale=1280:720" });
+    chain.join(",")
 }
 
 /// V4L2 devices on this system as `(path, name)`, ordered by number.

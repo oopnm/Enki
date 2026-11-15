@@ -33,6 +33,8 @@ import kotlin.math.abs
 class CameraStreamer(
     private val context: Context,
     private val queue: FrameQueue,
+    /** "back" or "front". */
+    private val facing: String,
     private val onError: (String) -> Unit,
 ) {
     private val lock = Any()
@@ -49,7 +51,7 @@ class CameraStreamer(
     @SuppressLint("MissingPermission") // checked by the caller (MainActivity requests it before starting the service)
     fun start() {
         val manager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
-        val cameraId = pickBackCamera(manager) ?: return fail("no camera found")
+        val cameraId = pickCamera(manager) ?: return fail("no $facing camera on this phone")
         val characteristics = manager.getCameraCharacteristics(cameraId)
         val map = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
             ?: return fail("camera has no stream configuration")
@@ -233,10 +235,14 @@ class CameraStreamer(
         if (first) onError(message)
     }
 
-    private fun pickBackCamera(manager: CameraManager): String? =
-        manager.cameraIdList.firstOrNull {
-            manager.getCameraCharacteristics(it).get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_BACK
-        } ?: manager.cameraIdList.firstOrNull()
+    private fun pickCamera(manager: CameraManager): String? {
+        val want = if (facing == "front") CameraCharacteristics.LENS_FACING_FRONT else CameraCharacteristics.LENS_FACING_BACK
+        val match = manager.cameraIdList.firstOrNull {
+            manager.getCameraCharacteristics(it).get(CameraCharacteristics.LENS_FACING) == want
+        }
+        // A phone without a back camera (rare) still streams something; a missing front camera is an error.
+        return match ?: if (facing == "front") null else manager.cameraIdList.firstOrNull()
+    }
 
     private fun chooseSize(sizes: Array<Size>?): Size? {
         if (sizes.isNullOrEmpty()) return null

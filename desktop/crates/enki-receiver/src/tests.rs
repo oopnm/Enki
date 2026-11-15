@@ -8,29 +8,71 @@ fn frame(stream: u8, kind: Kind, flags: u8, pts: u64, payload: &[u8]) -> Vec<u8>
     v
 }
 
-/// Fake phone: answers the handshake, sends a few frames, then closes.
-async fn fake_phone(listener: TcpListener) {
-    let (mut s, _) = listener.accept().await.unwrap();
-    let mut pre = [0u8; 8];
-    s.read_exact(&mut pre).await.unwrap();
-    assert_eq!(Preamble::decode(&pre).unwrap().channel, Channel::Media);
-    s.write_all(&pre).await.unwrap();
-    s.write_all(&frame(0, Kind::VideoConfig, 0, 0, &[0, 0, 1, 0x67])).await.unwrap();
-    s.write_all(&frame(0, Kind::VideoKey, 0, 0, &[0, 0, 1, 0x65])).await.unwrap();
-    s.write_all(&frame(1, Kind::AudioFrame, 0, 5, &[9, 9, 9])).await.unwrap(); // must be ignored
-    s.write_all(&frame(0, Kind::VideoDelta, FLAG_DISCONTINUITY, 33_333, &[0x41, 0x9a])).await.unwrap();
+type Received = Arc<Mutex<Vec<String>>>;
+
+/// Fake phone app. Accepts any number of connections. On a control connection it says hello, records every
+/// message and confirms `set` with a `state` reply. On a media connection it sends a few frames and then
+/// closes, or, with `hold_media`, keeps the connection open until the receiver hangs up.
+async fn fake_phone(listener: TcpListener, hold_media: bool, received: Received) {
+    loop {
+        let Ok((mut s, _)) = listener.accept().await else { return };
+        let received = received.clone();
+        tokio::spawn(async move {
+            let mut pre = [0u8; 8];
+            if s.read_exact(&mut pre).await.is_err() {
+                return;
+            }
+            let channel = Preamble::decode(&pre).unwrap().channel;
+            let _ = s.write_all(&pre).await;
+            match channel {
+                Channel::Control => {
+                    let _ = write_control(&mut s, r#"{"type":"hello","version":0}"#).await;
+                    while let Ok(message) = read_control(&mut s).await {
+                        received.lock().unwrap().push(message.clone());
+                        if message.contains("\"set\"") {
+                            let _ = write_control(&mut s, r#"{"type":"state"}"#).await;
+                        }
+                    }
+                }
+                Channel::Media => {
+                    let _ = s.write_all(&frame(0, Kind::VideoConfig, 0, 0, &[0, 0, 1, 0x67])).await;
+                    let _ = s.write_all(&frame(0, Kind::VideoKey, 0, 0, &[0, 0, 1, 0x65])).await;
+                    let _ = s.write_all(&frame(1, Kind::AudioFrame, 0, 5, &[9, 9, 9])).await; // must be ignored
+                    let _ = s.write_all(&frame(0, Kind::VideoDelta, FLAG_DISCONTINUITY, 33_333, &[0x41, 0x9a])).await;
+                    if hold_media {
+                        let mut b = [0u8; 1];
+                        let _ = s.read(&mut b).await;
+                    }
+                }
+            }
+        });
+    }
+}
+
+async fn start_phone(hold_media: bool) -> (u16, Received) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let received: Received = Arc::default();
+    tokio::spawn(fake_phone(listener, hold_media, received.clone()));
+    (port, received)
+}
+
+fn test_config(port: u16) -> Config {
+    let mut cfg = Config::new("/dev/null");
+    cfg.port = port;
+    cfg.setup_adb = false;
+    cfg
+}
+
+fn drain(rx: &mut mpsc::UnboundedReceiver<Event>) -> Vec<Event> {
+    std::iter::from_fn(|| rx.try_recv().ok()).collect()
 }
 
 #[tokio::test]
 async fn streams_video_frames_to_the_sink_and_reconnects() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    tokio::spawn(fake_phone(listener));
-
+    let (port, _) = start_phone(false).await;
     let out = std::env::temp_dir().join(format!("enki-receiver-test-{}-{port}.h264", std::process::id()));
-    let mut cfg = Config::new("/dev/null");
-    cfg.port = port;
-    cfg.setup_adb = false;
+    let mut cfg = test_config(port);
     cfg.sink_override = Some(("sh".into(), vec!["-c".into(), format!("cat > {}", out.display())]));
 
     let (tx, mut rx) = mpsc::unbounded_channel();
@@ -39,7 +81,7 @@ async fn streams_video_frames_to_the_sink_and_reconnects() {
 
     let expected: Vec<u8> = vec![0, 0, 1, 0x67, 0, 0, 1, 0x65, 0x41, 0x9a];
     let mut got = Vec::new();
-    for _ in 0..50 {
+    for _ in 0..80 {
         tokio::time::sleep(Duration::from_millis(100)).await;
         got = std::fs::read(&out).unwrap_or_default();
         if got == expected {
@@ -52,41 +94,25 @@ async fn streams_video_frames_to_the_sink_and_reconnects() {
     task.await.unwrap();
     let _ = std::fs::remove_file(&out);
 
-    let mut states = Vec::new();
-    let mut logs = String::new();
-    while let Ok(ev) = rx.try_recv() {
-        match ev {
-            Event::State(s) => states.push(s),
-            Event::Log(t) => logs.push_str(&t),
-            Event::Stats(_) => {}
-        }
-    }
+    let events = drain(&mut rx);
+    let states: Vec<State> = events.iter().filter_map(|e| if let Event::State(s) = e { Some(*s) } else { None }).collect();
     assert!(states.contains(&State::Streaming));
     assert_eq!(states.last(), Some(&State::Stopped));
+    let logs: String = events.iter().filter_map(|e| if let Event::Log(t) = e { Some(t.as_str()) } else { None }).collect();
     assert!(logs.contains("اتصل بالهاتف"));
 }
 
 #[tokio::test]
 async fn missing_sink_program_is_a_clear_error() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    tokio::spawn(fake_phone(listener));
-
-    let mut cfg = Config::new("/dev/null");
-    cfg.port = port;
-    cfg.setup_adb = false;
+    let (port, _) = start_phone(false).await;
+    let mut cfg = test_config(port);
     cfg.ffmpeg = "enki-no-such-ffmpeg".into();
 
     let (tx, mut rx) = mpsc::unbounded_channel();
     let (_stop_tx, stop_rx) = oneshot::channel();
     tokio::time::timeout(Duration::from_secs(5), run(cfg, tx, stop_rx)).await.expect("run must end by itself");
 
-    let mut logs = String::new();
-    while let Ok(ev) = rx.try_recv() {
-        if let Event::Log(t) = ev {
-            logs.push_str(&t);
-        }
-    }
+    let logs: String = drain(&mut rx).into_iter().filter_map(|e| if let Event::Log(t) = e { Some(t) } else { None }).collect();
     assert!(logs.contains("غير مثبت"), "{logs}");
 }
 
@@ -100,30 +126,76 @@ async fn phone_not_listening_behind_adb_forward_is_retried_quietly() {
             let _ = listener.accept().await;
         }
     });
-    let mut cfg = Config::new("/dev/null");
-    cfg.port = port;
-    cfg.setup_adb = false;
 
     let (tx, mut rx) = mpsc::unbounded_channel();
     let (stop_tx, stop_rx) = oneshot::channel();
-    let task = tokio::spawn(run(cfg, tx, stop_rx));
+    let task = tokio::spawn(run(test_config(port), tx, stop_rx));
     tokio::time::sleep(Duration::from_millis(3500)).await;
     let _ = stop_tx.send(());
     task.await.unwrap();
 
-    let hints = std::iter::from_fn(|| rx.try_recv().ok())
-        .filter(|e| matches!(e, Event::Log(t) if t.contains("اضغط Start")))
-        .count();
+    let hints = drain(&mut rx).into_iter().filter(|e| matches!(e, Event::Log(t) if t.contains("اضغط Start"))).count();
     assert_eq!(hints, 1, "the hint is shown once, not on every retry");
+}
+
+#[tokio::test]
+async fn camera_choice_is_sent_before_streaming_and_can_change_live() {
+    let (port, received) = start_phone(true).await;
+    let mut cfg = test_config(port);
+    cfg.facing = Facing::Front;
+    cfg.sink_override = Some(("sh".into(), vec!["-c".into(), "cat > /dev/null".into()]));
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (stop_tx, stop_rx) = oneshot::channel();
+    let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+    let task = tokio::spawn(run_with_commands(cfg, tx, stop_rx, cmd_rx));
+
+    let mut streaming = false;
+    for _ in 0..80 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        streaming |= drain(&mut rx).iter().any(|e| matches!(e, Event::State(State::Streaming)));
+        if streaming {
+            break;
+        }
+    }
+    assert!(streaming, "must reach the streaming state");
+    {
+        let got = received.lock().unwrap();
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert!(got[0].contains(r#""key":"camera.facing""#) && got[0].contains(r#""value":"front""#), "{got:?}");
+    }
+
+    cmd_tx.send(Control::SetFacing(Facing::Back)).unwrap();
+    let mut switched = false;
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        switched = received.lock().unwrap().iter().any(|m| m.contains(r#""value":"back""#));
+        if switched {
+            break;
+        }
+    }
+    assert!(switched, "a live camera switch must reach the phone: {:?}", received.lock().unwrap());
+
+    let _ = stop_tx.send(());
+    task.await.unwrap();
 }
 
 #[test]
 fn ffmpeg_args_contain_the_settings_that_fixed_the_frozen_picture() {
-    let a = ffmpeg_args("/dev/video10", 30);
-    let s = a.join(" ");
+    let s = ffmpeg_args("/dev/video10", 30, 0, false).join(" ");
     assert!(s.contains("-framerate 30 -f h264 -i -"));
     assert!(s.contains("-fps_mode passthrough"));
+    assert!(s.contains("-vf scale=1280:720"));
     assert!(s.ends_with("-f v4l2 /dev/video10"));
+}
+
+#[test]
+fn video_filter_rotation_and_mirror() {
+    assert_eq!(video_filter(0, false), "scale=1280:720");
+    assert_eq!(video_filter(180, false), "hflip,vflip,scale=1280:720");
+    assert_eq!(video_filter(90, false), "transpose=1,scale=720:1280");
+    assert_eq!(video_filter(270, true), "transpose=2,hflip,scale=720:1280");
+    assert_eq!(video_filter(0, true), "hflip,scale=1280:720");
 }
 
 #[test]
