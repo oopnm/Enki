@@ -40,8 +40,8 @@ class MediaTest {
     @Test
     fun controlMessageIsLengthPrefixed() {
         val b = encodeControlMessage("""{"type":"hello"}""")
-        assertEquals(15, b.size - 4)
-        assertArrayEquals(byteArrayOf(0, 0, 0, 15), b.copyOfRange(0, 4))
+        assertEquals(16, b.size - 4)
+        assertArrayEquals(byteArrayOf(0, 0, 0, 16), b.copyOfRange(0, 4))
     }
 
     @Test
