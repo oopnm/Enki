@@ -1,0 +1,16 @@
+[package]
+name = "enki-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Enki: use your phone as a webcam, microphone and screen source on Linux"
+
+# اسم الملف التنفيذي موحّد في كل الحزم وملف .desktop
+[[bin]]
+name = "enki"
+path = "src/main.rs"
+
+[dependencies]
+gtk = { package = "gtk4", version = "0.7" }
+tokio = { version = "1", features = ["rt-multi-thread", "process", "io-util", "sync", "macros"] }

@@ -62,6 +62,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "enki-gui"
+version = "0.1.0"
+dependencies = [
+ "gtk4",
+ "tokio",
+]
+
+[[package]]
+name = "enki-protocol"
+version = "0.1.0"
+
+[[package]]
 name = "equivalent"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -494,14 +506,6 @@ dependencies = [
  "gobject-sys",
  "libc",
  "system-deps",
-]
-
-[[package]]
-name = "phonecam_studio"
-version = "0.1.0"
-dependencies = [
- "gtk4",
- "tokio",
 ]
 
 [[package]]

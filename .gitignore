@@ -3,3 +3,13 @@
 *.AppImage
 *.deb
 *.rpm
+android/.gradle/
+android/build/
+android/*/build/
+android/local.properties
+*.apk
+debian/.debhelper/
+debian/debhelper-build-stamp
+debian/*.substvars
+debian/enki/
+debian/files

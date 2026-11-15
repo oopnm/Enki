@@ -1,4 +1,4 @@
-name: Build All Linux Packages
+name: Build Enki Linux Packages
 
 on:
   push:
@@ -23,8 +23,8 @@ jobs:
           ver=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
           # مجلد منفصل: makepkg يستخدم src/ وسيتعارض مع src/ الخاص بالمشروع
           mkdir /tmp/pkg
-          git archive --prefix="PhoneCam-Studio-${ver}/" -o "/tmp/pkg/phonecam-studio-${ver}.tar.gz" HEAD
-          cp PKGBUILD /tmp/pkg/
+          git archive --prefix="enki-${ver}/" -o "/tmp/pkg/enki-${ver}.tar.gz" HEAD
+          cp packaging/arch/PKGBUILD /tmp/pkg/
           useradd -m builder
           chown -R builder:builder /tmp/pkg
           su builder -c "cd /tmp/pkg && makepkg -d --noconfirm"
@@ -49,8 +49,8 @@ jobs:
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           ver=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
           mkdir -p ~/rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
-          git archive --prefix="PhoneCam-Studio-${ver}/" -o ~/rpmbuild/SOURCES/phonecam-studio-${ver}.tar.gz HEAD
-          rpmbuild -ba phonecam-spec.spec
+          git archive --prefix="enki-${ver}/" -o ~/rpmbuild/SOURCES/enki-${ver}.tar.gz HEAD
+          cp packaging/fedora/enki.spec ~/rpmbuild/SPECS/ && rpmbuild -ba ~/rpmbuild/SPECS/enki.spec
           cp ~/rpmbuild/RPMS/*/*.rpm "$GITHUB_WORKSPACE"/
       - name: Upload Fedora Artifact
         uses: actions/upload-artifact@v4
@@ -70,7 +70,7 @@ jobs:
         # -d: تجاوز فحص Build-Depends لـ cargo/rustc (نستخدم نسخة rustup)
         run: |
           dpkg-buildpackage -us -uc -b -d
-          mv ../phonecam-studio*.deb .
+          mv ../enki*.deb .
       - name: Upload Debian Artifact
         uses: actions/upload-artifact@v4
         with:
@@ -86,7 +86,7 @@ jobs:
       - name: Install GTK
         run: sudo apt-get update && sudo apt-get install -y libgtk-4-dev libglib2.0-dev wget
       - name: Build Binary
-        run: cargo build --release --locked
+        run: cargo build --release --locked -p enki-gui
       - name: Make AppImage
         env:
           ARCH: x86_64
@@ -96,14 +96,14 @@ jobs:
           chmod +x appimagetool-x86_64.AppImage
 
           mkdir -p AppDir/usr/bin
-          cp target/release/phonecam-studio AppDir/usr/bin/
-          cp appimage/AppRun AppDir/AppRun
+          cp target/release/enki AppDir/usr/bin/
+          cp packaging/appimage/AppRun AppDir/AppRun
           chmod +x AppDir/AppRun
-          cp appimage/phonecam-studio.desktop AppDir/
-          cp appimage/phonecam-studio.png AppDir/
-          cp appimage/phonecam-studio.png AppDir/.DirIcon
+          cp packaging/appimage/enki.desktop AppDir/
+          cp packaging/appimage/enki.png AppDir/
+          cp packaging/appimage/enki.png AppDir/.DirIcon
 
-          ./appimagetool-x86_64.AppImage AppDir PhoneCam_Studio-x86_64.AppImage
+          ./appimagetool-x86_64.AppImage AppDir Enki-x86_64.AppImage
       - name: Upload AppImage Artifact
         uses: actions/upload-artifact@v4
         with:

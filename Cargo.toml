@@ -1,16 +1,9 @@
-[package]
-name = "phonecam_studio"
+[workspace]
+resolver = "2"
+members = ["desktop/crates/*"]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2021"
-description = "A modern GTK4 GUI wrapper for scrcpy and v4l2loopback to use a phone camera on Linux"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/oopnm/PhoneCam-Studio"
-
-# اسم الملف التنفيذي موحّد (بشرطة) في كل الحزم وملف .desktop
-[[bin]]
-name = "phonecam-studio"
-path = "src/main.rs"
-
-[dependencies]
-gtk = { package = "gtk4", version = "0.7" }
-tokio = { version = "1", features = ["rt-multi-thread", "process", "io-util", "sync", "macros"] }

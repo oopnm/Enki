@@ -13,7 +13,7 @@ use tokio::process::Command;
 use tokio::runtime::Handle;
 use tokio::sync::{mpsc, oneshot};
 
-const APP_ID: &str = "com.github.phonecam.studio";
+const APP_ID: &str = "io.github.oopnm.Enki";
 const DEFAULT_DEVICE: &str = "/dev/video10";
 
 /// رسائل تُرسل من مهام Tokio إلى واجهة GTK (تُعالَج فقط على الخيط الرئيسي).
@@ -42,7 +42,7 @@ fn main() -> glib::ExitCode {
 fn build_ui(app: &Application, rt: Handle) {
     let window = ApplicationWindow::builder()
         .application(app)
-        .title("PhoneCam Studio - Linux")
+        .title("Enki")
         .default_width(650)
         .default_height(600)
         .build();
@@ -55,7 +55,7 @@ fn build_ui(app: &Application, rt: Handle) {
 
     main_box.append(
         &Label::builder()
-            .label("<b>PhoneCam Studio (Scrcpy + v4l2loopback)</b>")
+            .label("<b>Enki</b>")
             .use_markup(true)
             .xalign(0.0)
             .build(),
@@ -273,7 +273,7 @@ async fn load_module(nr: u32, tx: EventTx) {
             "v4l2loopback",
             "devices=1",
             &nr_arg,
-            "card_label=PhoneCam",
+            "card_label=Enki",
             "exclusive_caps=1",
         ])
         .stdin(Stdio::null())

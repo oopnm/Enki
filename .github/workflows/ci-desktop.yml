@@ -1,0 +1,21 @@
+name: CI Desktop
+
+on:
+  push:
+    branches: [main]
+    paths: ['desktop/**', 'protocol/**', 'Cargo.*', '.github/workflows/ci-desktop.yml']
+  pull_request:
+    paths: ['desktop/**', 'protocol/**', 'Cargo.*', '.github/workflows/ci-desktop.yml']
+  workflow_dispatch:
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install GTK
+        run: sudo apt-get update && sudo apt-get install -y libgtk-4-dev libglib2.0-dev
+      - name: Build
+        run: cargo build --locked --workspace
+      - name: Test
+        run: cargo test --locked --workspace

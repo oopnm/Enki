@@ -1,8 +1,0 @@
-[Desktop Entry]
-Type=Application
-Name=PhoneCam Studio
-Comment=Use your phone camera as a webcam
-Exec=phonecam-studio
-Icon=phonecam-studio
-Terminal=false
-Categories=AudioVideo;Video;

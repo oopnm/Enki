@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Enki
+Comment=Use your phone as a webcam, microphone and screen source
+Exec=enki
+Icon=enki
+Terminal=false
+Categories=AudioVideo;Video;

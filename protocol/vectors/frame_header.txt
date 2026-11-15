@@ -1,0 +1,6 @@
+# Enki Link v0 media frame header vectors (shared by Rust and Android tests)
+# name|stream|kind|flags|len|pts_us|hex(16 bytes)
+video_config|0|0|0|30|0|000000000000001e0000000000000000
+video_key|0|1|0|48213|33333|000100000000bc550000000000008235
+video_delta_disc|0|2|1|1500|1234567890123|00020100000005dc0000011f71fb04cb
+audio_frame|1|4|0|960|20000|01040000000003c00000000000004e20
