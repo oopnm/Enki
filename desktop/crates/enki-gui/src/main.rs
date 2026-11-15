@@ -20,6 +20,8 @@ const DEFAULT_DEVICE: &str = "/dev/video10";
 enum UiEvent {
     Log(String),
     Running(bool),
+    /// نص حالة البث (يُعرض بجانب «الحالة:»).
+    Status(String),
 }
 
 type EventTx = mpsc::UnboundedSender<UiEvent>;
@@ -73,7 +75,8 @@ fn build_ui(app: &Application, rt: Handle) {
     source_box.append(&row_label("المصدر:"));
     let source_dropdown = DropDown::new(
         Some(gtk::StringList::new(&[
-            "كاميرا الهاتف → جهاز V4L2",
+            "كاميرا الهاتف (تطبيق Enki) → جهاز V4L2",
+            "كاميرا الهاتف (scrcpy، أندرويد 12+) → جهاز V4L2",
             "شاشة الهاتف → نافذة",
             "شاشة الهاتف → جهاز V4L2",
         ])),
@@ -107,6 +110,10 @@ fn build_ui(app: &Application, rt: Handle) {
     let device_box = GtkBox::new(Orientation::Horizontal, 10);
     device_box.append(&row_label("جهاز V4L2:"));
     let device_entry = Entry::builder().text(DEFAULT_DEVICE).build();
+    // اكتشاف تلقائي: إن وُجد جهاز v4l2loopback باسم Enki نستخدمه بدل الكتابة اليدوية
+    if let Some(found) = enki_receiver::pick_default_device(&enki_receiver::list_v4l2_devices()) {
+        device_entry.set_text(&found);
+    }
     device_box.append(&device_entry);
     settings_box.append(&device_box);
 
@@ -171,6 +178,9 @@ fn build_ui(app: &Application, rt: Handle) {
             while let Some(event) = rx.recv().await {
                 match event {
                     UiEvent::Log(text) => append_log(&buffer, &text),
+                    UiEvent::Status(text) => {
+                        status.set_markup(&format!("<b>الحالة: {text}</b>"));
+                    }
                     UiEvent::Running(running) => {
                         if !running {
                             slot.borrow_mut().take();
@@ -218,14 +228,41 @@ fn build_ui(app: &Application, rt: Handle) {
             if slot.borrow().is_some() {
                 return; // يوجد بث شغال أصلاً
             }
-            // 0 = كاميرا، 1 = شاشة إلى نافذة، 2 = شاشة إلى V4L2
+            // 0 = كاميرا Enki، 1 = كاميرا scrcpy، 2 = شاشة إلى نافذة، 3 = شاشة إلى V4L2
             let source = source_dd.selected();
             let device = entry.text().to_string();
-            if source != 1 && parse_video_nr(&device).is_none() {
+            if source != 2 && parse_video_nr(&device).is_none() {
                 log(
                     &tx,
                     format!("❌ مسار غير صالح: «{device}». الصيغة المطلوبة: /dev/videoN\n"),
                 );
+                return;
+            }
+            if source == 0 {
+                // كاميرا تطبيق Enki: يستقبلها enki-receiver ويمررها إلى V4L2 (تعمل من أندرويد 7)
+                log(&tx, format!("> كاميرا Enki → {device} (الدقة والاتجاه يُضبطان من تطبيق الهاتف حالياً)...\n"));
+                let (stop_tx, stop_rx) = oneshot::channel();
+                *slot.borrow_mut() = Some(stop_tx);
+                let _ = tx.send(UiEvent::Running(true));
+                let (ev_tx, mut ev_rx) = mpsc::unbounded_channel();
+                rt.spawn(enki_receiver::run(enki_receiver::Config::new(device), ev_tx, stop_rx));
+                let ui = tx.clone();
+                rt.spawn(async move {
+                    use enki_receiver::{Event, State};
+                    while let Some(event) = ev_rx.recv().await {
+                        let _ = ui.send(match event {
+                            Event::Log(text) => UiEvent::Log(text),
+                            Event::State(State::Connecting) => UiEvent::Status("🟡 بانتظار الهاتف".to_string()),
+                            Event::State(State::Streaming) => UiEvent::Status("🟢 متصل".to_string()),
+                            Event::State(State::Stopped) => UiEvent::Running(false),
+                            Event::Stats(s) => UiEvent::Status(format!(
+                                "🟢 متصل · {} fps · {:.1} Mbps",
+                                s.fps,
+                                s.kbps as f64 / 1000.0
+                            )),
+                        });
+                    }
+                });
                 return;
             }
             let facing = if facing_dd.selected() == 1 { "front" } else { "back" };
@@ -237,7 +274,7 @@ fn build_ui(app: &Application, rt: Handle) {
 
             let mut args: Vec<String>;
             let what;
-            if source == 0 {
+            if source == 1 {
                 args = vec![
                     "--video-source=camera".to_string(),
                     format!("--camera-facing={facing}"),
@@ -251,7 +288,7 @@ fn build_ui(app: &Application, rt: Handle) {
                 // الشاشة: --max-size هو أكبر بُعد للصورة
                 let max = size.split('x').next().unwrap_or("1920");
                 args = vec![format!("--max-size={max}")];
-                if source == 2 {
+                if source == 3 {
                     args.push(format!("--v4l2-sink={device}"));
                     args.push("--no-video-playback".to_string());
                     what = format!("شاشة → {device}, أكبر بُعد: {max}");
