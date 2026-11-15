@@ -12,6 +12,7 @@ import android.hardware.camera2.CaptureRequest
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaFormat
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.HandlerThread
@@ -150,12 +151,29 @@ class CameraStreamer(
     }
 
     private fun startEncoder(size: Size, fps: Int) {
+        // Low-latency hints first; some encoders reject them, so fall back to the plain configuration.
+        val codec = try {
+            configureEncoder(size, fps, lowLatency = true)
+        } catch (e: Exception) {
+            configureEncoder(size, fps, lowLatency = false)
+        }
+        encoder = codec
+        drainThread = Thread({ drain(codec) }, "enki-encoder").also { it.start() }
+    }
+
+    private fun configureEncoder(size: Size, fps: Int, lowLatency: Boolean): MediaCodec {
         val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, size.width, size.height).apply {
             setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
             setInteger(MediaFormat.KEY_BIT_RATE, BITRATE)
             setInteger(MediaFormat.KEY_FRAME_RATE, fps)
             setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
             setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR)
+            if (lowLatency) {
+                setInteger(MediaFormat.KEY_PRIORITY, 0) // real-time
+                setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline) // no B-frames
+                if (Build.VERSION.SDK_INT >= 29) setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
+                if (Build.VERSION.SDK_INT >= 30) setInteger(MediaFormat.KEY_LATENCY, 1)
+            }
         }
         val codec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
         try {
@@ -166,8 +184,7 @@ class CameraStreamer(
             codec.release()
             throw e
         }
-        encoder = codec
-        drainThread = Thread({ drain(codec) }, "enki-encoder").also { it.start() }
+        return codec
     }
 
     /** Reads encoded buffers until the encoder is stopped or fails. */
