@@ -24,5 +24,12 @@ cargo build --release -p enki-gui     # binary: target/release/enki
 cd android && gradle :app:assembleDebug
 ```
 
-Status: Phase 0 (foundations). The camera app arrives in Phase 1; until then the desktop app
-still works with scrcpy's own camera mode on Android 12+.
+Status: Phase 1 (camera). The Android app streams the back camera as H.264 over Enki Link.
+The desktop receiver comes next; to test the phone side now:
+
+```
+adb forward tcp:28200 tcp:28200      # then tap Start in the Enki app
+python3 tools/enki_dump.py | ffplay -f h264 -fflags nobuffer -flags low_delay -framedrop -i -
+```
+
+Until the desktop receiver lands, the desktop app still works with scrcpy's own camera mode on Android 12+.

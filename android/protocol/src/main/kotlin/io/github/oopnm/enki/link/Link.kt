@@ -9,10 +9,22 @@ object Link {
     const val PREAMBLE_LEN = 8
     const val FRAME_HEADER_LEN = 16
     const val MAX_PAYLOAD = 16 * 1024 * 1024L
+    const val MAX_CONTROL = 1024 * 1024
+    /** TCP port the phone listens on (reach it from the PC with `adb forward`). */
+    const val DEFAULT_PORT = 28200
     val MAGIC = byteArrayOf('E'.code.toByte(), 'N'.code.toByte(), 'K'.code.toByte(), 'I'.code.toByte())
 }
 
-enum class Channel(val code: Int) { MEDIA(0), CONTROL(1) }
+const val FLAG_DISCONTINUITY = 1
+
+enum class Channel(val code: Int) {
+    MEDIA(0), CONTROL(1);
+
+    companion object {
+        fun from(code: Int): Channel = entries.firstOrNull { it.code == code }
+            ?: throw ProtocolException("unknown channel $code")
+    }
+}
 
 enum class Kind(val code: Int) {
     VIDEO_CONFIG(0), VIDEO_KEY(1), VIDEO_DELTA(2), AUDIO_CONFIG(3), AUDIO_FRAME(4);
@@ -31,6 +43,15 @@ fun encodePreamble(channel: Channel): ByteArray {
     b[4] = Link.VERSION.toByte()
     b[5] = channel.code.toByte()
     return b
+}
+
+/** Validates a peer's 8-byte preamble and returns its channel. */
+fun decodePreamble(b: ByteArray): Channel {
+    if (b.size != Link.PREAMBLE_LEN) throw ProtocolException("preamble must be 8 bytes")
+    if (!b.copyOfRange(0, 4).contentEquals(Link.MAGIC)) throw ProtocolException("bad magic")
+    if (b[4].toInt() != Link.VERSION) throw ProtocolException("unsupported version ${b[4].toInt() and 0xFF}")
+    if (b[6].toInt() != 0 || b[7].toInt() != 0) throw ProtocolException("reserved bytes must be zero")
+    return Channel.from(b[5].toInt() and 0xFF)
 }
 
 data class FrameHeader(val streamId: Int, val kind: Kind, val flags: Int, val len: Long, val ptsUs: Long) {

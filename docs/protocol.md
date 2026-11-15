@@ -4,7 +4,8 @@ Enki Link connects the Enki Android app to the Linux desktop app. It carries **c
 and a **control channel**. Screen streaming is **not** part of Enki Link: it is done by scrcpy.
 
 Transport: two TCP connections to the phone (over `adb forward` on USB, or Wi-Fi later).
-All integers are big-endian.
+The phone listens on `127.0.0.1:28200` (loopback only, so nothing else on the network can reach it);
+use `adb forward tcp:28200 tcp:28200`. All integers are big-endian.
 
 ## Preamble (8 bytes, first bytes of every connection)
 
@@ -15,7 +16,9 @@ All integers are big-endian.
 | 5 | 1 | channel: `0` media, `1` control |
 | 6 | 2 | reserved, must be `0` |
 
-A peer that sees a bad magic or an unsupported version closes the connection.
+The PC connects and sends its preamble first; the phone validates it and answers with its own preamble
+for the same channel. A peer that sees a bad magic or an unsupported version closes the connection.
+The phone accepts one media connection at a time and runs the camera only while it is open.
 
 ## Media channel
 
