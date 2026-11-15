@@ -68,6 +68,20 @@ fn build_ui(app: &Application, rt: Handle) {
 
     let settings_box = GtkBox::new(Orientation::Vertical, 8);
 
+    // مصدر البث: الكاميرا أو الشاشة (الشاشة يبثّها scrcpy)
+    let source_box = GtkBox::new(Orientation::Horizontal, 10);
+    source_box.append(&row_label("المصدر:"));
+    let source_dropdown = DropDown::new(
+        Some(gtk::StringList::new(&[
+            "كاميرا الهاتف → جهاز V4L2",
+            "شاشة الهاتف → نافذة",
+            "شاشة الهاتف → جهاز V4L2",
+        ])),
+        gtk::Expression::NONE,
+    );
+    source_box.append(&source_dropdown);
+    settings_box.append(&source_box);
+
     // كاميرا الهاتف (أمامية / خلفية)
     let facing_box = GtkBox::new(Orientation::Horizontal, 10);
     facing_box.append(&row_label("كاميرا الهاتف:"));
@@ -195,6 +209,7 @@ fn build_ui(app: &Application, rt: Handle) {
         let tx = tx.clone();
         let rt = rt.clone();
         let slot = stop_slot.clone();
+        let source_dd = source_dropdown.clone();
         let facing_dd = facing_dropdown.clone();
         let res_dd = res_dropdown.clone();
         let entry = device_entry.clone();
@@ -203,8 +218,10 @@ fn build_ui(app: &Application, rt: Handle) {
             if slot.borrow().is_some() {
                 return; // يوجد بث شغال أصلاً
             }
+            // 0 = كاميرا، 1 = شاشة إلى نافذة، 2 = شاشة إلى V4L2
+            let source = source_dd.selected();
             let device = entry.text().to_string();
-            if parse_video_nr(&device).is_none() {
+            if source != 1 && parse_video_nr(&device).is_none() {
                 log(
                     &tx,
                     format!("❌ مسار غير صالح: «{device}». الصيغة المطلوبة: /dev/videoN\n"),
@@ -218,14 +235,30 @@ fn build_ui(app: &Application, rt: Handle) {
                 _ => "1920x1080",
             };
 
-            let mut args = vec![
-                "--video-source=camera".to_string(),
-                format!("--camera-facing={facing}"),
-                format!("--camera-size={size}"),
-                format!("--v4l2-sink={device}"),
-                // لا نافذة معاينة (يُبقي الصوت شغال إذا فُعّل)
-                "--no-video-playback".to_string(),
-            ];
+            let mut args: Vec<String>;
+            let what;
+            if source == 0 {
+                args = vec![
+                    "--video-source=camera".to_string(),
+                    format!("--camera-facing={facing}"),
+                    format!("--camera-size={size}"),
+                    format!("--v4l2-sink={device}"),
+                    // لا نافذة معاينة (يُبقي الصوت شغال إذا فُعّل)
+                    "--no-video-playback".to_string(),
+                ];
+                what = format!("كاميرا: {facing}, دقة: {size}, الجهاز: {device}");
+            } else {
+                // الشاشة: --max-size هو أكبر بُعد للصورة
+                let max = size.split('x').next().unwrap_or("1920");
+                args = vec![format!("--max-size={max}")];
+                if source == 2 {
+                    args.push(format!("--v4l2-sink={device}"));
+                    args.push("--no-video-playback".to_string());
+                    what = format!("شاشة → {device}, أكبر بُعد: {max}");
+                } else {
+                    what = format!("شاشة → نافذة, أكبر بُعد: {max}");
+                }
+            }
             if audio.is_active() {
                 args.push("--audio-source=mic".to_string());
             } else {
@@ -234,7 +267,7 @@ fn build_ui(app: &Application, rt: Handle) {
 
             log(
                 &tx,
-                format!("> تشغيل scrcpy (كاميرا: {facing}, دقة: {size}, الجهاز: {device})...\n"),
+                format!("> تشغيل scrcpy ({what})...\n"),
             );
 
             let (stop_tx, stop_rx) = oneshot::channel();
