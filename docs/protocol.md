@@ -54,7 +54,9 @@ After the preamble: a sequence of messages, each a `u32` length followed by that
 
 | Key | Values | Behavior |
 |---|---|---|
-| `camera.facing` | `"back"`, `"front"` | Chooses the camera. The phone remembers it and uses it for the next media connection; if a media stream is running it switches camera at once (a new config + key frame follows). The phone confirms with `{"type":"state","key":"camera.facing","value":"front"}`, or answers `{"type":"error","code":"bad_value",...}`. |
+| `camera.facing` | `"back"`, `"front"` | Chooses the camera. The phone remembers it and uses it for the next media connection; if a media stream is running it switches camera at once (a new config + key frame follows). The phone confirms with `{"type":"state","key":"camera.facing","value":"front"}` (after an `image.rotation` state), or answers `{"type":"error","code":"bad_value",...}`. |
+
+| `image.rotation` | `0`, `90`, `180`, `270` (phone → PC, `state` only) | Clockwise rotation that makes the picture upright, computed on the phone from the camera's sensor orientation and the phone's accelerometer (`OrientationEventListener`, independent of the screen-rotation lock; 15° hysteresis). Sent after every `camera.facing` set and whenever the phone is turned. The PC applies it when "auto rotate" is on. |
 
 The PC opens the control connection first, sends `camera.facing`, waits briefly for the `state` reply
 (old phone apps never reply, so it gives up after 1 s), and only then opens the media connection.

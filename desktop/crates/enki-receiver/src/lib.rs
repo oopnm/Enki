@@ -51,6 +51,17 @@ impl Facing {
 pub enum Control {
     /// Switch the phone camera, also while streaming.
     SetFacing(Facing),
+    /// Turn the sensor-driven rotation on or off.
+    SetAutoRotate(bool),
+}
+
+/// Settings that can change while streaming. The decoder is restarted when they change the picture orientation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Live {
+    facing: Facing,
+    auto_rotate: bool,
+    /// Clockwise rotation the phone asked for (from its orientation sensor), if it reported one.
+    phone_rotation: Option<u16>,
 }
 
 #[derive(Debug, Clone)]
@@ -66,6 +77,9 @@ pub struct Config {
     pub rotate: Option<u16>,
     /// Mirror the picture horizontally. `None` = the default for the active camera.
     pub mirror: Option<bool>,
+    /// Follow the phone's orientation sensor: the phone says how the picture must be rotated to be upright
+    /// and that overrides `rotate`. Can be switched live with [`Control::SetAutoRotate`].
+    pub auto_rotate: bool,
     pub adb: String,
     pub ffmpeg: String,
     /// Run `adb forward` before connecting. Tests turn this off.
@@ -83,6 +97,7 @@ impl Config {
             facing: Facing::Back,
             rotate: None,
             mirror: None,
+            auto_rotate: false,
             adb: "adb".into(),
             ffmpeg: "ffmpeg".into(),
             setup_adb: true,
@@ -123,7 +138,7 @@ fn log(tx: &Tx, text: impl Into<String>) {
 
 /// State shared between the session loop and the command task.
 struct Shared {
-    facing: tokio::sync::watch::Sender<Facing>,
+    live: tokio::sync::watch::Sender<Live>,
     /// Write half of the current control connection (None while not connected).
     writer: tokio::sync::Mutex<Option<OwnedWriteHalf>>,
 }
@@ -142,15 +157,27 @@ pub async fn run_with_commands(
     mut cmds: mpsc::UnboundedReceiver<Control>,
 ) {
     let shared = Arc::new(Shared {
-        facing: tokio::sync::watch::channel(cfg.facing).0,
+        live: tokio::sync::watch::channel(Live {
+            facing: cfg.facing,
+            auto_rotate: cfg.auto_rotate,
+            phone_rotation: None,
+        })
+        .0,
         writer: tokio::sync::Mutex::new(None),
     });
     let command_task = {
         let shared = shared.clone();
         let tx = tx.clone();
         tokio::spawn(async move {
-            while let Some(Control::SetFacing(facing)) = cmds.recv().await {
-                apply_facing(&shared, &tx, facing).await;
+            while let Some(request) = cmds.recv().await {
+                match request {
+                    Control::SetFacing(facing) => apply_facing(&shared, &tx, facing).await,
+                    Control::SetAutoRotate(on) => {
+                        shared.live.send_modify(|l| l.auto_rotate = on);
+                        let text = if on { "🧭 التدوير التلقائي حسب مستشعر الهاتف: مفعّل" } else { "🧭 التدوير التلقائي: متوقف" };
+                        log(&tx, format!("{text}\n"));
+                    }
+                }
             }
         })
     };
@@ -168,7 +195,7 @@ pub async fn run_with_commands(
 }
 
 async fn apply_facing(shared: &Shared, tx: &Tx, facing: Facing) {
-    shared.facing.send_replace(facing);
+    shared.live.send_modify(|l| l.facing = facing);
     let mut writer = shared.writer.lock().await;
     if let Some(w) = writer.as_mut() {
         match write_control(w, &set_facing_json(facing)).await {
@@ -180,6 +207,24 @@ async fn apply_facing(shared: &Shared, tx: &Tx, facing: Facing) {
         }
     }
     // Not connected yet: the new value is sent as soon as the next connection is made.
+}
+
+/// The rotation from an `image.rotation` state message, e.g. `{"type":"state","key":"image.rotation","value":180}`.
+/// Plain string search: key order inside the JSON is not guaranteed and this avoids a JSON dependency.
+fn parse_rotation(message: &str) -> Option<u16> {
+    if !message.contains("\"image.rotation\"") {
+        return None;
+    }
+    let rest = message[message.find("\"value\"")? + "\"value\"".len()..].trim_start().strip_prefix(':')?.trim_start();
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    let value: u16 = digits.parse().ok()?;
+    (value < 360 && value % 90 == 0).then_some(value)
+}
+
+fn handle_state(shared: &Shared, message: &str) {
+    if let Some(rotation) = parse_rotation(message) {
+        shared.live.send_modify(|l| l.phone_rotation = Some(rotation));
+    }
 }
 
 fn set_facing_json(facing: Facing) -> String {
@@ -212,6 +257,7 @@ async fn read_control<R: AsyncReadExt + Unpin>(r: &mut R) -> std::io::Result<Str
 /// confirmation, so the camera that opens next is the right one. Returns a task that reads (and logs
 /// errors from) the rest of the connection, or None if the phone app is not listening.
 async fn open_control(cfg: &Config, shared: &Arc<Shared>, tx: &Tx) -> Option<tokio::task::JoinHandle<()>> {
+    shared.live.send_modify(|l| l.phone_rotation = None); // a rotation from an earlier connection is stale
     let mut s = TcpStream::connect(("127.0.0.1", cfg.port)).await.ok()?;
     s.write_all(&Preamble::new(Channel::Control).encode()).await.ok()?;
     let mut reply = [0u8; PREAMBLE_LEN];
@@ -220,11 +266,13 @@ async fn open_control(cfg: &Config, shared: &Arc<Shared>, tx: &Tx) -> Option<tok
     Preamble::decode(&reply).ok().filter(|p| p.channel == Channel::Control)?;
     tokio::time::timeout(HANDSHAKE_TIMEOUT, read_control(&mut s)).await.ok()?.ok()?; // phone's hello
 
-    let facing = *shared.facing.borrow();
+    let facing = shared.live.borrow().facing;
     write_control(&mut s, &set_facing_json(facing)).await.ok()?;
     let _ = tokio::time::timeout(ACK_TIMEOUT, async {
+        // The phone sends its picture rotation first and then confirms the camera.
         while let Ok(message) = read_control(&mut s).await {
-            if message.contains("\"state\"") {
+            handle_state(shared, &message);
+            if message.contains("\"camera.facing\"") {
                 break;
             }
         }
@@ -234,8 +282,10 @@ async fn open_control(cfg: &Config, shared: &Arc<Shared>, tx: &Tx) -> Option<tok
     let (mut read_half, write_half) = s.into_split();
     *shared.writer.lock().await = Some(write_half);
     let tx = tx.clone();
+    let shared = shared.clone();
     Some(tokio::spawn(async move {
         while let Ok(message) = read_control(&mut read_half).await {
+            handle_state(&shared, &message);
             if message.contains("\"error\"") {
                 log(&tx, format!("⚠️ الهاتف: {message}\n"));
             }
@@ -307,14 +357,20 @@ struct Counters {
     gaps: AtomicU64,
 }
 
-/// Default picture orientation per camera, measured on a phone held landscape with the screen facing you:
-/// the back camera needs 180° + mirror, the front camera 180°. `Config` can override both.
-fn orientation(cfg: &Config, facing: Facing) -> (u16, bool) {
-    let (rotate, mirror) = match facing {
+/// Picture orientation `(clockwise degrees, mirror)` for the current settings. Defaults per camera, measured on
+/// a phone held landscape with the screen facing you: back = 180° + mirror, front = 180°. With auto-rotate the
+/// phone's own rotation (from its orientation sensor) replaces the degrees; `Config` overrides come first
+/// when auto-rotate is off, and the mirror setting always applies.
+fn orientation(cfg: &Config, live: &Live) -> (u16, bool) {
+    let (default_rotate, default_mirror) = match live.facing {
         Facing::Back => (180, true),
         Facing::Front => (180, false),
     };
-    (cfg.rotate.unwrap_or(rotate), cfg.mirror.unwrap_or(mirror))
+    let rotate = match (live.auto_rotate, live.phone_rotation) {
+        (true, Some(phone)) => phone,
+        _ => cfg.rotate.unwrap_or(default_rotate),
+    };
+    (rotate, cfg.mirror.unwrap_or(default_mirror))
 }
 
 /// The decoder process that writes to the V4L2 device.
@@ -324,8 +380,7 @@ struct Sink {
 }
 
 impl Sink {
-    async fn spawn(cfg: &Config, facing: Facing, tx: &Tx) -> Result<Sink, String> {
-        let (rotate, mirror) = orientation(cfg, facing);
+    async fn spawn(cfg: &Config, (rotate, mirror): (u16, bool), tx: &Tx) -> Result<Sink, String> {
         let (program, args) = sink_command(cfg, rotate, mirror);
         let mut child = Command::new(&program)
             .args(&args)
@@ -380,16 +435,16 @@ async fn session(cfg: &Config, mut stream: TcpStream, tx: &Tx, shared: &Shared) 
         return Err("الهاتف ردّ بقناة غير متوقعة".into());
     }
 
-    let mut facing_rx = shared.facing.subscribe();
-    let mut facing = *facing_rx.borrow_and_update();
-    let mut sink = Sink::spawn(cfg, facing, tx).await?;
+    let mut live_rx = shared.live.subscribe();
+    let mut current = orientation(cfg, &live_rx.borrow_and_update());
+    let mut sink = Sink::spawn(cfg, current, tx).await?;
 
     log(tx, format!("✓ اتصل بالهاتف، البث إلى {}\n", cfg.device));
     let _ = tx.send(Event::State(State::Streaming));
 
     let counters = Arc::new(Counters::default());
     let ticker = tokio::spawn(report_stats(counters.clone(), tx.clone()));
-    let result = pump_frames(&mut stream, &mut sink, &counters, cfg, tx, &mut facing_rx, &mut facing).await;
+    let result = pump_frames(&mut stream, &mut sink, &counters, cfg, tx, &mut live_rx, &mut current).await;
     ticker.abort();
 
     let frames = counters.frames.load(Ordering::Relaxed);
@@ -430,8 +485,8 @@ async fn pump_frames(
     counters: &Counters,
     cfg: &Config,
     tx: &Tx,
-    facing_rx: &mut tokio::sync::watch::Receiver<Facing>,
-    facing: &mut Facing,
+    live_rx: &mut tokio::sync::watch::Receiver<Live>,
+    current: &mut (u16, bool),
 ) -> Result<(), PumpError> {
     let mut header = [0u8; FRAME_HEADER_LEN];
     let mut payload = Vec::new();
@@ -443,14 +498,14 @@ async fn pump_frames(
         payload.resize(h.len as usize, 0);
         stream.read_exact(&mut payload).await.map_err(|_| PumpError::PhoneClosed)?;
 
-        // The picture orientation differs per camera and can only change by restarting the decoder.
-        if facing_rx.has_changed().unwrap_or(false) {
-            let new = *facing_rx.borrow_and_update();
-            let changed = orientation(cfg, new) != orientation(cfg, *facing);
-            *facing = new;
-            if changed {
+        // The picture orientation depends on the camera and on how the phone is held. It can only change by
+        // restarting the decoder, which only happens when the resulting orientation really differs.
+        if live_rx.has_changed().unwrap_or(false) {
+            let wanted = orientation(cfg, &live_rx.borrow_and_update());
+            if wanted != *current {
+                *current = wanted;
                 sink.stop().await;
-                *sink = Sink::spawn(cfg, new, tx).await.map_err(PumpError::Fatal)?;
+                *sink = Sink::spawn(cfg, wanted, tx).await.map_err(PumpError::Fatal)?;
                 wait_for_config = true;
             }
         }

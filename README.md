@@ -31,6 +31,7 @@ reconnects by itself when the phone app is restarted, and feeds `/dev/videoN` th
 
 Front/back camera can be chosen before starting and switched while streaming. The picture orientation is set
 automatically for each camera (landscape phone, screen facing you) and can be overridden in the desktop app;
+with "auto rotate" the phone's orientation sensor decides (landscape/portrait/upside down), and the picture is rotated in software on the desktop;
 the output is always 1280x720 (black bars when the picture is rotated to portrait).
 
 Manual testing of the phone side without the GUI:

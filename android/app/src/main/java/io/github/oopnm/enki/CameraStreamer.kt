@@ -258,9 +258,21 @@ class CameraStreamer(
         return ranges.filter { it.upper == TARGET_FPS }.maxByOrNull { it.lower } ?: ranges.maxByOrNull { it.upper }
     }
 
-    private companion object {
-        const val TARGET_FPS = 30
-        const val BITRATE = 4_000_000
-        const val ERROR_CAMERA_IN_USE = CameraDevice.StateCallback.ERROR_CAMERA_IN_USE
+    companion object {
+        /** The camera's fixed sensor orientation (degrees), used to work out the picture rotation. */
+        fun sensorOrientation(context: Context, facing: String): Int? = try {
+            val manager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
+            val want = if (facing == "front") CameraCharacteristics.LENS_FACING_FRONT else CameraCharacteristics.LENS_FACING_BACK
+            val id = manager.cameraIdList.firstOrNull {
+                manager.getCameraCharacteristics(it).get(CameraCharacteristics.LENS_FACING) == want
+            } ?: if (facing == "front") null else manager.cameraIdList.firstOrNull()
+            id?.let { manager.getCameraCharacteristics(it).get(CameraCharacteristics.SENSOR_ORIENTATION) }
+        } catch (e: CameraAccessException) {
+            null
+        }
+
+        private const val TARGET_FPS = 30
+        private const val BITRATE = 4_000_000
+        private const val ERROR_CAMERA_IN_USE = CameraDevice.StateCallback.ERROR_CAMERA_IN_USE
     }
 }

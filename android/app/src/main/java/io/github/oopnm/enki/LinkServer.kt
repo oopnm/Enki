@@ -9,6 +9,7 @@ import io.github.oopnm.enki.link.ProtocolException
 import io.github.oopnm.enki.link.decodePreamble
 import io.github.oopnm.enki.link.encodeControlMessage
 import io.github.oopnm.enki.link.encodePreamble
+import io.github.oopnm.enki.link.imageRotation
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
 import java.io.DataInputStream
@@ -19,6 +20,9 @@ import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.util.Collections
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.atomic.AtomicBoolean
 import org.json.JSONException
 import org.json.JSONObject
@@ -44,6 +48,35 @@ class LinkServer(
     private var facing = "back"
     private val mediaLock = Any()
     private var activeMedia: MediaSession? = null
+
+    // Control connections currently open, and a worker for network writes (never on the main thread).
+    private val controls: MutableList<ControlOut> = Collections.synchronizedList(ArrayList())
+    private val notifier: ExecutorService = Executors.newSingleThreadExecutor()
+    private val deviceOrientation = DeviceOrientation(context) {
+        try { notifier.execute { broadcastRotation() } } catch (e: RejectedExecutionException) { /* stopping */ }
+    }
+
+    /** Serializes writes to one control connection (replies and orientation updates come from different threads). */
+    private class ControlOut(private val out: OutputStream) {
+        @Synchronized
+        fun send(json: JSONObject) {
+            out.write(encodeControlMessage(json.toString()))
+            out.flush()
+        }
+    }
+
+    /** Clockwise rotation the PC should apply so the picture is upright, for the current camera and hold. */
+    private fun rotationMessage(): JSONObject? {
+        val front = synchronized(mediaLock) { facing } == "front"
+        val sensor = CameraStreamer.sensorOrientation(context, if (front) "front" else "back") ?: return null
+        val value = imageRotation(sensor, front, deviceOrientation.bucket)
+        return JSONObject().put("type", "state").put("key", "image.rotation").put("value", value)
+    }
+
+    private fun broadcastRotation() {
+        val message = rotationMessage() ?: return
+        synchronized(controls) { controls.toList() }.forEach { runCatching { it.send(message) } }
+    }
 
     /** Owns the camera pipeline of one media connection and can swap it for the other camera while streaming. */
     private inner class MediaSession(private val queue: FrameQueue, private val onError: (String) -> Unit) {
@@ -92,12 +125,15 @@ class LinkServer(
             throw e
         }
         server = s
+        deviceOrientation.enable()
         Thread({ acceptLoop(s) }, "enki-accept").start()
         status(WAITING)
     }
 
     fun stop() {
         if (!stopped.compareAndSet(false, true)) return
+        deviceOrientation.disable()
+        notifier.shutdownNow()
         runCatching { server?.close() }
         synchronized(clients) { clients.toList() }.forEach { runCatching { it.close() } }
     }
@@ -165,36 +201,44 @@ class LinkServer(
         }
     }
 
-    /** Says hello, then handles `set camera.facing`; other messages are read and ignored (see docs/protocol.md). */
+    /**
+     * Says hello, then handles `set camera.facing` (confirmed with `state`, preceded by the current
+     * `image.rotation`) and pushes `image.rotation` whenever the phone is turned. Other messages are ignored.
+     */
     private fun serveControl(input: DataInputStream, out: OutputStream) {
-        val hello = JSONObject()
-            .put("type", "hello")
-            .put("version", Link.VERSION)
-            .put("app", "enki-android")
-            .put("app_version", appVersion)
-        out.write(encodeControlMessage(hello.toString()))
-        out.flush()
-        while (true) {
-            val len = input.readInt()
-            if (len < 0 || len > Link.MAX_CONTROL) throw ProtocolException("bad control message length $len")
-            val body = ByteArray(len).also { input.readFully(it) }
-            val message = try { JSONObject(String(body, Charsets.UTF_8)) } catch (e: JSONException) { continue }
-            if (message.optString("type") == "set" && message.optString("key") == "camera.facing") {
-                val value = message.optString("value")
-                if (value == "front" || value == "back") {
-                    setFacing(value)
-                    reply(out, JSONObject().put("type", "state").put("key", "camera.facing").put("value", value))
-                } else {
-                    reply(out, JSONObject().put("type", "error").put("code", "bad_value")
-                        .put("message", "camera.facing must be \"front\" or \"back\""))
+        val control = ControlOut(out)
+        controls.add(control)
+        try {
+            control.send(
+                JSONObject()
+                    .put("type", "hello")
+                    .put("version", Link.VERSION)
+                    .put("app", "enki-android")
+                    .put("app_version", appVersion),
+            )
+            while (true) {
+                val len = input.readInt()
+                if (len < 0 || len > Link.MAX_CONTROL) throw ProtocolException("bad control message length $len")
+                val body = ByteArray(len).also { input.readFully(it) }
+                val message = try { JSONObject(String(body, Charsets.UTF_8)) } catch (e: JSONException) { continue }
+                if (message.optString("type") == "set" && message.optString("key") == "camera.facing") {
+                    val value = message.optString("value")
+                    if (value == "front" || value == "back") {
+                        setFacing(value)
+                        // The rotation depends on the camera, so it goes out first; the PC waits for the facing reply.
+                        rotationMessage()?.let { control.send(it) }
+                        control.send(JSONObject().put("type", "state").put("key", "camera.facing").put("value", value))
+                    } else {
+                        control.send(
+                            JSONObject().put("type", "error").put("code", "bad_value")
+                                .put("message", "camera.facing must be \"front\" or \"back\""),
+                        )
+                    }
                 }
             }
+        } finally {
+            controls.remove(control)
         }
-    }
-
-    private fun reply(out: OutputStream, json: JSONObject) {
-        out.write(encodeControlMessage(json.toString()))
-        out.flush()
     }
 
     companion object {

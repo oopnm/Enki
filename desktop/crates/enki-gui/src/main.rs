@@ -121,6 +121,11 @@ fn build_ui(app: &Application, rt: Handle) {
     );
     rot_box.append(&mirror_dropdown);
     settings_box.append(&rot_box);
+    let auto_rotate_check = CheckButton::builder()
+        .label("تدوير تلقائي حسب مستشعر الهاتف (يتبع طريقة إمساكه: أفقي/عمودي)")
+        .active(false)
+        .build();
+    settings_box.append(&auto_rotate_check);
 
     // جهاز V4L2
     let device_box = GtkBox::new(Orientation::Horizontal, 10);
@@ -247,6 +252,7 @@ fn build_ui(app: &Application, rt: Handle) {
         let audio = audio_check.clone();
         let rot_dd = rot_dropdown.clone();
         let mirror_dd = mirror_dropdown.clone();
+        let auto_cb = auto_rotate_check.clone();
         let control = control_slot.clone();
         start_btn.connect_clicked(move |_| {
             if slot.borrow().is_some() {
@@ -275,6 +281,7 @@ fn build_ui(app: &Application, rt: Handle) {
                     0 => None,
                     n => Some([0, 90, 180, 270][(n as usize - 1).min(3)]),
                 };
+                cfg.auto_rotate = auto_cb.is_active();
                 cfg.mirror = match mirror_dd.selected() {
                     0 => None,
                     1 => Some(true),
@@ -367,6 +374,16 @@ fn build_ui(app: &Application, rt: Handle) {
                     enki_receiver::Facing::Back
                 };
                 let _ = ctl.send(enki_receiver::Control::SetFacing(facing));
+            }
+        });
+    }
+
+    // تشغيل/إيقاف التدوير التلقائي أثناء البث
+    {
+        let control = control_slot.clone();
+        auto_rotate_check.connect_toggled(move |check| {
+            if let Some(ctl) = control.borrow().as_ref() {
+                let _ = ctl.send(enki_receiver::Control::SetAutoRotate(check.is_active()));
             }
         });
     }

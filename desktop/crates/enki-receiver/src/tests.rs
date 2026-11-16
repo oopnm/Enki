@@ -31,7 +31,9 @@ async fn fake_phone(listener: TcpListener, hold_media: bool, received: Received)
                     while let Ok(message) = read_control(&mut s).await {
                         received.lock().unwrap().push(message.clone());
                         if message.contains("\"set\"") {
-                            let _ = write_control(&mut s, r#"{"type":"state"}"#).await;
+                            // like the real app: current picture rotation first, then the camera confirmation
+                            let _ = write_control(&mut s, r#"{"value":90,"key":"image.rotation","type":"state"}"#).await;
+                            let _ = write_control(&mut s, r#"{"type":"state","key":"camera.facing","value":"x"}"#).await;
                         }
                     }
                 }
@@ -204,15 +206,79 @@ fn video_filter_rotation_and_mirror_keep_a_fixed_output_size() {
     assert_eq!(video_filter(0, true), format!("hflip,{FIT}"));
 }
 
+fn live(facing: Facing, auto_rotate: bool, phone_rotation: Option<u16>) -> Live {
+    Live { facing, auto_rotate, phone_rotation }
+}
+
 #[test]
 fn default_orientation_per_camera_and_overrides() {
     let mut cfg = Config::new("/dev/null");
-    assert_eq!(orientation(&cfg, Facing::Back), (180, true));
-    assert_eq!(orientation(&cfg, Facing::Front), (180, false));
+    assert_eq!(orientation(&cfg, &live(Facing::Back, false, None)), (180, true));
+    assert_eq!(orientation(&cfg, &live(Facing::Front, false, None)), (180, false));
     cfg.rotate = Some(90);
     cfg.mirror = Some(false);
-    assert_eq!(orientation(&cfg, Facing::Back), (90, false));
-    assert_eq!(orientation(&cfg, Facing::Front), (90, false));
+    assert_eq!(orientation(&cfg, &live(Facing::Back, false, None)), (90, false));
+    assert_eq!(orientation(&cfg, &live(Facing::Front, false, None)), (90, false));
+}
+
+#[test]
+fn auto_rotate_uses_the_phone_sensor_and_keeps_the_mirror_default() {
+    let cfg = Config::new("/dev/null");
+    // sensor value wins when auto-rotate is on and the phone has reported one
+    assert_eq!(orientation(&cfg, &live(Facing::Back, true, Some(270))), (270, true));
+    assert_eq!(orientation(&cfg, &live(Facing::Front, true, Some(0))), (0, false));
+    // no report yet: fall back to the fixed default
+    assert_eq!(orientation(&cfg, &live(Facing::Back, true, None)), (180, true));
+    // auto-rotate off: the phone's value is ignored
+    assert_eq!(orientation(&cfg, &live(Facing::Back, false, Some(270))), (180, true));
+}
+
+#[test]
+fn rotation_is_parsed_whatever_the_key_order() {
+    assert_eq!(parse_rotation(r#"{"type":"state","key":"image.rotation","value":180}"#), Some(180));
+    assert_eq!(parse_rotation(r#"{"value":90,"key":"image.rotation","type":"state"}"#), Some(90));
+    assert_eq!(parse_rotation(r#"{"type":"state","key":"image.rotation","value": 0}"#), Some(0));
+    assert_eq!(parse_rotation(r#"{"type":"state","key":"camera.facing","value":"front"}"#), None);
+    assert_eq!(parse_rotation(r#"{"type":"state","key":"image.rotation","value":45}"#), None);
+    assert_eq!(parse_rotation(r#"{"type":"state","key":"image.rotation","value":360}"#), None);
+}
+
+#[tokio::test]
+async fn turning_auto_rotate_on_restarts_the_decoder_with_the_phones_rotation() {
+    let (port, _received) = start_phone(true).await; // phone reports rotation 90
+    let marker = std::env::temp_dir().join(format!("enki-auto-{}-{port}", std::process::id()));
+    let _ = std::fs::remove_file(&marker);
+    let mut cfg = test_config(port);
+    cfg.facing = Facing::Front; // fixed default would be 180
+    cfg.sink_override = Some((
+        "sh".into(),
+        vec!["-c".into(), format!("echo started >> {}; cat > /dev/null", marker.display())],
+    ));
+    let starts = || std::fs::read_to_string(&marker).map(|t| t.lines().count()).unwrap_or(0);
+
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let (stop_tx, stop_rx) = oneshot::channel();
+    let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+    let task = tokio::spawn(run_with_commands(cfg, tx, stop_rx, cmd_rx));
+
+    async fn wait_for(mut cond: impl FnMut() -> bool) -> bool {
+        for _ in 0..60 {
+            if cond() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        false
+    }
+    assert!(wait_for(|| starts() == 1).await, "first decoder start");
+    cmd_tx.send(Control::SetAutoRotate(true)).unwrap(); // 180 -> 90 reported by the phone
+    assert!(wait_for(|| starts() == 2).await, "auto-rotate must restart the decoder");
+    cmd_tx.send(Control::SetAutoRotate(false)).unwrap(); // and back to 180
+    assert!(wait_for(|| starts() == 3).await);
+
+    let _ = stop_tx.send(());
+    task.await.unwrap();
+    let _ = std::fs::remove_file(&marker);
 }
 
 #[tokio::test]
