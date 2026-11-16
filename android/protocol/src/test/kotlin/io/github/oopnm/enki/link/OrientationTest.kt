@@ -10,7 +10,8 @@ class OrientationTest {
         assertEquals(90, deviceBucket(70, 0))     // beyond it: move
         assertEquals(0, deviceBucket(340, 0))     // wraps around
         assertEquals(0, deviceBucket(359, 0))
-        assertEquals(270, deviceBucket(300, 0))
+        assertEquals(0, deviceBucket(300, 0)) // exactly 60 away: still inside the band
+        assertEquals(270, deviceBucket(290, 0))
         assertEquals(90, deviceBucket(100, 90))
         assertEquals(180, deviceBucket(175, 90))
         assertEquals(0, deviceBucket(10, 270))    // 270 -> 0 across the wrap
