@@ -4,7 +4,8 @@ Enki Link connects the Enki Android app to the Linux desktop app. It carries **c
 and a **control channel**. Screen streaming is **not** part of Enki Link: it is done by scrcpy.
 
 Transport: two TCP connections to the phone (over `adb forward` on USB, or Wi-Fi later).
-All integers are big-endian.
+The phone listens on `127.0.0.1:28200` (loopback only, so nothing else on the network can reach it);
+use `adb forward tcp:28200 tcp:28200`. All integers are big-endian.
 
 ## Preamble (8 bytes, first bytes of every connection)
 
@@ -15,7 +16,9 @@ All integers are big-endian.
 | 5 | 1 | channel: `0` media, `1` control |
 | 6 | 2 | reserved, must be `0` |
 
-A peer that sees a bad magic or an unsupported version closes the connection.
+The PC connects and sends its preamble first; the phone validates it and answers with its own preamble
+for the same channel. A peer that sees a bad magic or an unsupported version closes the connection.
+The phone accepts one media connection at a time and runs the camera only while it is open.
 
 ## Media channel
 
@@ -46,6 +49,17 @@ After the preamble: a sequence of messages, each a `u32` length followed by that
 | `set` | PC → phone | change one setting live: `{"type":"set","key":"camera.zoom","value":2.0}` |
 | `state` | phone → PC | current stream state and applied settings |
 | `error` | both | `{"type":"error","code":"camera_in_use","message":"..."}` |
+
+### Settings implemented so far
+
+| Key | Values | Behavior |
+|---|---|---|
+| `camera.facing` | `"back"`, `"front"` | Chooses the camera. The phone remembers it and uses it for the next media connection; if a media stream is running it switches camera at once (a new config + key frame follows). The phone confirms with `{"type":"state","key":"camera.facing","value":"front"}` (after an `image.rotation` state), or answers `{"type":"error","code":"bad_value",...}`. |
+
+| `image.rotation` | `0`, `90`, `180`, `270` (phone → PC, `state` only) | Clockwise rotation that makes the picture upright, computed on the phone from the camera's sensor orientation and the phone's accelerometer (`OrientationEventListener`, independent of the screen-rotation lock; 15° hysteresis). Sent after every `camera.facing` set and whenever the phone is turned. The PC applies it when "auto rotate" is on. |
+
+The PC opens the control connection first, sends `camera.facing`, waits briefly for the `state` reply
+(old phone apps never reply, so it gives up after 1 s), and only then opens the media connection.
 
 The desktop UI is built from `capabilities`; a setting the phone does not report is not shown.
 Unknown message types and unknown keys are ignored, so newer peers can talk to older ones.

@@ -1,0 +1,11 @@
+[package]
+name = "enki-receiver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Enki desktop receiver: Enki Link camera stream from the phone into a V4L2 loopback device"
+
+[dependencies]
+enki-protocol = { path = "../enki-protocol" }
+tokio = { version = "1", features = ["rt-multi-thread", "process", "io-util", "sync", "net", "time", "macros"] }

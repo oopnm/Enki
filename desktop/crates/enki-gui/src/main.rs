@@ -20,6 +20,8 @@ const DEFAULT_DEVICE: &str = "/dev/video10";
 enum UiEvent {
     Log(String),
     Running(bool),
+    /// نص حالة البث (يُعرض بجانب «الحالة:»).
+    Status(String),
 }
 
 type EventTx = mpsc::UnboundedSender<UiEvent>;
@@ -73,7 +75,8 @@ fn build_ui(app: &Application, rt: Handle) {
     source_box.append(&row_label("المصدر:"));
     let source_dropdown = DropDown::new(
         Some(gtk::StringList::new(&[
-            "كاميرا الهاتف → جهاز V4L2",
+            "كاميرا الهاتف (تطبيق Enki) → جهاز V4L2",
+            "كاميرا الهاتف (scrcpy، أندرويد 12+) → جهاز V4L2",
             "شاشة الهاتف → نافذة",
             "شاشة الهاتف → جهاز V4L2",
         ])),
@@ -103,10 +106,35 @@ fn build_ui(app: &Application, rt: Handle) {
     res_box.append(&res_dropdown);
     settings_box.append(&res_box);
 
+    // تدوير الصورة / مرآة لكاميرا تطبيق Enki (تلقائي = الإعداد الأنسب لكل كاميرا، ويتبدّل مع تبديلها)
+    let rot_box = GtkBox::new(Orientation::Horizontal, 10);
+    rot_box.append(&row_label("تدوير الصورة:"));
+    let rot_dropdown = DropDown::new(
+        Some(gtk::StringList::new(&["تلقائي (حسب الكاميرا)", "0°", "90°", "180°", "270°"])),
+        gtk::Expression::NONE,
+    );
+    rot_box.append(&rot_dropdown);
+    rot_box.append(&Label::new(Some("مرآة أفقية:")));
+    let mirror_dropdown = DropDown::new(
+        Some(gtk::StringList::new(&["تلقائي", "مفعّلة", "متوقفة"])),
+        gtk::Expression::NONE,
+    );
+    rot_box.append(&mirror_dropdown);
+    settings_box.append(&rot_box);
+    let auto_rotate_check = CheckButton::builder()
+        .label("تدوير تلقائي حسب مستشعر الهاتف (يتبع طريقة إمساكه: أفقي/عمودي)")
+        .active(false)
+        .build();
+    settings_box.append(&auto_rotate_check);
+
     // جهاز V4L2
     let device_box = GtkBox::new(Orientation::Horizontal, 10);
     device_box.append(&row_label("جهاز V4L2:"));
     let device_entry = Entry::builder().text(DEFAULT_DEVICE).build();
+    // اكتشاف تلقائي: إن وُجد جهاز v4l2loopback باسم Enki نستخدمه بدل الكتابة اليدوية
+    if let Some(found) = enki_receiver::pick_default_device(&enki_receiver::list_v4l2_devices()) {
+        device_entry.set_text(&found);
+    }
     device_box.append(&device_entry);
     settings_box.append(&device_box);
 
@@ -161,19 +189,27 @@ fn build_ui(app: &Application, rt: Handle) {
 
     // مرسل الإيقاف للجلسة الحالية (None = لا يوجد بث).
     let stop_slot: Rc<RefCell<Option<oneshot::Sender<()>>>> = Rc::new(RefCell::new(None));
+    // مرسل أوامر الجلسة الحالية (تبديل الكاميرا أثناء البث).
+    let control_slot: Rc<RefCell<Option<mpsc::UnboundedSender<enki_receiver::Control>>>> =
+        Rc::new(RefCell::new(None));
 
     {
         let buffer = text_buffer.clone();
         let status = status_label.clone();
         let start = start_btn.clone();
         let slot = stop_slot.clone();
+        let control = control_slot.clone();
         glib::spawn_future_local(async move {
             while let Some(event) = rx.recv().await {
                 match event {
                     UiEvent::Log(text) => append_log(&buffer, &text),
+                    UiEvent::Status(text) => {
+                        status.set_markup(&format!("<b>الحالة: {text}</b>"));
+                    }
                     UiEvent::Running(running) => {
                         if !running {
                             slot.borrow_mut().take();
+                            control.borrow_mut().take();
                         }
                         start.set_sensitive(!running);
                         set_status(&status, running);
@@ -214,18 +250,68 @@ fn build_ui(app: &Application, rt: Handle) {
         let res_dd = res_dropdown.clone();
         let entry = device_entry.clone();
         let audio = audio_check.clone();
+        let rot_dd = rot_dropdown.clone();
+        let mirror_dd = mirror_dropdown.clone();
+        let auto_cb = auto_rotate_check.clone();
+        let control = control_slot.clone();
         start_btn.connect_clicked(move |_| {
             if slot.borrow().is_some() {
                 return; // يوجد بث شغال أصلاً
             }
-            // 0 = كاميرا، 1 = شاشة إلى نافذة، 2 = شاشة إلى V4L2
+            // 0 = كاميرا Enki، 1 = كاميرا scrcpy، 2 = شاشة إلى نافذة، 3 = شاشة إلى V4L2
             let source = source_dd.selected();
             let device = entry.text().to_string();
-            if source != 1 && parse_video_nr(&device).is_none() {
+            if source != 2 && parse_video_nr(&device).is_none() {
                 log(
                     &tx,
                     format!("❌ مسار غير صالح: «{device}». الصيغة المطلوبة: /dev/videoN\n"),
                 );
+                return;
+            }
+            if source == 0 {
+                // كاميرا تطبيق Enki: يستقبلها enki-receiver ويمررها إلى V4L2 (تعمل من أندرويد 7)
+                let facing = if facing_dd.selected() == 1 {
+                    enki_receiver::Facing::Front
+                } else {
+                    enki_receiver::Facing::Back
+                };
+                let mut cfg = enki_receiver::Config::new(device.clone());
+                cfg.facing = facing;
+                cfg.rotate = match rot_dd.selected() {
+                    0 => None,
+                    n => Some([0, 90, 180, 270][(n as usize - 1).min(3)]),
+                };
+                cfg.auto_rotate = auto_cb.is_active();
+                cfg.mirror = match mirror_dd.selected() {
+                    0 => None,
+                    1 => Some(true),
+                    _ => Some(false),
+                };
+                log(&tx, format!("> كاميرا Enki ({}) → {device}...\n", facing.as_str()));
+                let (stop_tx, stop_rx) = oneshot::channel();
+                *slot.borrow_mut() = Some(stop_tx);
+                let _ = tx.send(UiEvent::Running(true));
+                let (ev_tx, mut ev_rx) = mpsc::unbounded_channel();
+                let (ctl_tx, ctl_rx) = mpsc::unbounded_channel();
+                *control.borrow_mut() = Some(ctl_tx);
+                rt.spawn(enki_receiver::run_with_commands(cfg, ev_tx, stop_rx, ctl_rx));
+                let ui = tx.clone();
+                rt.spawn(async move {
+                    use enki_receiver::{Event, State};
+                    while let Some(event) = ev_rx.recv().await {
+                        let _ = ui.send(match event {
+                            Event::Log(text) => UiEvent::Log(text),
+                            Event::State(State::Connecting) => UiEvent::Status("🟡 بانتظار الهاتف".to_string()),
+                            Event::State(State::Streaming) => UiEvent::Status("🟢 متصل".to_string()),
+                            Event::State(State::Stopped) => UiEvent::Running(false),
+                            Event::Stats(s) => UiEvent::Status(format!(
+                                "🟢 متصل · {} fps · {:.1} Mbps",
+                                s.fps,
+                                s.kbps as f64 / 1000.0
+                            )),
+                        });
+                    }
+                });
                 return;
             }
             let facing = if facing_dd.selected() == 1 { "front" } else { "back" };
@@ -237,7 +323,7 @@ fn build_ui(app: &Application, rt: Handle) {
 
             let mut args: Vec<String>;
             let what;
-            if source == 0 {
+            if source == 1 {
                 args = vec![
                     "--video-source=camera".to_string(),
                     format!("--camera-facing={facing}"),
@@ -251,7 +337,7 @@ fn build_ui(app: &Application, rt: Handle) {
                 // الشاشة: --max-size هو أكبر بُعد للصورة
                 let max = size.split('x').next().unwrap_or("1920");
                 args = vec![format!("--max-size={max}")];
-                if source == 2 {
+                if source == 3 {
                     args.push(format!("--v4l2-sink={device}"));
                     args.push("--no-video-playback".to_string());
                     what = format!("شاشة → {device}, أكبر بُعد: {max}");
@@ -274,6 +360,31 @@ fn build_ui(app: &Application, rt: Handle) {
             *slot.borrow_mut() = Some(stop_tx);
             let _ = tx.send(UiEvent::Running(true));
             rt.spawn(run_scrcpy(args, stop_rx, tx.clone()));
+        });
+    }
+
+    // تبديل الكاميرا الأمامية/الخلفية أثناء بث كاميرا Enki
+    {
+        let control = control_slot.clone();
+        facing_dropdown.connect_selected_notify(move |dd| {
+            if let Some(ctl) = control.borrow().as_ref() {
+                let facing = if dd.selected() == 1 {
+                    enki_receiver::Facing::Front
+                } else {
+                    enki_receiver::Facing::Back
+                };
+                let _ = ctl.send(enki_receiver::Control::SetFacing(facing));
+            }
+        });
+    }
+
+    // تشغيل/إيقاف التدوير التلقائي أثناء البث
+    {
+        let control = control_slot.clone();
+        auto_rotate_check.connect_toggled(move |check| {
+            if let Some(ctl) = control.borrow().as_ref() {
+                let _ = ctl.send(enki_receiver::Control::SetAutoRotate(check.is_active()));
+            }
         });
     }
 
