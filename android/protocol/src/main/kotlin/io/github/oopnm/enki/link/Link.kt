@@ -3,9 +3,9 @@ package io.github.oopnm.enki.link
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
-/** Enki Link wire format, version 0 (mirrors desktop/crates/enki-protocol). See docs/protocol.md. */
+/** Enki Link wire format, version 1 (mirrors desktop/crates/enki-protocol). See docs/protocol.md. */
 object Link {
-    const val VERSION = 0
+    const val VERSION = 1
     const val PREAMBLE_LEN = 8
     const val FRAME_HEADER_LEN = 16
     const val MAX_PAYLOAD = 16 * 1024 * 1024L
@@ -35,7 +35,10 @@ enum class Kind(val code: Int) {
     }
 }
 
-class ProtocolException(message: String) : Exception(message)
+open class ProtocolException(message: String) : Exception(message)
+
+/** The peer's preamble carries a protocol version this build does not speak. */
+class UnsupportedVersionException(val peerVersion: Int) : ProtocolException("unsupported version $peerVersion")
 
 fun encodePreamble(channel: Channel): ByteArray {
     val b = ByteArray(Link.PREAMBLE_LEN)
@@ -49,7 +52,7 @@ fun encodePreamble(channel: Channel): ByteArray {
 fun decodePreamble(b: ByteArray): Channel {
     if (b.size != Link.PREAMBLE_LEN) throw ProtocolException("preamble must be 8 bytes")
     if (!b.copyOfRange(0, 4).contentEquals(Link.MAGIC)) throw ProtocolException("bad magic")
-    if (b[4].toInt() != Link.VERSION) throw ProtocolException("unsupported version ${b[4].toInt() and 0xFF}")
+    if (b[4].toInt() != Link.VERSION) throw UnsupportedVersionException(b[4].toInt() and 0xFF)
     if (b[6].toInt() != 0 || b[7].toInt() != 0) throw ProtocolException("reserved bytes must be zero")
     return Channel.from(b[5].toInt() and 0xFF)
 }

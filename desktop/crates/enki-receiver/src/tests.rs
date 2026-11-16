@@ -11,23 +11,78 @@ fn frame(stream: u8, kind: Kind, flags: u8, pts: u64, payload: &[u8]) -> Vec<u8>
 
 type Received = Arc<Mutex<Vec<String>>>;
 
-/// Fake phone app. Accepts any number of connections. On a control connection it says hello, records every
-/// message and confirms `set` with a `state` reply. On a media connection it sends a few frames and then
-/// closes, or, with `hold_media`, keeps the connection open until the receiver hangs up.
-async fn fake_phone(listener: TcpListener, hold_media: bool, received: Received) {
+/// Token the fake phone accepts unless a test says otherwise; `test_config` uses the same one.
+const TEST_TOKEN: [u8; TOKEN_LEN] = [42; TOKEN_LEN];
+
+/// How the fake phone behaves at the handshake.
+#[derive(Clone)]
+struct Phone {
+    /// Protocol version it answers with (a different one simulates an old app).
+    version: u8,
+    /// Token it holds. `None` = never provisioned.
+    token: Option<[u8; TOKEN_LEN]>,
+    /// Provisioning log written by the fake adb: the phone holds `TEST_TOKEN` once this file has at least
+    /// `provisions` lines containing "content call" (simulates receiving the token through adb).
+    adb_log: Option<(std::path::PathBuf, Arc<std::sync::atomic::AtomicUsize>)>,
+}
+
+impl Phone {
+    fn normal() -> Self {
+        Phone { version: enki_protocol::VERSION, token: Some(TEST_TOKEN), adb_log: None }
+    }
+
+    fn current_token(&self) -> Option<[u8; TOKEN_LEN]> {
+        if let Some((log, needed)) = &self.adb_log {
+            let text = std::fs::read_to_string(log).unwrap_or_default();
+            let given = text.lines().filter(|l| l.contains("content call")).count();
+            return (given >= needed.load(Ordering::Relaxed)).then_some(TEST_TOKEN);
+        }
+        self.token
+    }
+}
+
+static NONCES: AtomicU64 = AtomicU64::new(1);
+
+/// Fake phone app. Accepts any number of connections. Like the real app it answers the preamble, sends a
+/// challenge and checks the answer before serving anything. On a control connection it then says hello,
+/// records every message and confirms `set` with a `state` reply. On a media connection it sends a few
+/// frames and then closes, or, with `hold_media`, keeps the connection open until the receiver hangs up.
+async fn fake_phone(listener: TcpListener, hold_media: bool, received: Received, phone: Phone) {
     loop {
         let Ok((mut s, _)) = listener.accept().await else { return };
         let received = received.clone();
+        let phone = phone.clone();
         tokio::spawn(async move {
             let mut pre = [0u8; 8];
             if s.read_exact(&mut pre).await.is_err() {
                 return;
             }
             let channel = Preamble::decode(&pre).unwrap().channel;
-            let _ = s.write_all(&pre).await;
+            let mut reply = pre;
+            reply[4] = phone.version;
+            let _ = s.write_all(&reply).await;
+            if phone.version != enki_protocol::VERSION {
+                return; // like a phone that does not know our version: answer and hang up
+            }
+            let mut nonce = [0u8; NONCE_LEN];
+            nonce[..8].copy_from_slice(&NONCES.fetch_add(1, Ordering::Relaxed).to_be_bytes());
+            let _ = s.write_all(&nonce).await;
+            let mut answer = [0u8; MAC_LEN];
+            if s.read_exact(&mut answer).await.is_err() {
+                return;
+            }
+            let status = match phone.current_token() {
+                None => AuthStatus::NotProvisioned,
+                Some(t) if auth_mac(&t, channel, &nonce) == answer => AuthStatus::Ok,
+                Some(_) => AuthStatus::BadToken,
+            };
+            let _ = s.write_all(&[status as u8]).await;
+            if status != AuthStatus::Ok {
+                return;
+            }
             match channel {
                 Channel::Control => {
-                    let _ = write_control(&mut s, r#"{"type":"hello","version":0}"#).await;
+                    let _ = write_control(&mut s, r#"{"type":"hello","version":1}"#).await;
                     while let Ok(message) = read_control(&mut s).await {
                         received.lock().unwrap().push(message.clone());
                         if message.contains("\"set\"") {
@@ -55,17 +110,22 @@ async fn fake_phone(listener: TcpListener, hold_media: bool, received: Received)
     }
 }
 
-async fn start_phone(hold_media: bool) -> (u16, Received) {
+async fn start_phone_as(hold_media: bool, phone: Phone) -> (u16, Received) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let received: Received = Arc::default();
-    tokio::spawn(fake_phone(listener, hold_media, received.clone()));
+    tokio::spawn(fake_phone(listener, hold_media, received.clone(), phone));
     (port, received)
+}
+
+async fn start_phone(hold_media: bool) -> (u16, Received) {
+    start_phone_as(hold_media, Phone::normal()).await
 }
 
 fn test_config(port: u16) -> Config {
     let mut cfg = Config::new("/dev/null");
     cfg.port = port;
+    cfg.token = TEST_TOKEN;
     cfg.setup_adb = false;
     cfg
 }
@@ -321,6 +381,165 @@ async fn decoder_restarts_only_when_the_orientation_changes_with_the_camera() {
     let _ = stop_tx.send(());
     task.await.unwrap();
     let _ = std::fs::remove_file(&marker);
+}
+
+fn logs_of(rx: &mut mpsc::UnboundedReceiver<Event>) -> String {
+    drain(rx).into_iter().filter_map(|e| if let Event::Log(t) = e { Some(t) } else { None }).collect()
+}
+
+/// Runs a session that must end by itself with an error, and returns everything it logged.
+async fn run_to_failure(cfg: Config) -> String {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (_stop_tx, stop_rx) = oneshot::channel();
+    tokio::time::timeout(Duration::from_secs(10), run(cfg, tx, stop_rx)).await.expect("run must end by itself");
+    logs_of(&mut rx)
+}
+
+#[tokio::test]
+async fn a_phone_with_another_token_is_refused_with_a_clear_message() {
+    let phone = Phone { token: Some([1; TOKEN_LEN]), ..Phone::normal() };
+    let (port, _) = start_phone_as(false, phone).await;
+    let logs = run_to_failure(test_config(port)).await;
+    assert!(logs.contains("رفض مفتاح الجلسة"), "{logs}");
+}
+
+#[tokio::test]
+async fn a_phone_that_was_never_provisioned_says_so() {
+    let phone = Phone { token: None, ..Phone::normal() };
+    let (port, _) = start_phone_as(false, phone).await;
+    let logs = run_to_failure(test_config(port)).await;
+    assert!(logs.contains("لم يستلم مفتاح الجلسة"), "{logs}");
+}
+
+#[tokio::test]
+async fn an_old_phone_app_is_reported_instead_of_waiting_forever() {
+    let phone = Phone { version: 0, ..Phone::normal() };
+    let (port, _) = start_phone_as(false, phone).await;
+    let logs = run_to_failure(test_config(port)).await;
+    assert!(logs.contains("بروتوكولاً مختلفاً") && logs.contains("النسخة 0"), "{logs}");
+}
+
+/// A stand-in for `adb`: records its arguments, accepts `forward`, and answers `shell content call` like the
+/// provider does.
+fn fake_adb(dir: &std::path::Path) -> (String, std::path::PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let log = dir.join("adb.log");
+    let script = dir.join("adb");
+    std::fs::write(
+        &script,
+        format!("#!/bin/sh\necho \"$@\" >> {}\nif [ \"$1\" = shell ]; then echo 'Result: Bundle[{{ok=true}}]'; fi\n", log.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    (script.display().to_string(), log)
+}
+
+#[tokio::test]
+async fn the_token_goes_to_the_phone_through_adb_and_streaming_starts() {
+    let dir = std::env::temp_dir().join(format!("enki-adb-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (adb, log) = fake_adb(&dir);
+    let needed = Arc::new(std::sync::atomic::AtomicUsize::new(1));
+    let phone = Phone { adb_log: Some((log.clone(), needed)), ..Phone::normal() };
+    let (port, _) = start_phone_as(true, phone).await;
+    let mut cfg = test_config(port);
+    cfg.setup_adb = true;
+    cfg.adb = adb;
+    cfg.sink_override = Some(("sh".into(), vec!["-c".into(), "cat > /dev/null".into()]));
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (stop_tx, stop_rx) = oneshot::channel();
+    let task = tokio::spawn(run(cfg, tx, stop_rx));
+    let mut streaming = false;
+    for _ in 0..80 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        streaming |= drain(&mut rx).iter().any(|e| matches!(e, Event::State(State::Streaming)));
+        if streaming {
+            break;
+        }
+    }
+    let _ = stop_tx.send(());
+    task.await.unwrap();
+    assert!(streaming, "must stream once the phone has the token");
+
+    let text = std::fs::read_to_string(&log).unwrap();
+    let call = text.lines().find(|l| l.contains("content call")).expect("provisioning call");
+    assert_eq!(
+        call,
+        format!(
+            "shell content call --uri content://io.github.oopnm.enki.provision --method provision --arg {}",
+            to_hex(&TEST_TOKEN)
+        )
+    );
+    assert!(text.lines().any(|l| l.starts_with("forward tcp:")));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn a_phone_that_restarted_and_lost_the_token_is_provisioned_again() {
+    let dir = std::env::temp_dir().join(format!("enki-adb-again-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (adb, log) = fake_adb(&dir);
+    let needed = Arc::new(std::sync::atomic::AtomicUsize::new(1));
+    let phone = Phone { adb_log: Some((log.clone(), needed.clone())), ..Phone::normal() };
+    let (port, _) = start_phone_as(false, phone).await; // media closes by itself, so the receiver reconnects
+    let mut cfg = test_config(port);
+    cfg.setup_adb = true;
+    cfg.adb = adb;
+    cfg.sink_override = Some(("sh".into(), vec!["-c".into(), "cat > /dev/null".into()]));
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (stop_tx, stop_rx) = oneshot::channel();
+    let task = tokio::spawn(run(cfg, tx, stop_rx));
+    let mut streams = 0;
+    let mut logs = String::new();
+    for _ in 0..150 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        for e in drain(&mut rx) {
+            match e {
+                Event::State(State::Streaming) => {
+                    streams += 1;
+                    if streams == 1 {
+                        needed.store(2, Ordering::Relaxed); // the phone app "restarts": it needs a second provisioning
+                    }
+                }
+                Event::Log(t) => logs.push_str(&t),
+                _ => {}
+            }
+        }
+        if streams >= 2 {
+            break;
+        }
+    }
+    let _ = stop_tx.send(());
+    task.await.unwrap();
+    assert!(streams >= 2, "must stream again after provisioning again: {logs}");
+    assert!(logs.contains("أعيد تزويده"), "{logs}");
+    let given = std::fs::read_to_string(&log).unwrap().lines().filter(|l| l.contains("content call")).count();
+    assert_eq!(given, 2);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn failed_provisioning_is_a_clear_error() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("enki-adb-fail-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let script = dir.join("adb");
+    std::fs::write(&script, "#!/bin/sh\nif [ \"$1\" = shell ]; then echo 'Error: No content provider found' >&2; exit 1; fi\n").unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let (port, _) = start_phone(false).await;
+    let mut cfg = test_config(port);
+    cfg.setup_adb = true;
+    cfg.adb = script.display().to_string();
+    let logs = run_to_failure(cfg).await;
+    assert!(logs.contains("تعذر تزويد الهاتف بمفتاح الجلسة") && logs.contains("No content provider found"), "{logs}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn every_config_gets_its_own_token() {
+    assert_ne!(Config::new("/dev/null").token, Config::new("/dev/null").token);
 }
 
 #[test]

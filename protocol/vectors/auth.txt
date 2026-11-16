@@ -1,0 +1,6 @@
+# Enki Link v1 authentication vectors (shared by Rust and Android tests)
+# mac = HMAC-SHA256(key = token, message = "ENKI-AUTH-1" || channel byte || nonce)
+# name|token_hex(32 bytes)|channel|nonce_hex(16 bytes)|mac_hex(32 bytes)
+control_zero_nonce|000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f|1|00000000000000000000000000000000|0b8ff77f49497934eabdaee6b10d0b3fe934267f22d9434779fc5ef3dc941c40
+media_counting_nonce|000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f|0|a0a1a2a3a4a5a6a7a8a9aaabacadaeaf|e50a46453cf344e4bea37b5383e0588aa90a740936c0c44a7cb0702a3020a43d
+control_other_token|ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff|1|000102030405060708090a0b0c0d0e0f|f7c508982cc77f19c91818d9a77cb9b1ba7bdad589dbde22c24f59fddb2fdbca

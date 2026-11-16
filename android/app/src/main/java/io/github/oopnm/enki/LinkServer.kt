@@ -1,11 +1,15 @@
 package io.github.oopnm.enki
 
 import android.content.Context
+import android.util.Log
+import io.github.oopnm.enki.link.Auth
+import io.github.oopnm.enki.link.AuthStatus
 import io.github.oopnm.enki.link.Channel
 import io.github.oopnm.enki.link.FrameQueue
 import io.github.oopnm.enki.link.Link
 import io.github.oopnm.enki.link.MediaFrameWriter
 import io.github.oopnm.enki.link.ProtocolException
+import io.github.oopnm.enki.link.UnsupportedVersionException
 import io.github.oopnm.enki.link.decodePreamble
 import io.github.oopnm.enki.link.encodeControlMessage
 import io.github.oopnm.enki.link.encodePreamble
@@ -30,8 +34,10 @@ import org.json.JSONObject
 /**
  * Enki Link server (phone side). Listens on loopback only, so the PC reaches it through `adb forward`.
  *
- * The PC opens a connection and sends its 8-byte preamble; we validate it and answer with our own, then
- * serve that channel. The camera runs only while a media connection is open.
+ * The PC opens a connection and sends its 8-byte preamble; we validate it and answer with our own. Then we
+ * send a random challenge and serve the channel only if the PC answers it with the session token it gave
+ * us through adb ([SessionToken]); any other app on the phone can reach this port but cannot answer.
+ * The camera runs only while a media connection is open.
  */
 class LinkServer(
     private val context: Context,
@@ -133,6 +139,7 @@ class LinkServer(
     fun stop() {
         if (!stopped.compareAndSet(false, true)) return
         deviceOrientation.disable()
+        SessionToken.clear()
         notifier.shutdownNow()
         runCatching { server?.close() }
         synchronized(clients) { clients.toList() }.forEach { runCatching { it.close() } }
@@ -156,13 +163,23 @@ class LinkServer(
             val out = BufferedOutputStream(socket.getOutputStream(), 64 * 1024)
             out.write(encodePreamble(channel))
             out.flush()
+            // Nothing is served, and the single media slot is not taken, before the PC proves it has the token.
+            val verdict = Auth.serverHandshake(input, out, channel, SessionToken.get())
+            if (verdict != AuthStatus.OK) {
+                Log.w(TAG, "Refused a connection: $verdict")
+                return
+            }
             socket.soTimeout = 0
             when (channel) {
                 Channel.MEDIA -> serveMedia(out)
                 Channel.CONTROL -> serveControl(input, out)
             }
+        } catch (e: UnsupportedVersionException) {
+            // Answer with our own version first, so an older PC program can tell the user the versions differ.
+            runCatching { socket.getOutputStream().apply { write(encodePreamble(Channel.CONTROL)); flush() } }
+            Log.w(TAG, "Refused a connection: peer speaks protocol version ${e.peerVersion}, we speak ${Link.VERSION}")
         } catch (e: ProtocolException) {
-            status("Rejected a connection: ${e.message}")
+            Log.w(TAG, "Refused a connection: ${e.message}")
         } catch (e: IOException) {
             // The peer went away or the handshake timed out; nothing else to do.
         } finally {
@@ -246,5 +263,6 @@ class LinkServer(
         const val STREAMING = "Streaming camera to the PC"
         private const val QUEUE_FRAMES = 30
         private const val HANDSHAKE_TIMEOUT_MS = 5_000
+        private const val TAG = "EnkiLink"
     }
 }

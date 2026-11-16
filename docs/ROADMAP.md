@@ -9,8 +9,8 @@ screens, then the look.
 |---|---|---|
 | 0 | Project skeleton, packaging, scrcpy screen modes | done |
 | 1 | Phone camera (Camera2 → H.264 → TCP), desktop receiver, auto rotate | done (PR #1) |
-| 2 | Release 0.2.0 (packaging dependencies, version bump) | in progress |
-| 3 | Enki-Link v2: best possible communication | planned |
+| 2 | Release 0.2.0 (packaging dependencies, version bump) | done |
+| 3 | Enki-Link v2: best possible communication | in progress (3a authentication done) |
 | 4 | Unified settings engine, i18n skeleton, design tokens | planned |
 | 5 | DroidCam-class camera settings and live preview | planned |
 | 6 | "Abzu" theme, wave animation, full translations | planned |
@@ -42,6 +42,12 @@ Phases 7 and 8 can swap places.
 - Testing without a phone: a fake phone written in Rust that speaks the
   protocol, plus golden test vectors in `protocol/vectors` used by both the Rust
   and Kotlin sides.
+
+Steps: 3a authentication (protocol v1, session token through adb, challenge on every
+connection, clear version and token errors; done), 3b fake phone as a reusable
+test tool and golden vectors for control messages, 3c capabilities handshake, 3d
+state machine, heartbeat and quality statistics, 3e separate video channel
+fields and error fix buttons in the GUI.
 
 Done when: unplugging and replugging the cable during a stream recovers by
 itself, and another app on the phone cannot read the stream.

@@ -4,6 +4,8 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Enki Link wire format: preamble and media frame header encode/decode"
+description = "Enki Link wire format: preamble, session authentication and media frame header encode/decode"
 
 [dependencies]
+hmac = "0.12"
+sha2 = "0.10"

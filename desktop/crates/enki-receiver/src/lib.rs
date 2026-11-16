@@ -1,12 +1,16 @@
 //! Receives the Enki Link camera stream from the phone and feeds it to a V4L2 loopback device.
 //!
-//! Flow: `adb forward` → connect to the phone app → Enki Link handshake → H.264 frames are piped into
-//! ffmpeg, which decodes them and writes to `/dev/videoN`. The session reconnects by itself when the
+//! Flow: `adb forward` → hand the phone a fresh session token over adb → connect to the phone app →
+//! Enki Link handshake and authentication → H.264 frames are piped into ffmpeg, which decodes them and
+//! writes to `/dev/videoN`. The session reconnects by itself when the
 //! phone app is stopped and started again, and runs until [`run`]'s stop signal fires.
 //!
 //! Everything is reported through [`Event`]s, so any UI (GTK today) can show the state.
 
-use enki_protocol::{Channel, FrameHeader, Kind, Preamble, FLAG_DISCONTINUITY, FRAME_HEADER_LEN, PREAMBLE_LEN};
+use enki_protocol::{
+    auth_mac, to_hex, AuthStatus, Channel, FrameHeader, Kind, Preamble, FLAG_DISCONTINUITY, FRAME_HEADER_LEN, MAC_LEN,
+    NONCE_LEN, PREAMBLE_LEN, TOKEN_LEN,
+};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -23,6 +27,8 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3);
 /// How long to wait for the phone to confirm a setting before streaming anyway (older apps never confirm).
 const ACK_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_CONTROL: usize = 1024 * 1024;
+/// The phone app's content provider that accepts the session token, and only from adb (shell uid).
+const PROVISION_URI: &str = "content://io.github.oopnm.enki.provision";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Facing {
@@ -80,9 +86,12 @@ pub struct Config {
     /// Follow the phone's orientation sensor: the phone says how the picture must be rotated to be upright
     /// and that overrides `rotate`. Can be switched live with [`Control::SetAutoRotate`].
     pub auto_rotate: bool,
+    /// Secret for this session: given to the phone through adb and proven on every connection, so another
+    /// app on the phone cannot read the camera. A fresh random value for every [`Config`].
+    pub token: [u8; TOKEN_LEN],
     pub adb: String,
     pub ffmpeg: String,
-    /// Run `adb forward` before connecting. Tests turn this off.
+    /// Run `adb forward` and hand over the token before connecting. Tests turn this off.
     pub setup_adb: bool,
     /// Replaces the ffmpeg command (program, args). Tests use it to capture the stream.
     pub sink_override: Option<(String, Vec<String>)>,
@@ -98,12 +107,23 @@ impl Config {
             rotate: None,
             mirror: None,
             auto_rotate: false,
+            token: random_token(),
             adb: "adb".into(),
             ffmpeg: "ffmpeg".into(),
             setup_adb: true,
             sink_override: None,
         }
     }
+}
+
+/// 32 random bytes from the kernel. Reading `/dev/urandom` cannot fail on a working Linux system.
+fn random_token() -> [u8; TOKEN_LEN] {
+    use std::io::Read;
+    let mut token = [0u8; TOKEN_LEN];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut token))
+        .expect("cannot read random bytes from /dev/urandom");
+    token
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -253,21 +273,83 @@ async fn read_control<R: AsyncReadExt + Unpin>(r: &mut R) -> std::io::Result<Str
     Ok(String::from_utf8_lossy(&body).into_owned())
 }
 
+/// Why a connection to the phone did not become an authenticated Enki Link channel.
+#[derive(Debug, PartialEq, Eq)]
+enum ConnectError {
+    /// Nothing is serving on the port (`adb forward` accepts the connection and closes it), or the phone is
+    /// slow to answer. Not an error to show: the loop just tries again.
+    NotListening,
+    /// The phone speaks another protocol version.
+    OtherVersion(u8),
+    /// The phone refused our answer to its challenge.
+    Auth(AuthStatus),
+    Protocol(String),
+}
+
+impl ConnectError {
+    fn message(&self) -> String {
+        match self {
+            ConnectError::NotListening => "الهاتف لا يستمع على المنفذ.".into(),
+            ConnectError::OtherVersion(v) => format!(
+                "تطبيق Enki على الهاتف يستخدم بروتوكولاً مختلفاً (النسخة {v}، المطلوب {}). ثبّت على الهاتف تطبيق Enki من نفس إصدار برنامج الحاسوب.",
+                enki_protocol::VERSION
+            ),
+            ConnectError::Auth(AuthStatus::NotProvisioned) => {
+                "الهاتف لم يستلم مفتاح الجلسة. أعد تشغيل البث؛ وإن تكرر ذلك فحدّث تطبيق الهاتف.".into()
+            }
+            ConnectError::Auth(_) => "الهاتف رفض مفتاح الجلسة. أوقف البث على الهاتف ثم شغّله من جديد.".into(),
+            ConnectError::Protocol(m) => format!("بروتوكول غير متوقع من الهاتف: {m}"),
+        }
+    }
+}
+
+async fn read_within(s: &mut TcpStream, buf: &mut [u8]) -> Result<(), ConnectError> {
+    match tokio::time::timeout(HANDSHAKE_TIMEOUT, s.read_exact(buf)).await {
+        Ok(Ok(_)) => Ok(()),
+        _ => Err(ConnectError::NotListening),
+    }
+}
+
+/// Opens a connection for `channel`: preambles both ways, then the phone's random challenge, our HMAC answer
+/// and the phone's one-byte verdict (docs/protocol.md). The phone serves nothing before that succeeds.
+async fn connect_authenticated(cfg: &Config, channel: Channel) -> Result<TcpStream, ConnectError> {
+    let mut s = TcpStream::connect(("127.0.0.1", cfg.port)).await.map_err(|_| ConnectError::NotListening)?;
+    let _ = s.set_nodelay(true);
+    s.write_all(&Preamble::new(channel).encode()).await.map_err(|_| ConnectError::NotListening)?;
+    let mut reply = [0u8; PREAMBLE_LEN];
+    read_within(&mut s, &mut reply).await?;
+    match Preamble::decode(&reply) {
+        Ok(p) if p.channel == channel => {}
+        Ok(_) => return Err(ConnectError::Protocol("قناة غير متوقعة".into())),
+        Err(enki_protocol::Error::UnsupportedVersion(v)) => return Err(ConnectError::OtherVersion(v)),
+        Err(e) => return Err(ConnectError::Protocol(e.to_string())),
+    }
+    let mut nonce = [0u8; NONCE_LEN];
+    read_within(&mut s, &mut nonce).await?;
+    let answer: [u8; MAC_LEN] = auth_mac(&cfg.token, channel, &nonce);
+    s.write_all(&answer).await.map_err(|_| ConnectError::NotListening)?;
+    let mut verdict = [0u8; 1];
+    read_within(&mut s, &mut verdict).await?;
+    match AuthStatus::from_u8(verdict[0]) {
+        Some(AuthStatus::Ok) => Ok(s),
+        Some(status) => Err(ConnectError::Auth(status)),
+        None => Err(ConnectError::Protocol(format!("رمز توثيق غير معروف {}", verdict[0]))),
+    }
+}
+
 /// Connects the control channel, tells the phone which camera to use and waits briefly for its
 /// confirmation, so the camera that opens next is the right one. Returns a task that reads (and logs
-/// errors from) the rest of the connection, or None if the phone app is not listening.
-async fn open_control(cfg: &Config, shared: &Arc<Shared>, tx: &Tx) -> Option<tokio::task::JoinHandle<()>> {
+/// errors from) the rest of the connection.
+async fn open_control(cfg: &Config, shared: &Arc<Shared>, tx: &Tx) -> Result<tokio::task::JoinHandle<()>, ConnectError> {
     shared.live.send_modify(|l| l.phone_rotation = None); // a rotation from an earlier connection is stale
-    let mut s = TcpStream::connect(("127.0.0.1", cfg.port)).await.ok()?;
-    s.write_all(&Preamble::new(Channel::Control).encode()).await.ok()?;
-    let mut reply = [0u8; PREAMBLE_LEN];
-    // `adb forward` accepts the connection even if the phone app is not listening, then closes it.
-    tokio::time::timeout(HANDSHAKE_TIMEOUT, s.read_exact(&mut reply)).await.ok()?.ok()?;
-    Preamble::decode(&reply).ok().filter(|p| p.channel == Channel::Control)?;
-    tokio::time::timeout(HANDSHAKE_TIMEOUT, read_control(&mut s)).await.ok()?.ok()?; // phone's hello
+    let mut s = connect_authenticated(cfg, Channel::Control).await?;
+    tokio::time::timeout(HANDSHAKE_TIMEOUT, read_control(&mut s))
+        .await
+        .map_err(|_| ConnectError::NotListening)?
+        .map_err(|_| ConnectError::NotListening)?; // phone's hello
 
     let facing = shared.live.borrow().facing;
-    write_control(&mut s, &set_facing_json(facing)).await.ok()?;
+    write_control(&mut s, &set_facing_json(facing)).await.map_err(|_| ConnectError::NotListening)?;
     let _ = tokio::time::timeout(ACK_TIMEOUT, async {
         // The phone sends its picture rotation first and then confirms the camera.
         while let Ok(message) = read_control(&mut s).await {
@@ -283,7 +365,7 @@ async fn open_control(cfg: &Config, shared: &Arc<Shared>, tx: &Tx) -> Option<tok
     *shared.writer.lock().await = Some(write_half);
     let tx = tx.clone();
     let shared = shared.clone();
-    Some(tokio::spawn(async move {
+    Ok(tokio::spawn(async move {
         while let Ok(message) = read_control(&mut read_half).await {
             handle_state(&shared, &message);
             if message.contains("\"error\"") {
@@ -294,24 +376,39 @@ async fn open_control(cfg: &Config, shared: &Arc<Shared>, tx: &Tx) -> Option<tok
 }
 
 async fn run_inner(cfg: &Config, tx: &Tx, shared: &Arc<Shared>) -> Result<(), String> {
+    // True right after the token was handed to the phone: a refusal then is final, not a stale token.
+    let mut fresh = false;
     if cfg.setup_adb {
         adb_forward(cfg).await?;
         log(tx, format!("✓ adb forward على المنفذ {}\n", cfg.port));
+        provision(cfg).await?;
+        log(tx, "🔑 تم تزويد الهاتف بمفتاح جلسة جديد.\n");
+        fresh = true;
     }
     let mut hinted = false;
     loop {
         let _ = tx.send(Event::State(State::Connecting));
         match open_control(cfg, shared, tx).await {
-            None => {
+            Err(ConnectError::NotListening) => {
                 if !hinted {
-                    log(tx, "بانتظار الهاتف: افتح تطبيق Enki واضغط Start.\n");
+                    log(tx, "بانتظار الهاتف: افتح تطبيق Enki واضغط Start (وإن كان مفتوحاً فتأكد أنه من نفس إصدار برنامج الحاسوب).\n");
                     hinted = true;
                 }
             }
-            Some(control_reader) => {
-                let outcome = match TcpStream::connect(("127.0.0.1", cfg.port)).await {
+            Err(ConnectError::Auth(status)) if cfg.setup_adb && !fresh => {
+                // The phone app was restarted since we gave it the token, so it lost it: give it again.
+                log(tx, format!("🔑 الهاتف لا يملك المفتاح الحالي ({status:?})، أعيد تزويده.\n"));
+                provision(cfg).await?;
+                fresh = true;
+                continue;
+            }
+            Err(e) => return Err(e.message()),
+            Ok(control_reader) => {
+                fresh = false;
+                let outcome = match connect_authenticated(cfg, Channel::Media).await {
                     Ok(stream) => session(cfg, stream, tx, shared).await,
-                    Err(_) => Ok(0),
+                    Err(ConnectError::NotListening) => Ok(0),
+                    Err(e) => Err(e.message()),
                 };
                 control_reader.abort();
                 *shared.writer.lock().await = None;
@@ -323,6 +420,25 @@ async fn run_inner(cfg: &Config, tx: &Tx, shared: &Arc<Shared>) -> Result<(), St
         }
         tokio::time::sleep(RETRY_DELAY).await;
     }
+}
+
+/// Gives the phone this session's token: `adb shell content call` on the app's provider, which accepts it only
+/// from the adb shell. Another app on the phone cannot do that, so it never learns the token.
+async fn provision(cfg: &Config) -> Result<(), String> {
+    let out = Command::new(&cfg.adb)
+        .args(["shell", "content", "call", "--uri", PROVISION_URI, "--method", "provision", "--arg", &to_hex(&cfg.token)])
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .map_err(|e| format!("تعذر تشغيل adb: {e}"))?;
+    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    if out.status.success() && text.contains("ok=true") {
+        return Ok(());
+    }
+    let detail = text.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("لا يوجد ردّ").to_string();
+    Err(format!(
+        "تعذر تزويد الهاتف بمفتاح الجلسة ({detail}). تأكد أن تطبيق Enki على الهاتف من نفس إصدار برنامج الحاسوب، وأن الهاتف مصرّح له بـ adb."
+    ))
 }
 
 async fn adb_forward(cfg: &Config) -> Result<(), String> {
@@ -418,23 +534,9 @@ impl Sink {
     }
 }
 
-/// One connection to the phone. Returns the number of video frames received (0 means the phone side
-/// was not listening). Fatal problems (bad protocol, ffmpeg failure) are returned as `Err`.
+/// One authenticated media connection to the phone. Returns the number of video frames received (0 means
+/// the phone side went away at once). Fatal problems (bad protocol, ffmpeg failure) are returned as `Err`.
 async fn session(cfg: &Config, mut stream: TcpStream, tx: &Tx, shared: &Shared) -> Result<u64, String> {
-    let _ = stream.set_nodelay(true);
-    if stream.write_all(&Preamble::new(Channel::Media).encode()).await.is_err() {
-        return Ok(0);
-    }
-    let mut reply = [0u8; PREAMBLE_LEN];
-    match tokio::time::timeout(HANDSHAKE_TIMEOUT, stream.read_exact(&mut reply)).await {
-        Ok(Ok(_)) => {}
-        _ => return Ok(0),
-    }
-    let peer = Preamble::decode(&reply).map_err(|e| format!("الهاتف يردّ ببروتوكول غير متوافق: {e}"))?;
-    if peer.channel != Channel::Media {
-        return Err("الهاتف ردّ بقناة غير متوقعة".into());
-    }
-
     let mut live_rx = shared.live.subscribe();
     let mut current = orientation(cfg, &live_rx.borrow_and_update());
     let mut sink = Sink::spawn(cfg, current, tx).await?;
