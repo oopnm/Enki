@@ -29,8 +29,9 @@ the desktop app choose "كاميرا الهاتف (تطبيق Enki)" and press s
 reconnects by itself when the phone app is restarted, and feeds `/dev/videoN` through ffmpeg
 (needs `adb` and `ffmpeg`; the V4L2 device is detected automatically when v4l2loopback was loaded by Enki).
 
-Front/back camera can be chosen before starting and switched while streaming. If a camera looks rotated or
-mirrored, use the rotation and mirror options in the desktop app.
+Front/back camera can be chosen before starting and switched while streaming. The picture orientation is set
+automatically for each camera (landscape phone, screen facing you) and can be overridden in the desktop app;
+the output is always 1280x720 (black bars when the picture is rotated to portrait).
 
 Manual testing of the phone side without the GUI:
 

@@ -106,16 +106,20 @@ fn build_ui(app: &Application, rt: Handle) {
     res_box.append(&res_dropdown);
     settings_box.append(&res_box);
 
-    // تدوير الصورة / مرآة (تُطبَّق عند بدء البث، لكاميرا تطبيق Enki)
+    // تدوير الصورة / مرآة لكاميرا تطبيق Enki (تلقائي = الإعداد الأنسب لكل كاميرا، ويتبدّل مع تبديلها)
     let rot_box = GtkBox::new(Orientation::Horizontal, 10);
     rot_box.append(&row_label("تدوير الصورة:"));
     let rot_dropdown = DropDown::new(
-        Some(gtk::StringList::new(&["0°", "90°", "180°", "270°"])),
+        Some(gtk::StringList::new(&["تلقائي (حسب الكاميرا)", "0°", "90°", "180°", "270°"])),
         gtk::Expression::NONE,
     );
     rot_box.append(&rot_dropdown);
-    let mirror_check = CheckButton::builder().label("مرآة أفقية").active(false).build();
-    rot_box.append(&mirror_check);
+    rot_box.append(&Label::new(Some("مرآة أفقية:")));
+    let mirror_dropdown = DropDown::new(
+        Some(gtk::StringList::new(&["تلقائي", "مفعّلة", "متوقفة"])),
+        gtk::Expression::NONE,
+    );
+    rot_box.append(&mirror_dropdown);
     settings_box.append(&rot_box);
 
     // جهاز V4L2
@@ -242,7 +246,7 @@ fn build_ui(app: &Application, rt: Handle) {
         let entry = device_entry.clone();
         let audio = audio_check.clone();
         let rot_dd = rot_dropdown.clone();
-        let mirror = mirror_check.clone();
+        let mirror_dd = mirror_dropdown.clone();
         let control = control_slot.clone();
         start_btn.connect_clicked(move |_| {
             if slot.borrow().is_some() {
@@ -267,8 +271,15 @@ fn build_ui(app: &Application, rt: Handle) {
                 };
                 let mut cfg = enki_receiver::Config::new(device.clone());
                 cfg.facing = facing;
-                cfg.rotate = [0, 90, 180, 270][(rot_dd.selected() as usize).min(3)];
-                cfg.mirror = mirror.is_active();
+                cfg.rotate = match rot_dd.selected() {
+                    0 => None,
+                    n => Some([0, 90, 180, 270][(n as usize - 1).min(3)]),
+                };
+                cfg.mirror = match mirror_dd.selected() {
+                    0 => None,
+                    1 => Some(true),
+                    _ => Some(false),
+                };
                 log(&tx, format!("> كاميرا Enki ({}) → {device}...\n", facing.as_str()));
                 let (stop_tx, stop_rx) = oneshot::channel();
                 *slot.borrow_mut() = Some(stop_tx);

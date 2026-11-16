@@ -9,7 +9,7 @@
 use enki_protocol::{Channel, FrameHeader, Kind, Preamble, FLAG_DISCONTINUITY, FRAME_HEADER_LEN, PREAMBLE_LEN};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::tcp::OwnedWriteHalf;
@@ -62,10 +62,10 @@ pub struct Config {
     pub fps: u32,
     /// Which phone camera to use at the start (can be changed live with [`Control::SetFacing`]).
     pub facing: Facing,
-    /// Rotate the picture clockwise: 0, 90, 180 or 270 degrees. Applied when the stream starts.
-    pub rotate: u16,
-    /// Mirror the picture horizontally. Applied when the stream starts.
-    pub mirror: bool,
+    /// Rotate the picture clockwise (0, 90, 180, 270). `None` = the default for the active camera.
+    pub rotate: Option<u16>,
+    /// Mirror the picture horizontally. `None` = the default for the active camera.
+    pub mirror: Option<bool>,
     pub adb: String,
     pub ffmpeg: String,
     /// Run `adb forward` before connecting. Tests turn this off.
@@ -81,8 +81,8 @@ impl Config {
             port: DEFAULT_PORT,
             fps: 30,
             facing: Facing::Back,
-            rotate: 0,
-            mirror: false,
+            rotate: None,
+            mirror: None,
             adb: "adb".into(),
             ffmpeg: "ffmpeg".into(),
             setup_adb: true,
@@ -123,7 +123,7 @@ fn log(tx: &Tx, text: impl Into<String>) {
 
 /// State shared between the session loop and the command task.
 struct Shared {
-    facing: Mutex<Facing>,
+    facing: tokio::sync::watch::Sender<Facing>,
     /// Write half of the current control connection (None while not connected).
     writer: tokio::sync::Mutex<Option<OwnedWriteHalf>>,
 }
@@ -141,7 +141,10 @@ pub async fn run_with_commands(
     stop: oneshot::Receiver<()>,
     mut cmds: mpsc::UnboundedReceiver<Control>,
 ) {
-    let shared = Arc::new(Shared { facing: Mutex::new(cfg.facing), writer: tokio::sync::Mutex::new(None) });
+    let shared = Arc::new(Shared {
+        facing: tokio::sync::watch::channel(cfg.facing).0,
+        writer: tokio::sync::Mutex::new(None),
+    });
     let command_task = {
         let shared = shared.clone();
         let tx = tx.clone();
@@ -165,7 +168,7 @@ pub async fn run_with_commands(
 }
 
 async fn apply_facing(shared: &Shared, tx: &Tx, facing: Facing) {
-    *shared.facing.lock().unwrap() = facing;
+    shared.facing.send_replace(facing);
     let mut writer = shared.writer.lock().await;
     if let Some(w) = writer.as_mut() {
         match write_control(w, &set_facing_json(facing)).await {
@@ -217,7 +220,7 @@ async fn open_control(cfg: &Config, shared: &Arc<Shared>, tx: &Tx) -> Option<tok
     Preamble::decode(&reply).ok().filter(|p| p.channel == Channel::Control)?;
     tokio::time::timeout(HANDSHAKE_TIMEOUT, read_control(&mut s)).await.ok()?.ok()?; // phone's hello
 
-    let facing = *shared.facing.lock().unwrap();
+    let facing = *shared.facing.borrow();
     write_control(&mut s, &set_facing_json(facing)).await.ok()?;
     let _ = tokio::time::timeout(ACK_TIMEOUT, async {
         while let Ok(message) = read_control(&mut s).await {
@@ -257,7 +260,7 @@ async fn run_inner(cfg: &Config, tx: &Tx, shared: &Arc<Shared>) -> Result<(), St
             }
             Some(control_reader) => {
                 let outcome = match TcpStream::connect(("127.0.0.1", cfg.port)).await {
-                    Ok(stream) => session(cfg, stream, tx).await,
+                    Ok(stream) => session(cfg, stream, tx, shared).await,
                     Err(_) => Ok(0),
                 };
                 control_reader.abort();
@@ -304,9 +307,65 @@ struct Counters {
     gaps: AtomicU64,
 }
 
+/// Default picture orientation per camera, measured on a phone held landscape with the screen facing you:
+/// the back camera needs 180° + mirror, the front camera 180°. `Config` can override both.
+fn orientation(cfg: &Config, facing: Facing) -> (u16, bool) {
+    let (rotate, mirror) = match facing {
+        Facing::Back => (180, true),
+        Facing::Front => (180, false),
+    };
+    (cfg.rotate.unwrap_or(rotate), cfg.mirror.unwrap_or(mirror))
+}
+
+/// The decoder process that writes to the V4L2 device.
+struct Sink {
+    child: tokio::process::Child,
+    stdin: Option<tokio::process::ChildStdin>,
+}
+
+impl Sink {
+    async fn spawn(cfg: &Config, facing: Facing, tx: &Tx) -> Result<Sink, String> {
+        let (rotate, mirror) = orientation(cfg, facing);
+        let (program, args) = sink_command(cfg, rotate, mirror);
+        let mut child = Command::new(&program)
+            .args(&args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    format!("{program} غير مثبت أو غير موجود في PATH.")
+                } else {
+                    format!("فشل تشغيل {program}: {e}")
+                }
+            })?;
+        let stdin = child.stdin.take().ok_or("تعذر فتح مدخل ffmpeg")?;
+        if let Some(stderr) = child.stderr.take() {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let mut lines = BufReader::new(stderr).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    log(&tx, format!("⚠️ {line}\n"));
+                }
+            });
+        }
+        Ok(Sink { child, stdin: Some(stdin) })
+    }
+
+    /// Closing stdin lets the decoder drain what is left and exit; it is killed only if it does not.
+    async fn stop(&mut self) {
+        self.stdin = None;
+        if tokio::time::timeout(Duration::from_secs(2), self.child.wait()).await.is_err() {
+            let _ = self.child.kill().await;
+        }
+    }
+}
+
 /// One connection to the phone. Returns the number of video frames received (0 means the phone side
 /// was not listening). Fatal problems (bad protocol, ffmpeg failure) are returned as `Err`.
-async fn session(cfg: &Config, mut stream: TcpStream, tx: &Tx) -> Result<u64, String> {
+async fn session(cfg: &Config, mut stream: TcpStream, tx: &Tx, shared: &Shared) -> Result<u64, String> {
     let _ = stream.set_nodelay(true);
     if stream.write_all(&Preamble::new(Channel::Media).encode()).await.is_err() {
         return Ok(0);
@@ -314,7 +373,6 @@ async fn session(cfg: &Config, mut stream: TcpStream, tx: &Tx) -> Result<u64, St
     let mut reply = [0u8; PREAMBLE_LEN];
     match tokio::time::timeout(HANDSHAKE_TIMEOUT, stream.read_exact(&mut reply)).await {
         Ok(Ok(_)) => {}
-        // `adb forward` accepts the connection even if the phone app is not listening, then closes it.
         _ => return Ok(0),
     }
     let peer = Preamble::decode(&reply).map_err(|e| format!("الهاتف يردّ ببروتوكول غير متوافق: {e}"))?;
@@ -322,46 +380,28 @@ async fn session(cfg: &Config, mut stream: TcpStream, tx: &Tx) -> Result<u64, St
         return Err("الهاتف ردّ بقناة غير متوقعة".into());
     }
 
-    let (program, args) = sink_command(cfg);
-    let mut child = Command::new(&program)
-        .args(&args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                format!("{program} غير مثبت أو غير موجود في PATH.")
-            } else {
-                format!("فشل تشغيل {program}: {e}")
-            }
-        })?;
-    let mut sink = child.stdin.take().ok_or("تعذر فتح مدخل ffmpeg")?;
-    if let Some(stderr) = child.stderr.take() {
-        let tx = tx.clone();
-        tokio::spawn(async move {
-            let mut lines = BufReader::new(stderr).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                log(&tx, format!("⚠️ {line}\n"));
-            }
-        });
-    }
+    let mut facing_rx = shared.facing.subscribe();
+    let mut facing = *facing_rx.borrow_and_update();
+    let mut sink = Sink::spawn(cfg, facing, tx).await?;
 
     log(tx, format!("✓ اتصل بالهاتف، البث إلى {}\n", cfg.device));
     let _ = tx.send(Event::State(State::Streaming));
 
     let counters = Arc::new(Counters::default());
     let ticker = tokio::spawn(report_stats(counters.clone(), tx.clone()));
-    let result = pump_frames(&mut stream, &mut sink, &counters).await;
+    let result = pump_frames(&mut stream, &mut sink, &counters, cfg, tx, &mut facing_rx, &mut facing).await;
     ticker.abort();
 
     let frames = counters.frames.load(Ordering::Relaxed);
     match result {
-        Ok(()) => {}
-        Err(PumpError::Protocol(e)) => return Err(format!("بيانات تالفة من الهاتف: {e}")),
+        Ok(()) | Err(PumpError::PhoneClosed) => {}
+        Err(PumpError::Protocol(e)) => {
+            sink.stop().await;
+            return Err(format!("بيانات تالفة من الهاتف: {e}"));
+        }
+        Err(PumpError::Fatal(message)) => return Err(message),
         Err(PumpError::SinkClosed) => {
-            let status = tokio::time::timeout(Duration::from_secs(1), child.wait()).await;
+            let status = tokio::time::timeout(Duration::from_secs(1), sink.child.wait()).await;
             return Err(format!(
                 "توقف ffmpeg ({}). راجع السجل أعلاه؛ تأكد أن {} موجود وأن v4l2loopback محمّل.",
                 match status {
@@ -371,11 +411,8 @@ async fn session(cfg: &Config, mut stream: TcpStream, tx: &Tx) -> Result<u64, St
                 cfg.device
             ));
         }
-        Err(PumpError::PhoneClosed) => {}
     }
-    // Closing stdin lets the decoder drain what is left and exit; only kill it if it does not.
-    drop(sink);
-    let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+    sink.stop().await;
     Ok(frames)
 }
 
@@ -383,29 +420,56 @@ enum PumpError {
     PhoneClosed,
     SinkClosed,
     Protocol(enki_protocol::Error),
+    Fatal(String),
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn pump_frames(
     stream: &mut TcpStream,
-    sink: &mut tokio::process::ChildStdin,
+    sink: &mut Sink,
     counters: &Counters,
+    cfg: &Config,
+    tx: &Tx,
+    facing_rx: &mut tokio::sync::watch::Receiver<Facing>,
+    facing: &mut Facing,
 ) -> Result<(), PumpError> {
     let mut header = [0u8; FRAME_HEADER_LEN];
     let mut payload = Vec::new();
+    // After a restart the new decoder must start at a config frame (the phone sends one before every key frame).
+    let mut wait_for_config = false;
     loop {
         stream.read_exact(&mut header).await.map_err(|_| PumpError::PhoneClosed)?;
         let h = FrameHeader::decode(&header).map_err(PumpError::Protocol)?;
         payload.resize(h.len as usize, 0);
         stream.read_exact(&mut payload).await.map_err(|_| PumpError::PhoneClosed)?;
 
+        // The picture orientation differs per camera and can only change by restarting the decoder.
+        if facing_rx.has_changed().unwrap_or(false) {
+            let new = *facing_rx.borrow_and_update();
+            let changed = orientation(cfg, new) != orientation(cfg, *facing);
+            *facing = new;
+            if changed {
+                sink.stop().await;
+                *sink = Sink::spawn(cfg, new, tx).await.map_err(PumpError::Fatal)?;
+                wait_for_config = true;
+            }
+        }
+
         // Only camera video goes to the decoder; audio arrives in a later phase.
         if h.stream_id != 0 || !matches!(h.kind, Kind::VideoConfig | Kind::VideoKey | Kind::VideoDelta) {
             continue;
         }
+        if wait_for_config {
+            if h.kind != Kind::VideoConfig {
+                continue;
+            }
+            wait_for_config = false;
+        }
         if h.flags & FLAG_DISCONTINUITY != 0 {
             counters.gaps.fetch_add(1, Ordering::Relaxed);
         }
-        sink.write_all(&payload).await.map_err(|_| PumpError::SinkClosed)?;
+        let stdin = sink.stdin.as_mut().ok_or(PumpError::SinkClosed)?;
+        stdin.write_all(&payload).await.map_err(|_| PumpError::SinkClosed)?;
         if h.kind != Kind::VideoConfig {
             counters.frames.fetch_add(1, Ordering::Relaxed);
         }
@@ -435,16 +499,16 @@ async fn report_stats(counters: Arc<Counters>, tx: Tx) {
     }
 }
 
-fn sink_command(cfg: &Config) -> (String, Vec<String>) {
+fn sink_command(cfg: &Config, rotate: u16, mirror: bool) -> (String, Vec<String>) {
     match &cfg.sink_override {
         Some((program, args)) => (program.clone(), args.clone()),
-        None => (cfg.ffmpeg.clone(), ffmpeg_args(&cfg.device, cfg.fps, cfg.rotate, cfg.mirror)),
+        None => (cfg.ffmpeg.clone(), ffmpeg_args(&cfg.device, cfg.fps, rotate, mirror)),
     }
 }
 
 /// ffmpeg arguments tuned for live use: no probing delay and no decoder-side buffering.
 /// `-framerate` matters: without it ffmpeg cannot timestamp the raw H.264 and drops almost every frame.
-/// The last filter pins the output size, so the picture size stays constant when the phone switches camera.
+/// The filter chain pins the output size, so it stays constant when the phone switches camera or the picture is rotated.
 pub fn ffmpeg_args(device: &str, fps: u32, rotate: u16, mirror: bool) -> Vec<String> {
     [
         "-hide_banner", "-loglevel", "warning",
@@ -461,6 +525,9 @@ pub fn ffmpeg_args(device: &str, fps: u32, rotate: u16, mirror: bool) -> Vec<Str
     .collect()
 }
 
+/// Rotation, mirror, then a fit into a fixed 1280x720 frame with black bars. The size never changes, whatever the
+/// rotation or camera, because programs that already opened the V4L2 device expect the size they negotiated;
+/// a different frame size shows up as a garbled picture.
 fn video_filter(rotate: u16, mirror: bool) -> String {
     let mut chain: Vec<&str> = Vec::new();
     match rotate % 360 {
@@ -472,7 +539,9 @@ fn video_filter(rotate: u16, mirror: bool) -> String {
     if mirror {
         chain.push("hflip");
     }
-    chain.push(if rotate % 180 == 90 { "scale=720:1280" } else { "scale=1280:720" });
+    chain.push("scale=1280:720:force_original_aspect_ratio=decrease:force_divisible_by=2");
+    chain.push("pad=1280:720:(ow-iw)/2:(oh-ih)/2");
+    chain.push("setsar=1");
     chain.join(",")
 }
 

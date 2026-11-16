@@ -1,4 +1,5 @@
 use super::*;
+use std::sync::Mutex;
 use tokio::net::TcpListener;
 
 fn frame(stream: u8, kind: Kind, flags: u8, pts: u64, payload: &[u8]) -> Vec<u8> {
@@ -39,9 +40,12 @@ async fn fake_phone(listener: TcpListener, hold_media: bool, received: Received)
                     let _ = s.write_all(&frame(0, Kind::VideoKey, 0, 0, &[0, 0, 1, 0x65])).await;
                     let _ = s.write_all(&frame(1, Kind::AudioFrame, 0, 5, &[9, 9, 9])).await; // must be ignored
                     let _ = s.write_all(&frame(0, Kind::VideoDelta, FLAG_DISCONTINUITY, 33_333, &[0x41, 0x9a])).await;
-                    if hold_media {
-                        let mut b = [0u8; 1];
-                        let _ = s.read(&mut b).await;
+                    // Keep streaming until the receiver hangs up (restart tests need frames to keep arriving).
+                    while hold_media {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        if s.write_all(&frame(0, Kind::VideoDelta, 0, 66_666, &[0x41, 0x9a])).await.is_err() {
+                            break;
+                        }
                     }
                 }
             }
@@ -185,17 +189,72 @@ fn ffmpeg_args_contain_the_settings_that_fixed_the_frozen_picture() {
     let s = ffmpeg_args("/dev/video10", 30, 0, false).join(" ");
     assert!(s.contains("-framerate 30 -f h264 -i -"));
     assert!(s.contains("-fps_mode passthrough"));
-    assert!(s.contains("-vf scale=1280:720"));
+    assert!(s.contains("pad=1280:720"));
     assert!(s.ends_with("-f v4l2 /dev/video10"));
 }
 
+const FIT: &str = "scale=1280:720:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1";
+
 #[test]
-fn video_filter_rotation_and_mirror() {
-    assert_eq!(video_filter(0, false), "scale=1280:720");
-    assert_eq!(video_filter(180, false), "hflip,vflip,scale=1280:720");
-    assert_eq!(video_filter(90, false), "transpose=1,scale=720:1280");
-    assert_eq!(video_filter(270, true), "transpose=2,hflip,scale=720:1280");
-    assert_eq!(video_filter(0, true), "hflip,scale=1280:720");
+fn video_filter_rotation_and_mirror_keep_a_fixed_output_size() {
+    assert_eq!(video_filter(0, false), FIT);
+    assert_eq!(video_filter(180, false), format!("hflip,vflip,{FIT}"));
+    assert_eq!(video_filter(90, false), format!("transpose=1,{FIT}"));
+    assert_eq!(video_filter(270, true), format!("transpose=2,hflip,{FIT}"));
+    assert_eq!(video_filter(0, true), format!("hflip,{FIT}"));
+}
+
+#[test]
+fn default_orientation_per_camera_and_overrides() {
+    let mut cfg = Config::new("/dev/null");
+    assert_eq!(orientation(&cfg, Facing::Back), (180, true));
+    assert_eq!(orientation(&cfg, Facing::Front), (180, false));
+    cfg.rotate = Some(90);
+    cfg.mirror = Some(false);
+    assert_eq!(orientation(&cfg, Facing::Back), (90, false));
+    assert_eq!(orientation(&cfg, Facing::Front), (90, false));
+}
+
+#[tokio::test]
+async fn decoder_restarts_only_when_the_orientation_changes_with_the_camera() {
+    let (port, received) = start_phone(true).await;
+    let marker = std::env::temp_dir().join(format!("enki-restart-{}-{port}", std::process::id()));
+    let _ = std::fs::remove_file(&marker);
+    let mut cfg = test_config(port);
+    cfg.facing = Facing::Front;
+    cfg.sink_override = Some((
+        "sh".into(),
+        vec!["-c".into(), format!("echo started >> {}; cat > /dev/null", marker.display())],
+    ));
+    let starts = || std::fs::read_to_string(&marker).map(|t| t.lines().count()).unwrap_or(0);
+
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let (stop_tx, stop_rx) = oneshot::channel();
+    let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+    let task = tokio::spawn(run_with_commands(cfg, tx, stop_rx, cmd_rx));
+
+    async fn wait_for(mut cond: impl FnMut() -> bool) -> bool {
+        for _ in 0..60 {
+            if cond() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        false
+    }
+    assert!(wait_for(|| starts() == 1).await, "first decoder start");
+    assert!(wait_for(|| received.lock().unwrap().len() == 1).await);
+
+    cmd_tx.send(Control::SetFacing(Facing::Front)).unwrap(); // same camera: nothing to restart
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(starts(), 1, "same orientation must not restart the decoder");
+
+    cmd_tx.send(Control::SetFacing(Facing::Back)).unwrap(); // front (180, no mirror) -> back (180, mirror)
+    assert!(wait_for(|| starts() == 2).await, "a different orientation restarts the decoder");
+
+    let _ = stop_tx.send(());
+    task.await.unwrap();
+    let _ = std::fs::remove_file(&marker);
 }
 
 #[test]
