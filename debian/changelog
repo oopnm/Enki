@@ -1,3 +1,10 @@
+enki (0.2.0-1) unstable; urgency=medium
+
+  * Phone camera through the Enki Android app, auto rotate, front/back switching.
+  * Depend on ffmpeg and adb.
+
+ -- Ahmed Al-Iraqi <ahmed@local>  Mon, 16 Nov 2026 21:00:00 +0300
+
 enki (0.1.0-1) unstable; urgency=medium
 
   * Initial release of Enki.

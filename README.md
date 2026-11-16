@@ -15,7 +15,7 @@ Named after Enki, the Sumerian god of fresh water and wisdom.
 | `android/` | Android app (Kotlin, minSdk 24) and a pure-JVM `protocol` module |
 | `protocol/` | Shared test vectors for both sides |
 | `packaging/` | Arch, Fedora, AppImage files (Debian files are in `debian/`) |
-| `docs/` | Protocol specification |
+| `docs/` | Protocol specification (`protocol.md`) and the plan (`ROADMAP.md`) |
 
 ## Build
 

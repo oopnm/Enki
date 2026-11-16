@@ -63,7 +63,7 @@ dependencies = [
 
 [[package]]
 name = "enki-gui"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "enki-receiver",
  "gtk4",
@@ -72,11 +72,11 @@ dependencies = [
 
 [[package]]
 name = "enki-protocol"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "enki-receiver"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "enki-protocol",
  "tokio",
