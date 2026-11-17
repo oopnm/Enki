@@ -81,25 +81,54 @@ After the preamble: a sequence of messages, each a `u32` length followed by that
 
 | Type | Direction | Purpose |
 |---|---|---|
-| `hello` | both | `{"type":"hello","version":1,"app":"enki-android","app_version":"0.2.0"}` |
-| `capabilities` | phone → PC | cameras, sizes, fps ranges, supported controls (ranges and enums) |
-| `start` / `stop` | PC → phone | begin or end a stream with the chosen settings |
-| `set` | PC → phone | change one setting live: `{"type":"set","key":"camera.zoom","value":2.0}` |
-| `state` | phone → PC | current stream state and applied settings |
-| `error` | both | `{"type":"error","code":"camera_in_use","message":"..."}` |
+| `hello` | phone → PC | First message: `{"type":"hello","version":1,"app":"enki-android","app_version":"0.2.0","device":"Pixel 6","android":28}` |
+| `capabilities` | phone → PC | Sent right after `hello`: what each camera can do (below) |
+| `ping` / `pong` | PC → phone / phone → PC | Heartbeat, `{"type":"ping","seq":7}` answered by `{"type":"pong","seq":7}` |
+| `set` | PC → phone | Change one setting live: `{"type":"set","key":"camera.facing","value":"front"}` |
+| `state` | phone → PC | A setting's current value: `{"type":"state","key":"image.rotation","value":180}` |
+| `error` | phone → PC | `{"type":"error","code":"bad_value","message":"..."}` |
+
+The exact JSON of each message is in `protocol/vectors/control.txt`; the Rust and the Android tests both check it.
+
+### Capabilities
+
+```json
+{"type":"capabilities","cameras":[{"id":"0","facing":"back","sensor_orientation":90,
+ "sizes":[[1920,1080],[1280,720]],"fps_ranges":[[15,30],[30,30]],"zoom_max":8.0,"flash":true,
+ "focus_modes":["continuous","auto"],"ev_range":[-4,4],"ev_step":0.5}],"codecs":["h264","hevc"]}
+```
+
+`sizes` are video sizes the camera can feed the encoder, largest first (at most 12, none above 3840x2160).
+`focus_modes` is a subset of `continuous`, `auto`, `manual`; `ev_range` is in steps of `ev_step` EV. Every field is
+optional for the reader (missing ones take empty or zero values) and unknown fields are ignored. The desktop UI offers
+only what the phone reports.
+
+### Heartbeat and lost links
+
+The PC sends a `ping` once a second. The phone answers at once with a `pong` carrying the same `seq`, which gives the
+PC a round-trip time. The PC treats the link as lost when the phone has sent nothing for 3 s; the phone does the same
+when it has received nothing for 5 s, and then closes the media connection so the camera stops. TCP over `adb forward`
+can stay open for minutes after the cable is pulled, so this is what makes unplug and replug recover by itself: the
+PC then reconnects and hands the phone a token again if the phone app lost it.
+
+### Bit rate
+
+The phone watches its send queue. When the PC or the cable cannot keep up and frames are dropped, it lowers the
+encoder's bit rate by 30 % (never below 0.5 Mbit/s) and raises it by 15 % after 5 quiet seconds, up to the 4 Mbit/s
+target. It reports the current target as `{"type":"state","key":"stream.bitrate","value":2800}` (kbit/s), once when
+streaming starts and after every change.
 
 ### Settings implemented so far
 
 | Key | Values | Behavior |
 |---|---|---|
 | `camera.facing` | `"back"`, `"front"` | Chooses the camera. The phone remembers it and uses it for the next media connection; if a media stream is running it switches camera at once (a new config + key frame follows). The phone confirms with `{"type":"state","key":"camera.facing","value":"front"}` (after an `image.rotation` state), or answers `{"type":"error","code":"bad_value",...}`. |
-
 | `image.rotation` | `0`, `90`, `180`, `270` (phone → PC, `state` only) | Clockwise rotation that makes the picture upright, computed on the phone from the camera's sensor orientation and the phone's accelerometer (`OrientationEventListener`, independent of the screen-rotation lock; 15° hysteresis). Sent after every `camera.facing` set and whenever the phone is turned. The PC applies it when "auto rotate" is on. |
+| `stream.bitrate` | kbit/s (phone → PC, `state` only) | The encoder's current target bit rate, see above. |
 
-The PC opens the control connection first, sends `camera.facing`, waits briefly for the `state` reply
-(old phone apps never reply, so it gives up after 1 s), and only then opens the media connection.
+The PC opens the control connection first, reads `hello` (and `capabilities`), sends `camera.facing`, waits up to 1 s
+for the `state` reply, and only then opens the media connection.
 
-The desktop UI is built from `capabilities`; a setting the phone does not report is not shown.
 Unknown message types and unknown keys are ignored, so newer peers can talk to older ones.
 
 ## Compatibility

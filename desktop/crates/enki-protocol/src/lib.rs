@@ -5,6 +5,8 @@
 //! payload bytes. A control connection carries length-prefixed JSON messages (handled elsewhere).
 //! All integers are big-endian. See `docs/protocol.md`.
 
+pub mod control;
+
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 

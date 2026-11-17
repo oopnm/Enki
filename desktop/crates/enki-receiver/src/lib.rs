@@ -7,26 +7,31 @@
 //!
 //! Everything is reported through [`Event`]s, so any UI (GTK today) can show the state.
 
+use enki_protocol::control::Message;
 use enki_protocol::{
     auth_mac, to_hex, AuthStatus, Channel, FrameHeader, Kind, Preamble, FLAG_DISCONTINUITY, FRAME_HEADER_LEN, MAC_LEN,
     NONCE_LEN, PREAMBLE_LEN, TOKEN_LEN,
 };
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::tcp::OwnedWriteHalf;
 use tokio::net::TcpStream;
 use tokio::process::Command;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Notify};
+
+pub use enki_protocol::control::Capabilities;
 
 pub const DEFAULT_PORT: u16 = 28200;
 const RETRY_DELAY: Duration = Duration::from_millis(1500);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3);
 /// How long to wait for the phone to confirm a setting before streaming anyway (older apps never confirm).
 const ACK_TIMEOUT: Duration = Duration::from_secs(1);
-const MAX_CONTROL: usize = 1024 * 1024;
+/// How often the PC pings the phone, and how long without any message from the phone counts as a lost link.
+const PING_INTERVAL: Duration = Duration::from_secs(1);
+const LINK_TIMEOUT: Duration = Duration::from_secs(3);
 /// The phone app's content provider that accepts the session token, and only from adb (shell uid).
 const PROVISION_URI: &str = "content://io.github.oopnm.enki.provision";
 
@@ -110,7 +115,8 @@ impl Config {
             token: random_token(),
             adb: "adb".into(),
             ffmpeg: "ffmpeg".into(),
-            setup_adb: true,
+            // ENKI_NO_ADB=1 skips adb and the token hand-over: for talking to `enki-fakephone --accept-any-token`.
+            setup_adb: std::env::var_os("ENKI_NO_ADB").is_none(),
             sink_override: None,
         }
     }
@@ -141,13 +147,71 @@ pub struct Stats {
     pub kbps: u32,
     /// Frames the phone reported as dropped before delivery (discontinuities), cumulative.
     pub gaps: u64,
+    /// Round trip of the last ping, in milliseconds.
+    pub rtt_ms: Option<u32>,
+    /// The bit rate the phone's encoder currently aims for (it lowers it when the link cannot keep up).
+    pub bitrate_kbps: Option<u32>,
 }
 
+/// Where the connection to the phone stands, for the UI's status line.
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LinkState {
+    /// `adb forward` and handing the phone the session token.
+    Preparing,
+    /// The phone app is not accepting connections yet.
+    WaitingForApp,
+    /// Authenticated; the camera is being opened.
+    Ready,
+    Streaming,
+    /// The link dropped (cable, app stopped, no heartbeat); trying again. Carries the reason.
+    Reconnecting(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProblemCode {
+    AdbMissing,
+    /// No phone, or it has not authorised this computer for USB debugging.
+    NoDevice,
+    ProvisionFailed,
+    /// The phone app speaks another protocol version.
+    VersionMismatch,
+    /// The phone refused the session token.
+    AuthRejected,
+    FfmpegMissing,
+    /// ffmpeg could not write to the V4L2 device (module not loaded, wrong number).
+    OutputDevice,
+    Other,
+}
+
+/// A problem that ended the session, with a code the UI can attach a fix to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Problem {
+    pub code: ProblemCode,
+    pub message: String,
+}
+
+impl Problem {
+    fn new(code: ProblemCode, message: impl Into<String>) -> Self {
+        Problem { code, message: message.into() }
+    }
+}
+
+impl From<String> for Problem {
+    fn from(message: String) -> Self {
+        Problem::new(ProblemCode::Other, message)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum Event {
     Log(String),
     State(State),
     Stats(Stats),
+    Link(LinkState),
+    /// What the phone's cameras can do (sent once per connection).
+    Capabilities(Capabilities),
+    /// The session ended because of this; also logged.
+    Problem(Problem),
 }
 
 type Tx = mpsc::UnboundedSender<Event>;
@@ -161,6 +225,61 @@ struct Shared {
     live: tokio::sync::watch::Sender<Live>,
     /// Write half of the current control connection (None while not connected).
     writer: tokio::sync::Mutex<Option<OwnedWriteHalf>>,
+    epoch: Instant,
+    /// Milliseconds since `epoch` at which the phone last sent anything on the control channel.
+    last_seen_ms: AtomicU64,
+    /// Round trip of the last answered ping in milliseconds (0 = none yet).
+    rtt_ms: AtomicU32,
+    /// Bit rate the phone reported for its encoder, in kbit/s (0 = unknown).
+    bitrate_kbps: AtomicU32,
+    /// Sequence number of the last ping and when it was sent.
+    ping: std::sync::Mutex<(u64, Option<Instant>)>,
+}
+
+impl Shared {
+    fn new(live: Live) -> Self {
+        Shared {
+            live: tokio::sync::watch::channel(live).0,
+            writer: tokio::sync::Mutex::new(None),
+            epoch: Instant::now(),
+            last_seen_ms: AtomicU64::new(0),
+            rtt_ms: AtomicU32::new(0),
+            bitrate_kbps: AtomicU32::new(0),
+            ping: std::sync::Mutex::new((0, None)),
+        }
+    }
+
+    fn touch(&self) {
+        self.last_seen_ms.store(self.epoch.elapsed().as_millis() as u64, Ordering::Relaxed);
+    }
+
+    fn since_seen(&self) -> Duration {
+        let last = Duration::from_millis(self.last_seen_ms.load(Ordering::Relaxed));
+        self.epoch.elapsed().saturating_sub(last)
+    }
+
+    /// Starts a new ping and returns its sequence number.
+    fn next_ping(&self) -> u64 {
+        let mut p = self.ping.lock().unwrap();
+        p.0 += 1;
+        p.1 = Some(Instant::now());
+        p.0
+    }
+
+    fn pong(&self, seq: u64) {
+        let p = self.ping.lock().unwrap();
+        if let (true, Some(sent)) = (p.0 == seq, p.1) {
+            self.rtt_ms.store((sent.elapsed().as_millis() as u32).max(1), Ordering::Relaxed);
+        }
+    }
+
+    /// A new connection starts with nothing known about the phone.
+    fn reset_link(&self) {
+        self.rtt_ms.store(0, Ordering::Relaxed);
+        self.bitrate_kbps.store(0, Ordering::Relaxed);
+        self.live.send_modify(|l| l.phone_rotation = None); // a rotation from an earlier connection is stale
+        self.touch();
+    }
 }
 
 /// Runs until `stop` fires. Always ends with `Event::State(State::Stopped)`.
@@ -176,15 +295,7 @@ pub async fn run_with_commands(
     stop: oneshot::Receiver<()>,
     mut cmds: mpsc::UnboundedReceiver<Control>,
 ) {
-    let shared = Arc::new(Shared {
-        live: tokio::sync::watch::channel(Live {
-            facing: cfg.facing,
-            auto_rotate: cfg.auto_rotate,
-            phone_rotation: None,
-        })
-        .0,
-        writer: tokio::sync::Mutex::new(None),
-    });
+    let shared = Arc::new(Shared::new(Live { facing: cfg.facing, auto_rotate: cfg.auto_rotate, phone_rotation: None }));
     let command_task = {
         let shared = shared.clone();
         let tx = tx.clone();
@@ -203,8 +314,9 @@ pub async fn run_with_commands(
     };
     tokio::select! {
         result = run_inner(&cfg, &tx, &shared) => {
-            if let Err(message) = result {
-                log(&tx, format!("❌ {message}\n"));
+            if let Err(problem) = result {
+                log(&tx, format!("❌ {}\n", problem.message));
+                let _ = tx.send(Event::Problem(problem));
             }
         }
         _ = stop => log(&tx, "🛑 تم إيقاف البث.\n"),
@@ -218,7 +330,7 @@ async fn apply_facing(shared: &Shared, tx: &Tx, facing: Facing) {
     shared.live.send_modify(|l| l.facing = facing);
     let mut writer = shared.writer.lock().await;
     if let Some(w) = writer.as_mut() {
-        match write_control(w, &set_facing_json(facing)).await {
+        match write_message(w, &Message::set("camera.facing", facing.as_str())).await {
             Ok(()) => log(tx, format!("🔄 تبديل الكاميرا إلى {}\n", facing.label())),
             Err(e) => {
                 *writer = None;
@@ -229,48 +341,66 @@ async fn apply_facing(shared: &Shared, tx: &Tx, facing: Facing) {
     // Not connected yet: the new value is sent as soon as the next connection is made.
 }
 
-/// The rotation from an `image.rotation` state message, e.g. `{"type":"state","key":"image.rotation","value":180}`.
-/// Plain string search: key order inside the JSON is not guaranteed and this avoids a JSON dependency.
-fn parse_rotation(message: &str) -> Option<u16> {
-    if !message.contains("\"image.rotation\"") {
-        return None;
+fn valid_rotation(value: &enki_protocol::control::Value) -> Option<u16> {
+    let v = value.as_u64()?;
+    (v < 360 && v % 90 == 0).then_some(v as u16)
+}
+
+/// Applies one control message from the phone. Any message proves the link is alive.
+fn handle_message(shared: &Shared, tx: &Tx, message: Message) {
+    shared.touch();
+    match message {
+        Message::State { key, value } => match key.as_str() {
+            "image.rotation" => {
+                if let Some(rotation) = valid_rotation(&value) {
+                    shared.live.send_modify(|l| l.phone_rotation = Some(rotation));
+                }
+            }
+            "stream.bitrate" => {
+                if let Some(kbps) = value.as_u64() {
+                    shared.bitrate_kbps.store(kbps.min(u32::MAX as u64) as u32, Ordering::Relaxed);
+                }
+            }
+            _ => {}
+        },
+        Message::Pong { seq } => shared.pong(seq),
+        Message::Hello { device, app_version, .. } => {
+            let device = if device.is_empty() { "?" } else { &device };
+            log(tx, format!("📱 الهاتف: {device} (Enki {app_version})\n"));
+        }
+        Message::Capabilities(caps) => {
+            let cameras: Vec<String> = caps
+                .cameras
+                .iter()
+                .map(|c| match c.sizes.first() {
+                    Some([w, h]) => format!("{} {w}x{h}", c.facing),
+                    None => c.facing.clone(),
+                })
+                .collect();
+            log(tx, format!("📷 كاميرات الهاتف: {}\n", cameras.join("، ")));
+            let _ = tx.send(Event::Capabilities(caps));
+        }
+        Message::Error { code, message } => log(tx, format!("⚠️ الهاتف: {code}: {message}\n")),
+        _ => {}
     }
-    let rest = message[message.find("\"value\"")? + "\"value\"".len()..].trim_start().strip_prefix(':')?.trim_start();
-    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-    let value: u16 = digits.parse().ok()?;
-    (value < 360 && value % 90 == 0).then_some(value)
 }
 
-fn handle_state(shared: &Shared, message: &str) {
-    if let Some(rotation) = parse_rotation(message) {
-        shared.live.send_modify(|l| l.phone_rotation = Some(rotation));
-    }
-}
-
-fn set_facing_json(facing: Facing) -> String {
-    format!(r#"{{"type":"set","key":"camera.facing","value":"{}"}}"#, facing.as_str())
-}
-
-/// Control messages are a big-endian u32 length followed by UTF-8 JSON (docs/protocol.md).
-async fn write_control<W: AsyncWriteExt + Unpin>(w: &mut W, json: &str) -> std::io::Result<()> {
-    let body = json.as_bytes();
-    let mut msg = Vec::with_capacity(4 + body.len());
-    msg.extend_from_slice(&(body.len() as u32).to_be_bytes());
-    msg.extend_from_slice(body);
-    w.write_all(&msg).await?;
+async fn write_message<W: AsyncWriteExt + Unpin>(w: &mut W, message: &Message) -> std::io::Result<()> {
+    w.write_all(&message.encode()).await?;
     w.flush().await
 }
 
-async fn read_control<R: AsyncReadExt + Unpin>(r: &mut R) -> std::io::Result<String> {
+/// One control message. Text that is not a known message (a newer phone) comes back as [`Message::Unknown`].
+async fn read_message<R: AsyncReadExt + Unpin>(r: &mut R) -> std::io::Result<Message> {
     let mut len = [0u8; 4];
     r.read_exact(&mut len).await?;
     let len = u32::from_be_bytes(len) as usize;
-    if len > MAX_CONTROL {
+    if len > enki_protocol::control::MAX_CONTROL {
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "control message too large"));
     }
     let mut body = vec![0u8; len];
     r.read_exact(&mut body).await?;
-    Ok(String::from_utf8_lossy(&body).into_owned())
+    Ok(Message::from_json(&String::from_utf8_lossy(&body)).unwrap_or(Message::Unknown))
 }
 
 /// Why a connection to the phone did not become an authenticated Enki Link channel.
@@ -287,19 +417,27 @@ enum ConnectError {
 }
 
 impl ConnectError {
-    fn message(&self) -> String {
-        match self {
-            ConnectError::NotListening => "الهاتف لا يستمع على المنفذ.".into(),
-            ConnectError::OtherVersion(v) => format!(
-                "تطبيق Enki على الهاتف يستخدم بروتوكولاً مختلفاً (النسخة {v}، المطلوب {}). ثبّت على الهاتف تطبيق Enki من نفس إصدار برنامج الحاسوب.",
-                enki_protocol::VERSION
+    fn problem(&self) -> Problem {
+        let (code, message) = match self {
+            ConnectError::NotListening => (ProblemCode::Other, "الهاتف لا يستمع على المنفذ.".to_string()),
+            ConnectError::OtherVersion(v) => (
+                ProblemCode::VersionMismatch,
+                format!(
+                    "تطبيق Enki على الهاتف يستخدم بروتوكولاً مختلفاً (النسخة {v}، المطلوب {}). ثبّت على الهاتف تطبيق Enki من نفس إصدار برنامج الحاسوب.",
+                    enki_protocol::VERSION
+                ),
             ),
-            ConnectError::Auth(AuthStatus::NotProvisioned) => {
-                "الهاتف لم يستلم مفتاح الجلسة. أعد تشغيل البث؛ وإن تكرر ذلك فحدّث تطبيق الهاتف.".into()
-            }
-            ConnectError::Auth(_) => "الهاتف رفض مفتاح الجلسة. أوقف البث على الهاتف ثم شغّله من جديد.".into(),
-            ConnectError::Protocol(m) => format!("بروتوكول غير متوقع من الهاتف: {m}"),
-        }
+            ConnectError::Auth(AuthStatus::NotProvisioned) => (
+                ProblemCode::AuthRejected,
+                "الهاتف لم يستلم مفتاح الجلسة. أعد تشغيل البث؛ وإن تكرر ذلك فحدّث تطبيق الهاتف.".to_string(),
+            ),
+            ConnectError::Auth(_) => (
+                ProblemCode::AuthRejected,
+                "الهاتف رفض مفتاح الجلسة. أوقف البث على الهاتف ثم شغّله من جديد.".to_string(),
+            ),
+            ConnectError::Protocol(m) => (ProblemCode::Other, format!("بروتوكول غير متوقع من الهاتف: {m}")),
+        };
+        Problem::new(code, message)
     }
 }
 
@@ -338,23 +476,27 @@ async fn connect_authenticated(cfg: &Config, channel: Channel) -> Result<TcpStre
 }
 
 /// Connects the control channel, tells the phone which camera to use and waits briefly for its
-/// confirmation, so the camera that opens next is the right one. Returns a task that reads (and logs
-/// errors from) the rest of the connection.
+/// confirmation, so the camera that opens next is the right one. Returns a task that reads the rest of the
+/// connection (rotation, bit rate, pongs, errors) until the phone closes it.
 async fn open_control(cfg: &Config, shared: &Arc<Shared>, tx: &Tx) -> Result<tokio::task::JoinHandle<()>, ConnectError> {
-    shared.live.send_modify(|l| l.phone_rotation = None); // a rotation from an earlier connection is stale
+    shared.reset_link();
     let mut s = connect_authenticated(cfg, Channel::Control).await?;
-    tokio::time::timeout(HANDSHAKE_TIMEOUT, read_control(&mut s))
+    let hello = tokio::time::timeout(HANDSHAKE_TIMEOUT, read_message(&mut s))
         .await
         .map_err(|_| ConnectError::NotListening)?
-        .map_err(|_| ConnectError::NotListening)?; // phone's hello
+        .map_err(|_| ConnectError::NotListening)?;
+    handle_message(shared, tx, hello);
 
     let facing = shared.live.borrow().facing;
-    write_control(&mut s, &set_facing_json(facing)).await.map_err(|_| ConnectError::NotListening)?;
+    write_message(&mut s, &Message::set("camera.facing", facing.as_str()))
+        .await
+        .map_err(|_| ConnectError::NotListening)?;
     let _ = tokio::time::timeout(ACK_TIMEOUT, async {
-        // The phone sends its picture rotation first and then confirms the camera.
-        while let Ok(message) = read_control(&mut s).await {
-            handle_state(shared, &message);
-            if message.contains("\"camera.facing\"") {
+        // The phone sends its capabilities and picture rotation first and then confirms the camera.
+        while let Ok(message) = read_message(&mut s).await {
+            let confirmed = matches!(&message, Message::State { key, .. } if key == "camera.facing");
+            handle_message(shared, tx, message);
+            if confirmed {
                 break;
             }
         }
@@ -366,19 +508,56 @@ async fn open_control(cfg: &Config, shared: &Arc<Shared>, tx: &Tx) -> Result<tok
     let tx = tx.clone();
     let shared = shared.clone();
     Ok(tokio::spawn(async move {
-        while let Ok(message) = read_control(&mut read_half).await {
-            handle_state(&shared, &message);
-            if message.contains("\"error\"") {
-                log(&tx, format!("⚠️ الهاتف: {message}\n"));
-            }
+        while let Ok(message) = read_message(&mut read_half).await {
+            handle_message(&shared, &tx, message);
         }
     }))
 }
 
-async fn run_inner(cfg: &Config, tx: &Tx, shared: &Arc<Shared>) -> Result<(), String> {
+/// Pings the phone every second. Fires `dead` when the phone has said nothing for [`LINK_TIMEOUT`] (a pulled
+/// cable or a frozen app: TCP alone may not notice for minutes) or when a ping cannot be written.
+async fn heartbeat(shared: Arc<Shared>, dead: Arc<Notify>) {
+    shared.touch();
+    let mut tick = tokio::time::interval(PING_INTERVAL);
+    tick.tick().await;
+    loop {
+        tick.tick().await;
+        if shared.since_seen() > LINK_TIMEOUT {
+            dead.notify_one();
+            return;
+        }
+        let seq = shared.next_ping();
+        let mut writer = shared.writer.lock().await;
+        let failed = match writer.as_mut() {
+            Some(w) => write_message(w, &Message::Ping { seq }).await.is_err(),
+            None => false,
+        };
+        if failed {
+            *writer = None;
+            dead.notify_one();
+            return;
+        }
+    }
+}
+
+/// Sends a [`LinkState`] only when it differs from the last one sent.
+struct LinkTracker(Option<LinkState>);
+
+impl LinkTracker {
+    fn set(&mut self, tx: &Tx, state: LinkState) {
+        if self.0.as_ref() != Some(&state) {
+            self.0 = Some(state.clone());
+            let _ = tx.send(Event::Link(state));
+        }
+    }
+}
+
+async fn run_inner(cfg: &Config, tx: &Tx, shared: &Arc<Shared>) -> Result<(), Problem> {
+    let mut link = LinkTracker(None);
     // True right after the token was handed to the phone: a refusal then is final, not a stale token.
     let mut fresh = false;
     if cfg.setup_adb {
+        link.set(tx, LinkState::Preparing);
         adb_forward(cfg).await?;
         log(tx, format!("✓ adb forward على المنفذ {}\n", cfg.port));
         provision(cfg).await?;
@@ -390,6 +569,7 @@ async fn run_inner(cfg: &Config, tx: &Tx, shared: &Arc<Shared>) -> Result<(), St
         let _ = tx.send(Event::State(State::Connecting));
         match open_control(cfg, shared, tx).await {
             Err(ConnectError::NotListening) => {
+                link.set(tx, LinkState::WaitingForApp);
                 if !hinted {
                     log(tx, "بانتظار الهاتف: افتح تطبيق Enki واضغط Start (وإن كان مفتوحاً فتأكد أنه من نفس إصدار برنامج الحاسوب).\n");
                     hinted = true;
@@ -398,23 +578,45 @@ async fn run_inner(cfg: &Config, tx: &Tx, shared: &Arc<Shared>) -> Result<(), St
             Err(ConnectError::Auth(status)) if cfg.setup_adb && !fresh => {
                 // The phone app was restarted since we gave it the token, so it lost it: give it again.
                 log(tx, format!("🔑 الهاتف لا يملك المفتاح الحالي ({status:?})، أعيد تزويده.\n"));
+                link.set(tx, LinkState::Preparing);
                 provision(cfg).await?;
                 fresh = true;
                 continue;
             }
-            Err(e) => return Err(e.message()),
-            Ok(control_reader) => {
+            Err(e) => return Err(e.problem()),
+            Ok(mut control_reader) => {
                 fresh = false;
-                let outcome = match connect_authenticated(cfg, Channel::Media).await {
-                    Ok(stream) => session(cfg, stream, tx, shared).await,
-                    Err(ConnectError::NotListening) => Ok(0),
-                    Err(e) => Err(e.message()),
+                link.set(tx, LinkState::Ready);
+                let dead = Arc::new(Notify::new());
+                let beat = tokio::spawn(heartbeat(shared.clone(), dead.clone()));
+                let outcome = tokio::select! {
+                    r = async {
+                        match connect_authenticated(cfg, Channel::Media).await {
+                            Ok(stream) => session(cfg, stream, tx, shared).await,
+                            Err(ConnectError::NotListening) => Ok(0),
+                            Err(e) => Err(e.problem()),
+                        }
+                    } => r,
+                    _ = dead.notified() => {
+                        log(tx, "⚠️ انقطع الاتصال بالهاتف (لا ردّ على النبض). أعيد الاتصال...\n");
+                        link.set(tx, LinkState::Reconnecting("no heartbeat".into()));
+                        Ok(0)
+                    }
+                    _ = &mut control_reader => {
+                        log(tx, "⚠️ الهاتف أغلق قناة التحكم. أعيد الاتصال...\n");
+                        link.set(tx, LinkState::Reconnecting("control channel closed".into()));
+                        Ok(0)
+                    }
                 };
+                beat.abort();
                 control_reader.abort();
                 *shared.writer.lock().await = None;
                 if outcome? > 0 {
                     log(tx, "الهاتف أنهى البث. بانتظار اتصال جديد...\n");
+                    link.set(tx, LinkState::Reconnecting("phone ended the stream".into()));
                     hinted = false;
+                } else if link.0 == Some(LinkState::Ready) || link.0 == Some(LinkState::Streaming) {
+                    link.0 = None; // the next round reports where it stands
                 }
             }
         }
@@ -424,24 +626,31 @@ async fn run_inner(cfg: &Config, tx: &Tx, shared: &Arc<Shared>) -> Result<(), St
 
 /// Gives the phone this session's token: `adb shell content call` on the app's provider, which accepts it only
 /// from the adb shell. Another app on the phone cannot do that, so it never learns the token.
-async fn provision(cfg: &Config) -> Result<(), String> {
+async fn provision(cfg: &Config) -> Result<(), Problem> {
     let out = Command::new(&cfg.adb)
         .args(["shell", "content", "call", "--uri", PROVISION_URI, "--method", "provision", "--arg", &to_hex(&cfg.token)])
         .stdin(Stdio::null())
         .output()
         .await
-        .map_err(|e| format!("تعذر تشغيل adb: {e}"))?;
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                Problem::new(ProblemCode::AdbMissing, "adb غير مثبت (ثبّت android-tools / adb).")
+            } else {
+                Problem::new(ProblemCode::Other, format!("تعذر تشغيل adb: {e}"))
+            }
+        })?;
     let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
     if out.status.success() && text.contains("ok=true") {
         return Ok(());
     }
     let detail = text.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("لا يوجد ردّ").to_string();
-    Err(format!(
-        "تعذر تزويد الهاتف بمفتاح الجلسة ({detail}). تأكد أن تطبيق Enki على الهاتف من نفس إصدار برنامج الحاسوب، وأن الهاتف مصرّح له بـ adb."
+    Err(Problem::new(
+        ProblemCode::ProvisionFailed,
+        format!("تعذر تزويد الهاتف بمفتاح الجلسة ({detail}). تأكد أن تطبيق Enki على الهاتف من نفس إصدار برنامج الحاسوب، وأن الهاتف مصرّح له بـ adb."),
     ))
 }
 
-async fn adb_forward(cfg: &Config) -> Result<(), String> {
+async fn adb_forward(cfg: &Config) -> Result<(), Problem> {
     let spec = format!("tcp:{}", cfg.port);
     let out = Command::new(&cfg.adb)
         .args(["forward", &spec, &spec])
@@ -450,9 +659,9 @@ async fn adb_forward(cfg: &Config) -> Result<(), String> {
         .await
         .map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
-                "adb غير مثبت (ثبّت android-tools / adb).".to_string()
+                Problem::new(ProblemCode::AdbMissing, "adb غير مثبت (ثبّت android-tools / adb).")
             } else {
-                format!("تعذر تشغيل adb: {e}")
+                Problem::new(ProblemCode::Other, format!("تعذر تشغيل adb: {e}"))
             }
         })?;
     if out.status.success() {
@@ -460,9 +669,12 @@ async fn adb_forward(cfg: &Config) -> Result<(), String> {
     }
     let stderr = String::from_utf8_lossy(&out.stderr);
     if stderr.contains("no devices") || stderr.contains("unauthorized") {
-        Err("لا يوجد هاتف جاهز: وصّله بـ USB، فعّل USB debugging، ووافق على نافذة التصريح في الهاتف.".into())
+        Err(Problem::new(
+            ProblemCode::NoDevice,
+            "لا يوجد هاتف جاهز: وصّله بـ USB، فعّل USB debugging، ووافق على نافذة التصريح في الهاتف.",
+        ))
     } else {
-        Err(format!("فشل adb forward: {}", stderr.trim()))
+        Err(Problem::new(ProblemCode::Other, format!("فشل adb forward: {}", stderr.trim())))
     }
 }
 
@@ -496,7 +708,7 @@ struct Sink {
 }
 
 impl Sink {
-    async fn spawn(cfg: &Config, (rotate, mirror): (u16, bool), tx: &Tx) -> Result<Sink, String> {
+    async fn spawn(cfg: &Config, (rotate, mirror): (u16, bool), tx: &Tx) -> Result<Sink, Problem> {
         let (program, args) = sink_command(cfg, rotate, mirror);
         let mut child = Command::new(&program)
             .args(&args)
@@ -507,12 +719,12 @@ impl Sink {
             .spawn()
             .map_err(|e| {
                 if e.kind() == std::io::ErrorKind::NotFound {
-                    format!("{program} غير مثبت أو غير موجود في PATH.")
+                    Problem::new(ProblemCode::FfmpegMissing, format!("{program} غير مثبت أو غير موجود في PATH."))
                 } else {
-                    format!("فشل تشغيل {program}: {e}")
+                    Problem::new(ProblemCode::Other, format!("فشل تشغيل {program}: {e}"))
                 }
             })?;
-        let stdin = child.stdin.take().ok_or("تعذر فتح مدخل ffmpeg")?;
+        let stdin = child.stdin.take().ok_or_else(|| Problem::from("تعذر فتح مدخل ffmpeg".to_string()))?;
         if let Some(stderr) = child.stderr.take() {
             let tx = tx.clone();
             tokio::spawn(async move {
@@ -536,16 +748,17 @@ impl Sink {
 
 /// One authenticated media connection to the phone. Returns the number of video frames received (0 means
 /// the phone side went away at once). Fatal problems (bad protocol, ffmpeg failure) are returned as `Err`.
-async fn session(cfg: &Config, mut stream: TcpStream, tx: &Tx, shared: &Shared) -> Result<u64, String> {
+async fn session(cfg: &Config, mut stream: TcpStream, tx: &Tx, shared: &Arc<Shared>) -> Result<u64, Problem> {
     let mut live_rx = shared.live.subscribe();
     let mut current = orientation(cfg, &live_rx.borrow_and_update());
     let mut sink = Sink::spawn(cfg, current, tx).await?;
 
     log(tx, format!("✓ اتصل بالهاتف، البث إلى {}\n", cfg.device));
     let _ = tx.send(Event::State(State::Streaming));
+    let _ = tx.send(Event::Link(LinkState::Streaming));
 
     let counters = Arc::new(Counters::default());
-    let ticker = tokio::spawn(report_stats(counters.clone(), tx.clone()));
+    let ticker = tokio::spawn(report_stats(counters.clone(), shared.clone(), tx.clone()));
     let result = pump_frames(&mut stream, &mut sink, &counters, cfg, tx, &mut live_rx, &mut current).await;
     ticker.abort();
 
@@ -554,18 +767,21 @@ async fn session(cfg: &Config, mut stream: TcpStream, tx: &Tx, shared: &Shared) 
         Ok(()) | Err(PumpError::PhoneClosed) => {}
         Err(PumpError::Protocol(e)) => {
             sink.stop().await;
-            return Err(format!("بيانات تالفة من الهاتف: {e}"));
+            return Err(Problem::new(ProblemCode::Other, format!("بيانات تالفة من الهاتف: {e}")));
         }
         Err(PumpError::Fatal(message)) => return Err(message),
         Err(PumpError::SinkClosed) => {
             let status = tokio::time::timeout(Duration::from_secs(1), sink.child.wait()).await;
-            return Err(format!(
-                "توقف ffmpeg ({}). راجع السجل أعلاه؛ تأكد أن {} موجود وأن v4l2loopback محمّل.",
-                match status {
-                    Ok(Ok(s)) => s.to_string(),
-                    _ => "غير معروف".into(),
-                },
-                cfg.device
+            return Err(Problem::new(
+                ProblemCode::OutputDevice,
+                format!(
+                    "توقف ffmpeg ({}). راجع السجل أعلاه؛ تأكد أن {} موجود وأن v4l2loopback محمّل.",
+                    match status {
+                        Ok(Ok(s)) => s.to_string(),
+                        _ => "غير معروف".into(),
+                    },
+                    cfg.device
+                ),
             ));
         }
     }
@@ -577,7 +793,7 @@ enum PumpError {
     PhoneClosed,
     SinkClosed,
     Protocol(enki_protocol::Error),
-    Fatal(String),
+    Fatal(Problem),
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -634,7 +850,7 @@ async fn pump_frames(
     }
 }
 
-async fn report_stats(counters: Arc<Counters>, tx: Tx) {
+async fn report_stats(counters: Arc<Counters>, shared: Arc<Shared>, tx: Tx) {
     let mut last_frames = 0;
     let mut last_bytes = 0;
     let mut interval = tokio::time::interval(Duration::from_secs(1));
@@ -647,6 +863,8 @@ async fn report_stats(counters: Arc<Counters>, tx: Tx) {
             fps: (frames - last_frames) as u32,
             kbps: ((bytes - last_bytes) * 8 / 1000) as u32,
             gaps: counters.gaps.load(Ordering::Relaxed),
+            rtt_ms: Some(shared.rtt_ms.load(Ordering::Relaxed)).filter(|v| *v > 0),
+            bitrate_kbps: Some(shared.bitrate_kbps.load(Ordering::Relaxed)).filter(|v| *v > 0),
         };
         last_frames = frames;
         last_bytes = bytes;

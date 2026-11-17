@@ -1,9 +1,12 @@
 package io.github.oopnm.enki
 
 import android.content.Context
+import android.os.Build
 import android.util.Log
 import io.github.oopnm.enki.link.Auth
 import io.github.oopnm.enki.link.AuthStatus
+import io.github.oopnm.enki.link.Capabilities
+import io.github.oopnm.enki.link.ControlMessages
 import io.github.oopnm.enki.link.Channel
 import io.github.oopnm.enki.link.FrameQueue
 import io.github.oopnm.enki.link.Link
@@ -22,6 +25,7 @@ import java.io.OutputStream
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.ServerSocket
+import java.net.SocketTimeoutException
 import java.net.Socket
 import java.util.Collections
 import java.util.concurrent.ExecutorService
@@ -55,6 +59,12 @@ class LinkServer(
     private val mediaLock = Any()
     private var activeMedia: MediaSession? = null
 
+    /** The media connection being served, so a dead control link can cut it (see [serveControl]). */
+    @Volatile private var mediaSocket: Socket? = null
+
+    /** Computed once: asking Camera2 about every camera takes a moment. */
+    private val capabilitiesJson: String by lazy { ControlMessages.capabilities(CapabilitiesReader.read(context)) }
+
     // Control connections currently open, and a worker for network writes (never on the main thread).
     private val controls: MutableList<ControlOut> = Collections.synchronizedList(ArrayList())
     private val notifier: ExecutorService = Executors.newSingleThreadExecutor()
@@ -65,10 +75,12 @@ class LinkServer(
     /** Serializes writes to one control connection (replies and orientation updates come from different threads). */
     private class ControlOut(private val out: OutputStream) {
         @Synchronized
-        fun send(json: JSONObject) {
-            out.write(encodeControlMessage(json.toString()))
+        fun send(json: String) {
+            out.write(encodeControlMessage(json))
             out.flush()
         }
+
+        fun send(json: JSONObject) = send(json.toString())
     }
 
     /** Clockwise rotation the PC should apply so the picture is upright, for the current camera and hold. */
@@ -79,6 +91,15 @@ class LinkServer(
         return JSONObject().put("type", "state").put("key", "image.rotation").put("value", value)
     }
 
+    /** Sends a `state` message to every connected PC without blocking the caller (it may be the camera thread). */
+    private fun broadcastState(json: String) {
+        try {
+            notifier.execute { synchronized(controls) { controls.toList() }.forEach { runCatching { it.send(json) } } }
+        } catch (e: RejectedExecutionException) {
+            // stopping
+        }
+    }
+
     private fun broadcastRotation() {
         val message = rotationMessage() ?: return
         synchronized(controls) { controls.toList() }.forEach { runCatching { it.send(message) } }
@@ -86,12 +107,17 @@ class LinkServer(
 
     /** Owns the camera pipeline of one media connection and can swap it for the other camera while streaming. */
     private inner class MediaSession(private val queue: FrameQueue, private val onError: (String) -> Unit) {
+        private fun newStreamer() = CameraStreamer(
+            context, queue, facing, onError,
+            onBitrate = { kbps -> broadcastState(ControlMessages.stateInt("stream.bitrate", kbps)) },
+        )
+
         private var streamer: CameraStreamer? = null
         private var closed = false
 
         fun start() {
             synchronized(mediaLock) {
-                if (!closed) streamer = CameraStreamer(context, queue, facing, onError).also { it.start() }
+                if (!closed) streamer = newStreamer().also { it.start() }
             }
         }
 
@@ -99,7 +125,7 @@ class LinkServer(
             synchronized(mediaLock) {
                 if (closed) return
                 streamer?.stop()
-                streamer = CameraStreamer(context, queue, facing, onError).also { it.start() }
+                streamer = newStreamer().also { it.start() }
             }
         }
 
@@ -171,8 +197,8 @@ class LinkServer(
             }
             socket.soTimeout = 0
             when (channel) {
-                Channel.MEDIA -> serveMedia(out)
-                Channel.CONTROL -> serveControl(input, out)
+                Channel.MEDIA -> serveMedia(socket, out)
+                Channel.CONTROL -> serveControl(socket, input, out)
             }
         } catch (e: UnsupportedVersionException) {
             // Answer with our own version first, so an older PC program can tell the user the versions differ.
@@ -188,11 +214,12 @@ class LinkServer(
         }
     }
 
-    private fun serveMedia(out: OutputStream) {
+    private fun serveMedia(socket: Socket, out: OutputStream) {
         if (!mediaBusy.compareAndSet(false, true)) {
             status("A second media connection was refused (one stream at a time)")
             return
         }
+        mediaSocket = socket
         val queue = FrameQueue(QUEUE_FRAMES)
         var cameraError: String? = null
         val session = MediaSession(queue) { message ->
@@ -212,6 +239,7 @@ class LinkServer(
             synchronized(mediaLock) { if (activeMedia === session) activeMedia = null }
             session.stop()
             queue.close()
+            mediaSocket = null
             mediaBusy.set(false)
             val error = cameraError
             if (!stopped.get()) status(if (error != null) "Camera stopped: $error" else WAITING)
@@ -219,40 +247,44 @@ class LinkServer(
     }
 
     /**
-     * Says hello, then handles `set camera.facing` (confirmed with `state`, preceded by the current
-     * `image.rotation`) and pushes `image.rotation` whenever the phone is turned. Other messages are ignored.
+     * Says hello and sends the phone's capabilities, answers `ping` with `pong`, handles `set camera.facing`
+     * (confirmed with `state`, preceded by the current `image.rotation`) and pushes `image.rotation` whenever
+     * the phone is turned. Other messages are ignored.
+     *
+     * The PC pings every second. If nothing arrives for [CONTROL_TIMEOUT_MS] the cable was pulled or the PC
+     * program froze: TCP alone may not notice for minutes, so the camera is stopped by closing the media
+     * connection, which saves the battery and lets the PC reconnect cleanly.
      */
-    private fun serveControl(input: DataInputStream, out: OutputStream) {
+    private fun serveControl(socket: Socket, input: DataInputStream, out: OutputStream) {
         val control = ControlOut(out)
         controls.add(control)
         try {
-            control.send(
-                JSONObject()
-                    .put("type", "hello")
-                    .put("version", Link.VERSION)
-                    .put("app", "enki-android")
-                    .put("app_version", appVersion),
-            )
+            control.send(ControlMessages.hello(appVersion, Build.MODEL ?: "", Build.VERSION.SDK_INT))
+            control.send(runCatching { capabilitiesJson }.getOrElse { ControlMessages.capabilities(Capabilities(emptyList(), emptyList())) })
+            socket.soTimeout = CONTROL_TIMEOUT_MS
             while (true) {
                 val len = input.readInt()
                 if (len < 0 || len > Link.MAX_CONTROL) throw ProtocolException("bad control message length $len")
                 val body = ByteArray(len).also { input.readFully(it) }
                 val message = try { JSONObject(String(body, Charsets.UTF_8)) } catch (e: JSONException) { continue }
-                if (message.optString("type") == "set" && message.optString("key") == "camera.facing") {
-                    val value = message.optString("value")
-                    if (value == "front" || value == "back") {
-                        setFacing(value)
-                        // The rotation depends on the camera, so it goes out first; the PC waits for the facing reply.
-                        rotationMessage()?.let { control.send(it) }
-                        control.send(JSONObject().put("type", "state").put("key", "camera.facing").put("value", value))
-                    } else {
-                        control.send(
-                            JSONObject().put("type", "error").put("code", "bad_value")
-                                .put("message", "camera.facing must be \"front\" or \"back\""),
-                        )
+                when (message.optString("type")) {
+                    "ping" -> control.send(ControlMessages.pong(message.optLong("seq")))
+                    "set" -> if (message.optString("key") == "camera.facing") {
+                        val value = message.optString("value")
+                        if (value == "front" || value == "back") {
+                            setFacing(value)
+                            // The rotation depends on the camera, so it goes out first; the PC waits for the facing reply.
+                            rotationMessage()?.let { control.send(it) }
+                            control.send(ControlMessages.stateString("camera.facing", value))
+                        } else {
+                            control.send(ControlMessages.error("bad_value", "camera.facing must be \"front\" or \"back\""))
+                        }
                     }
                 }
             }
+        } catch (e: SocketTimeoutException) {
+            Log.w(TAG, "No message from the PC for ${CONTROL_TIMEOUT_MS / 1000} s: stopping the camera")
+            runCatching { mediaSocket?.close() }
         } finally {
             controls.remove(control)
         }
@@ -263,6 +295,8 @@ class LinkServer(
         const val STREAMING = "Streaming camera to the PC"
         private const val QUEUE_FRAMES = 30
         private const val HANDSHAKE_TIMEOUT_MS = 5_000
+        /** The PC pings every second; this is generous enough for a slow moment and short enough to save the battery. */
+        private const val CONTROL_TIMEOUT_MS = 5_000
         private const val TAG = "EnkiLink"
     }
 }

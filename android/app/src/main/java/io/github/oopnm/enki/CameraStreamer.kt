@@ -19,6 +19,7 @@ import android.os.HandlerThread
 import android.util.Range
 import android.util.Size
 import android.view.Surface
+import io.github.oopnm.enki.link.BitrateController
 import io.github.oopnm.enki.link.EncodedFrame
 import io.github.oopnm.enki.link.FrameQueue
 import io.github.oopnm.enki.link.Kind
@@ -36,6 +37,8 @@ class CameraStreamer(
     /** "back" or "front". */
     private val facing: String,
     private val onError: (String) -> Unit,
+    /** Called with the encoder's target bit rate in kbit/s when streaming starts and whenever it changes. */
+    private val onBitrate: (Int) -> Unit = {},
 ) {
     private val lock = Any()
     private var stopped = false
@@ -47,6 +50,7 @@ class CameraStreamer(
     @Volatile private var encoder: MediaCodec? = null
     @Volatile private var inputSurface: Surface? = null
     @Volatile private var drainThread: Thread? = null
+    @Volatile private var adapterThread: Thread? = null
 
     @SuppressLint("MissingPermission") // checked by the caller (MainActivity requests it before starting the service)
     fun start() {
@@ -109,6 +113,7 @@ class CameraStreamer(
 
     /** Safe to call more than once; every step tolerates an already-released object. */
     private fun releaseResources() {
+        adapterThread?.interrupt()
         val thread = drainThread
         runCatching { session?.stopRepeating() }
         runCatching { session?.close() }
@@ -161,6 +166,33 @@ class CameraStreamer(
         }
         encoder = codec
         drainThread = Thread({ drain(codec) }, "enki-encoder").also { it.start() }
+        adapterThread = Thread({ adaptBitrate(codec) }, "enki-bitrate").also { it.isDaemon = true; it.start() }
+    }
+
+    /**
+     * Once a second, lowers the encoder's bit rate if the send queue dropped frames (the PC or the cable cannot
+     * keep up) and raises it again after a calm period; see [BitrateController].
+     */
+    private fun adaptBitrate(codec: MediaCodec) {
+        val controller = BitrateController(BITRATE)
+        onBitrate(controller.current / 1000)
+        var lastDropped = queue.droppedFrames()
+        while (!Thread.currentThread().isInterrupted) {
+            try {
+                Thread.sleep(1000)
+            } catch (e: InterruptedException) {
+                return
+            }
+            val dropped = queue.droppedFrames()
+            val next = controller.onSecond(dropped - lastDropped)
+            lastDropped = dropped
+            if (next != null) {
+                runCatching {
+                    codec.setParameters(Bundle().apply { putInt(MediaCodec.PARAMETER_KEY_VIDEO_BITRATE, next) })
+                }
+                onBitrate(next / 1000)
+            }
+        }
     }
 
     private fun configureEncoder(size: Size, fps: Int, lowLatency: Boolean): MediaCodec {

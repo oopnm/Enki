@@ -10,7 +10,7 @@ screens, then the look.
 | 0 | Project skeleton, packaging, scrcpy screen modes | done |
 | 1 | Phone camera (Camera2 → H.264 → TCP), desktop receiver, auto rotate | done (PR #1) |
 | 2 | Release 0.2.0 (packaging dependencies, version bump) | done |
-| 3 | Enki-Link v2: best possible communication | in progress (3a authentication done) |
+| 3 | Enki-Link v2: best possible communication | done, waiting for a test on the phone |
 | 4 | Unified settings engine, i18n skeleton, design tokens | planned |
 | 5 | DroidCam-class camera settings and live preview | planned |
 | 6 | "Abzu" theme, wave animation, full translations | planned |
@@ -43,11 +43,20 @@ Phases 7 and 8 can swap places.
   protocol, plus golden test vectors in `protocol/vectors` used by both the Rust
   and Kotlin sides.
 
-Steps: 3a authentication (protocol v1, session token through adb, challenge on every
-connection, clear version and token errors; done), 3b fake phone as a reusable
-test tool and golden vectors for control messages, 3c capabilities handshake, 3d
-state machine, heartbeat and quality statistics, 3e separate video channel
-fields and error fix buttons in the GUI.
+Steps, all done in the same branch:
+
+- 3a authentication (protocol v1, session token through adb, challenge on every connection).
+- 3b typed control messages with shared JSON vectors (`protocol/vectors/control.txt`), and `enki-fakephone`, a fake
+  phone usable from tests and by hand (`enki-fakephone --accept-any-token` with `ENKI_NO_ADB=1 enki` runs the
+  whole desktop side without a phone; it streams an ffmpeg test pattern).
+- 3c capabilities message from Camera2 and MediaCodec (the desktop receives it; the settings screens that use it
+  come in phase 5).
+- 3d link states (preparing, waiting for the app, ready, streaming, reconnecting), heartbeat with round-trip time,
+  lost-link detection on both sides, automatic bit-rate control on the phone.
+- 3e problems with codes in the receiver and a fix button in the GUI (load the kernel module, or try again).
+
+Decision: the video header keeps its 16 bytes (stream, kind, flags, length, PTS). A sequence number would not add
+anything: a frame the phone drops is reported with the discontinuity flag, and TCP does not reorder or lose bytes.
 
 Done when: unplugging and replugging the cable during a stream recovers by
 itself, and another app on the phone cannot read the stream.
