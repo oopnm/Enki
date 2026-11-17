@@ -1,16 +1,27 @@
-//! Enki Link wire format, version 0.
+//! Enki Link wire format, version 1.
 //!
-//! Every TCP connection starts with an 8-byte [`Preamble`]. A media connection
-//! then carries frames: a 16-byte [`FrameHeader`] followed by `len` payload bytes.
-//! A control connection carries length-prefixed JSON messages (handled elsewhere).
+//! Every TCP connection starts with an 8-byte [`Preamble`], followed by a short authentication exchange
+//! (see [`auth_mac`]). A media connection then carries frames: a 16-byte [`FrameHeader`] followed by `len`
+//! payload bytes. A control connection carries length-prefixed JSON messages (handled elsewhere).
 //! All integers are big-endian. See `docs/protocol.md`.
 
+pub mod control;
+
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
+
 pub const MAGIC: [u8; 4] = *b"ENKI";
-pub const VERSION: u8 = 0;
+pub const VERSION: u8 = 1;
 pub const PREAMBLE_LEN: usize = 8;
 pub const FRAME_HEADER_LEN: usize = 16;
 /// Upper bound for one media payload; larger values are rejected as corrupt.
 pub const MAX_PAYLOAD: u32 = 16 * 1024 * 1024;
+/// Session token: 32 random bytes the PC hands to the phone over adb, never over the Enki Link socket.
+pub const TOKEN_LEN: usize = 32;
+/// Random challenge the phone sends right after the preamble exchange.
+pub const NONCE_LEN: usize = 16;
+pub const MAC_LEN: usize = 32;
+const AUTH_CONTEXT: &[u8] = b"ENKI-AUTH-1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
@@ -145,12 +156,56 @@ impl FrameHeader {
     }
 }
 
+/// Answer to the phone's challenge: `HMAC-SHA256(token, "ENKI-AUTH-1" || channel || nonce)`.
+/// The channel is part of the message, so an answer for one channel cannot be replayed on the other.
+pub fn auth_mac(token: &[u8; TOKEN_LEN], channel: Channel, nonce: &[u8; NONCE_LEN]) -> [u8; MAC_LEN] {
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(token).expect("HMAC accepts any key length");
+    mac.update(AUTH_CONTEXT);
+    mac.update(&[channel as u8]);
+    mac.update(nonce);
+    mac.finalize().into_bytes().into()
+}
+
+/// The phone's verdict, one byte sent after it has read the PC's answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum AuthStatus {
+    Ok = 0,
+    /// The answer did not match the phone's token.
+    BadToken = 1,
+    /// The phone has no token yet (the PC has not provisioned it, or the app restarted).
+    NotProvisioned = 2,
+}
+
+impl AuthStatus {
+    pub fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(AuthStatus::Ok),
+            1 => Some(AuthStatus::BadToken),
+            2 => Some(AuthStatus::NotProvisioned),
+            _ => None,
+        }
+    }
+}
+
+pub fn to_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Parses an even-length hex string; `None` for anything else.
+pub fn from_hex(s: &str) -> Option<Vec<u8>> {
+    if s.len() % 2 != 0 || !s.is_ascii() {
+        return None;
+    }
+    (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok()).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn unhex(s: &str) -> Vec<u8> {
-        (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+        from_hex(s).unwrap()
     }
 
     /// Shared vectors: `protocol/vectors/frame_header.txt`, also used by the Android side.
@@ -182,14 +237,55 @@ mod tests {
             let p = Preamble::new(ch);
             assert_eq!(Preamble::decode(&p.encode()).unwrap(), p);
         }
-        assert_eq!(&Preamble::new(Channel::Media).encode(), b"ENKI\0\0\0\0");
+        assert_eq!(&Preamble::new(Channel::Media).encode(), b"ENKI\x01\0\0\0");
+    }
+
+    /// Shared vectors: `protocol/vectors/auth.txt`, also used by the Android side.
+    /// Line format: name|token_hex|channel|nonce_hex|mac_hex
+    #[test]
+    fn shared_auth_vectors() {
+        let text = include_str!("../../../../protocol/vectors/auth.txt");
+        let mut n = 0;
+        for line in text.lines().filter(|l| !l.starts_with('#') && !l.trim().is_empty()) {
+            let f: Vec<&str> = line.split('|').collect();
+            let token: [u8; TOKEN_LEN] = unhex(f[1]).try_into().unwrap();
+            let channel = match f[2] {
+                "0" => Channel::Media,
+                _ => Channel::Control,
+            };
+            let nonce: [u8; NONCE_LEN] = unhex(f[3]).try_into().unwrap();
+            assert_eq!(to_hex(&auth_mac(&token, channel, &nonce)), f[4], "{}", f[0]);
+            n += 1;
+        }
+        assert!(n >= 3);
+    }
+
+    #[test]
+    fn auth_answer_is_bound_to_token_channel_and_nonce() {
+        let token = [7u8; TOKEN_LEN];
+        let nonce = [1u8; NONCE_LEN];
+        let base = auth_mac(&token, Channel::Control, &nonce);
+        assert_ne!(base, auth_mac(&token, Channel::Media, &nonce), "no replay across channels");
+        assert_ne!(base, auth_mac(&[8u8; TOKEN_LEN], Channel::Control, &nonce));
+        assert_ne!(base, auth_mac(&token, Channel::Control, &[2u8; NONCE_LEN]));
+    }
+
+    #[test]
+    fn hex_and_status_helpers() {
+        assert_eq!(to_hex(&[0, 0xab, 0xff]), "00abff");
+        assert_eq!(from_hex("00abFF"), Some(vec![0, 0xab, 0xff]));
+        assert_eq!(from_hex("abc"), None);
+        assert_eq!(from_hex("zz"), None);
+        assert_eq!(AuthStatus::from_u8(2), Some(AuthStatus::NotProvisioned));
+        assert_eq!(AuthStatus::from_u8(9), None);
     }
 
     #[test]
     fn rejects_bad_input() {
         assert_eq!(Preamble::decode(b"HTTP/1.1"), Err(Error::BadMagic));
         assert_eq!(Preamble::decode(b"ENKI\x09\0\0\0"), Err(Error::UnsupportedVersion(9)));
-        assert_eq!(Preamble::decode(b"ENKI\0\x07\0\0"), Err(Error::UnknownChannel(7)));
+        assert_eq!(Preamble::decode(b"ENKI\0\0\0\0"), Err(Error::UnsupportedVersion(0)), "an old phone app");
+        assert_eq!(Preamble::decode(b"ENKI\x01\x07\0\0"), Err(Error::UnknownChannel(7)));
         let mut h = FrameHeader { stream_id: 0, kind: Kind::VideoKey, flags: 0, len: 1, pts_us: 0 }.encode();
         h[1] = 99;
         assert_eq!(FrameHeader::decode(&h), Err(Error::UnknownKind(99)));

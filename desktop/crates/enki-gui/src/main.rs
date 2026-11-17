@@ -22,6 +22,18 @@ enum UiEvent {
     Running(bool),
     /// نص حالة البث (يُعرض بجانب «الحالة:»).
     Status(String),
+    /// مشكلة أنهت الجلسة: يظهر زر الإصلاح المناسب لها إن وُجد.
+    Problem(enki_receiver::Problem),
+}
+
+/// نص زر الإصلاح لكل نوع مشكلة (None = لا يوجد إصلاح بزر؛ الرسالة في السجل تكفي).
+fn fix_label(code: enki_receiver::ProblemCode) -> Option<&'static str> {
+    use enki_receiver::ProblemCode::*;
+    match code {
+        OutputDevice => Some("🔧 تفعيل درايفر النواة"),
+        NoDevice | ProvisionFailed | AuthRejected | Other => Some("🔄 إعادة المحاولة"),
+        AdbMissing | FfmpegMissing | VersionMismatch => None,
+    }
 }
 
 type EventTx = mpsc::UnboundedSender<UiEvent>;
@@ -155,6 +167,9 @@ fn build_ui(app: &Application, rt: Handle) {
     action_box.append(&modprobe_btn);
     action_box.append(&start_btn);
     action_box.append(&stop_btn);
+    // يظهر فقط بعد مشكلة لها إصلاح (انظر fix_label).
+    let fix_btn = Button::builder().label("🔧").visible(false).build();
+    action_box.append(&fix_btn);
     main_box.append(&action_box);
 
     // السجلات
@@ -192,6 +207,8 @@ fn build_ui(app: &Application, rt: Handle) {
     // مرسل أوامر الجلسة الحالية (تبديل الكاميرا أثناء البث).
     let control_slot: Rc<RefCell<Option<mpsc::UnboundedSender<enki_receiver::Control>>>> =
         Rc::new(RefCell::new(None));
+    // نوع المشكلة التي يعالجها زر الإصلاح الظاهر حالياً.
+    let fix_slot: Rc<RefCell<Option<enki_receiver::ProblemCode>>> = Rc::new(RefCell::new(None));
 
     {
         let buffer = text_buffer.clone();
@@ -199,6 +216,8 @@ fn build_ui(app: &Application, rt: Handle) {
         let start = start_btn.clone();
         let slot = stop_slot.clone();
         let control = control_slot.clone();
+        let fix = fix_btn.clone();
+        let fix_code = fix_slot.clone();
         glib::spawn_future_local(async move {
             while let Some(event) = rx.recv().await {
                 match event {
@@ -206,8 +225,18 @@ fn build_ui(app: &Application, rt: Handle) {
                     UiEvent::Status(text) => {
                         status.set_markup(&format!("<b>الحالة: {text}</b>"));
                     }
+                    UiEvent::Problem(problem) => match fix_label(problem.code) {
+                        Some(label) => {
+                            fix.set_label(label);
+                            fix.set_visible(true);
+                            *fix_code.borrow_mut() = Some(problem.code);
+                        }
+                        None => fix.set_visible(false),
+                    },
                     UiEvent::Running(running) => {
-                        if !running {
+                        if running {
+                            fix.set_visible(false); // جلسة جديدة: المشكلة السابقة لم تعد قائمة
+                        } else {
                             slot.borrow_mut().take();
                             control.borrow_mut().take();
                         }
@@ -236,6 +265,33 @@ fn build_ui(app: &Application, rt: Handle) {
                     &tx,
                     format!("❌ مسار غير صالح: «{device}». الصيغة المطلوبة: /dev/videoN\n"),
                 ),
+            }
+        });
+    }
+
+    // زر الإصلاح: يعالج آخر مشكلة أنهت الجلسة (تفعيل الدرايفر، أو إعادة المحاولة)
+    {
+        let tx = tx.clone();
+        let rt = rt.clone();
+        let entry = device_entry.clone();
+        let start = start_btn.clone();
+        let fix = fix_btn.clone();
+        let code = fix_slot.clone();
+        fix_btn.connect_clicked(move |_| {
+            let problem = code.borrow_mut().take();
+            fix.set_visible(false);
+            match problem {
+                Some(enki_receiver::ProblemCode::OutputDevice) => {
+                    let device = entry.text().to_string();
+                    match parse_video_nr(&device) {
+                        Some(nr) => {
+                            rt.spawn(load_module(nr, tx.clone()));
+                        }
+                        None => log(&tx, format!("❌ مسار غير صالح: «{device}». الصيغة المطلوبة: /dev/videoN\n")),
+                    }
+                }
+                Some(_) => start.emit_clicked(),
+                None => {}
             }
         });
     }
@@ -297,19 +353,32 @@ fn build_ui(app: &Application, rt: Handle) {
                 rt.spawn(enki_receiver::run_with_commands(cfg, ev_tx, stop_rx, ctl_rx));
                 let ui = tx.clone();
                 rt.spawn(async move {
-                    use enki_receiver::{Event, State};
+                    use enki_receiver::{Event, LinkState, State};
                     while let Some(event) = ev_rx.recv().await {
-                        let _ = ui.send(match event {
-                            Event::Log(text) => UiEvent::Log(text),
-                            Event::State(State::Connecting) => UiEvent::Status("🟡 بانتظار الهاتف".to_string()),
-                            Event::State(State::Streaming) => UiEvent::Status("🟢 متصل".to_string()),
-                            Event::State(State::Stopped) => UiEvent::Running(false),
-                            Event::Stats(s) => UiEvent::Status(format!(
-                                "🟢 متصل · {} fps · {:.1} Mbps",
-                                s.fps,
-                                s.kbps as f64 / 1000.0
-                            )),
-                        });
+                        let ui_event = match event {
+                            Event::Log(text) => Some(UiEvent::Log(text)),
+                            Event::Link(LinkState::Preparing) => Some(UiEvent::Status("🟡 تجهيز الاتصال بالهاتف".to_string())),
+                            Event::Link(LinkState::WaitingForApp) => Some(UiEvent::Status("🟡 بانتظار تطبيق الهاتف".to_string())),
+                            Event::Link(LinkState::Ready) => Some(UiEvent::Status("🟡 فتح الكاميرا".to_string())),
+                            Event::Link(LinkState::Streaming) => Some(UiEvent::Status("🟢 متصل".to_string())),
+                            Event::Link(LinkState::Reconnecting(_)) => Some(UiEvent::Status("🟠 إعادة الاتصال".to_string())),
+                            Event::State(State::Stopped) => Some(UiEvent::Running(false)),
+                            Event::State(_) | Event::Capabilities(_) => None,
+                            Event::Problem(problem) => Some(UiEvent::Problem(problem)),
+                            Event::Stats(s) => {
+                                let mut text = format!("🟢 متصل · {} fps · {:.1} Mbps", s.fps, s.kbps as f64 / 1000.0);
+                                if let Some(ms) = s.rtt_ms {
+                                    text.push_str(&format!(" · {ms} ms"));
+                                }
+                                if let Some(target) = s.bitrate_kbps {
+                                    text.push_str(&format!(" · الهدف {:.1} Mbps", target as f64 / 1000.0));
+                                }
+                                Some(UiEvent::Status(text))
+                            }
+                        };
+                        if let Some(ui_event) = ui_event {
+                            let _ = ui.send(ui_event);
+                        }
                     }
                 });
                 return;

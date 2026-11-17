@@ -27,7 +27,7 @@ class FrameHeaderTest {
 
     @Test
     fun preambleBytes() {
-        assertArrayEquals("ENKI".toByteArray() + byteArrayOf(0, 0, 0, 0), encodePreamble(Channel.MEDIA))
+        assertArrayEquals("ENKI".toByteArray() + byteArrayOf(1, 0, 0, 0), encodePreamble(Channel.MEDIA))
         assertEquals(1, encodePreamble(Channel.CONTROL)[5].toInt())
     }
 }

@@ -34,6 +34,9 @@ automatically for each camera (landscape phone, screen facing you) and can be ov
 with "auto rotate" the phone's orientation sensor decides (landscape/portrait/upside down), and the picture is rotated in software on the desktop;
 the output is always 1280x720 (black bars when the picture is rotated to portrait).
 
+The phone only talks to a PC that holds a per-session secret, which the desktop app hands over through adb
+(`docs/protocol.md`, "Authentication"). Install the phone app and the desktop package from the same version.
+
 Manual testing of the phone side without the GUI:
 
 ```

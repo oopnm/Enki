@@ -23,6 +23,12 @@
             </intent-filter>
         </activity>
 
+        <!-- Exported on purpose: `adb shell content call` reaches it. It refuses every caller but the adb shell. -->
+        <provider
+            android:name=".ProvisionProvider"
+            android:authorities="io.github.oopnm.enki.provision"
+            android:exported="true" />
+
         <service
             android:name=".StreamService"
             android:exported="false"

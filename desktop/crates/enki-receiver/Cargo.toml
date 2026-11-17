@@ -9,3 +9,6 @@ description = "Enki desktop receiver: Enki Link camera stream from the phone int
 [dependencies]
 enki-protocol = { path = "../enki-protocol" }
 tokio = { version = "1", features = ["rt-multi-thread", "process", "io-util", "sync", "net", "time", "macros"] }
+
+[dev-dependencies]
+enki-fakephone = { path = "../enki-fakephone" }

@@ -1,71 +1,54 @@
 use super::*;
-use std::sync::Mutex;
 use tokio::net::TcpListener;
 
-fn frame(stream: u8, kind: Kind, flags: u8, pts: u64, payload: &[u8]) -> Vec<u8> {
-    let h = FrameHeader { stream_id: stream, kind, flags, len: payload.len() as u32, pts_us: pts };
-    let mut v = h.encode().to_vec();
-    v.extend_from_slice(payload);
-    v
+use enki_fakephone::{Behavior, Received};
+
+/// Token the fake phone accepts unless a test says otherwise; `test_config` uses the same one.
+const TEST_TOKEN: [u8; TOKEN_LEN] = [42; TOKEN_LEN];
+
+/// How the fake phone behaves at the handshake.
+#[derive(Clone)]
+struct Phone {
+    /// Protocol version it answers with (a different one simulates an old app).
+    version: u8,
+    /// Token it holds. `None` = never provisioned.
+    token: Option<[u8; TOKEN_LEN]>,
+    /// Provisioning log written by the fake adb: the phone holds `TEST_TOKEN` once this file has at least
+    /// as many lines containing "content call" as the counter says (simulates receiving the token through adb).
+    adb_log: Option<(std::path::PathBuf, Arc<std::sync::atomic::AtomicUsize>)>,
 }
 
-type Received = Arc<Mutex<Vec<String>>>;
+impl Phone {
+    fn normal() -> Self {
+        Phone { version: enki_protocol::VERSION, token: Some(TEST_TOKEN), adb_log: None }
+    }
 
-/// Fake phone app. Accepts any number of connections. On a control connection it says hello, records every
-/// message and confirms `set` with a `state` reply. On a media connection it sends a few frames and then
-/// closes, or, with `hold_media`, keeps the connection open until the receiver hangs up.
-async fn fake_phone(listener: TcpListener, hold_media: bool, received: Received) {
-    loop {
-        let Ok((mut s, _)) = listener.accept().await else { return };
-        let received = received.clone();
-        tokio::spawn(async move {
-            let mut pre = [0u8; 8];
-            if s.read_exact(&mut pre).await.is_err() {
-                return;
-            }
-            let channel = Preamble::decode(&pre).unwrap().channel;
-            let _ = s.write_all(&pre).await;
-            match channel {
-                Channel::Control => {
-                    let _ = write_control(&mut s, r#"{"type":"hello","version":0}"#).await;
-                    while let Ok(message) = read_control(&mut s).await {
-                        received.lock().unwrap().push(message.clone());
-                        if message.contains("\"set\"") {
-                            // like the real app: current picture rotation first, then the camera confirmation
-                            let _ = write_control(&mut s, r#"{"value":90,"key":"image.rotation","type":"state"}"#).await;
-                            let _ = write_control(&mut s, r#"{"type":"state","key":"camera.facing","value":"x"}"#).await;
-                        }
-                    }
-                }
-                Channel::Media => {
-                    let _ = s.write_all(&frame(0, Kind::VideoConfig, 0, 0, &[0, 0, 1, 0x67])).await;
-                    let _ = s.write_all(&frame(0, Kind::VideoKey, 0, 0, &[0, 0, 1, 0x65])).await;
-                    let _ = s.write_all(&frame(1, Kind::AudioFrame, 0, 5, &[9, 9, 9])).await; // must be ignored
-                    let _ = s.write_all(&frame(0, Kind::VideoDelta, FLAG_DISCONTINUITY, 33_333, &[0x41, 0x9a])).await;
-                    // Keep streaming until the receiver hangs up (restart tests need frames to keep arriving).
-                    while hold_media {
-                        tokio::time::sleep(Duration::from_millis(50)).await;
-                        if s.write_all(&frame(0, Kind::VideoDelta, 0, 66_666, &[0x41, 0x9a])).await.is_err() {
-                            break;
-                        }
-                    }
-                }
-            }
-        });
+    fn current_token(&self) -> Option<[u8; TOKEN_LEN]> {
+        if let Some((log, needed)) = &self.adb_log {
+            let text = std::fs::read_to_string(log).unwrap_or_default();
+            let given = text.lines().filter(|l| l.contains("content call")).count();
+            return (given >= needed.load(Ordering::Relaxed)).then_some(TEST_TOKEN);
+        }
+        self.token
     }
 }
 
+async fn start_phone_as(hold_media: bool, phone: Phone) -> (u16, Received) {
+    let mut behavior = Behavior::new(TEST_TOKEN);
+    behavior.hold_media = hold_media;
+    behavior.version = phone.version;
+    behavior.token = Arc::new(move || phone.current_token());
+    enki_fakephone::spawn(behavior).await
+}
+
 async fn start_phone(hold_media: bool) -> (u16, Received) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let received: Received = Arc::default();
-    tokio::spawn(fake_phone(listener, hold_media, received.clone()));
-    (port, received)
+    start_phone_as(hold_media, Phone::normal()).await
 }
 
 fn test_config(port: u16) -> Config {
     let mut cfg = Config::new("/dev/null");
     cfg.port = port;
+    cfg.token = TEST_TOKEN;
     cfg.setup_adb = false;
     cfg
 }
@@ -233,14 +216,30 @@ fn auto_rotate_uses_the_phone_sensor_and_keeps_the_mirror_default() {
     assert_eq!(orientation(&cfg, &live(Facing::Back, false, Some(270))), (180, true));
 }
 
+fn state(key: &str, value: enki_protocol::control::Value) -> Message {
+    Message::State { key: key.into(), value }
+}
+
 #[test]
-fn rotation_is_parsed_whatever_the_key_order() {
-    assert_eq!(parse_rotation(r#"{"type":"state","key":"image.rotation","value":180}"#), Some(180));
-    assert_eq!(parse_rotation(r#"{"value":90,"key":"image.rotation","type":"state"}"#), Some(90));
-    assert_eq!(parse_rotation(r#"{"type":"state","key":"image.rotation","value": 0}"#), Some(0));
-    assert_eq!(parse_rotation(r#"{"type":"state","key":"camera.facing","value":"front"}"#), None);
-    assert_eq!(parse_rotation(r#"{"type":"state","key":"image.rotation","value":45}"#), None);
-    assert_eq!(parse_rotation(r#"{"type":"state","key":"image.rotation","value":360}"#), None);
+fn rotation_bitrate_and_pong_messages_update_the_shared_state() {
+    let shared = Shared::new(Live { facing: Facing::Back, auto_rotate: false, phone_rotation: None });
+    let (tx, _rx) = mpsc::unbounded_channel();
+    handle_message(&shared, &tx, state("image.rotation", 180.into()));
+    assert_eq!(shared.live.borrow().phone_rotation, Some(180));
+    handle_message(&shared, &tx, state("image.rotation", 45.into())); // not a right angle: ignored
+    handle_message(&shared, &tx, state("image.rotation", "90".into())); // wrong type: ignored
+    assert_eq!(shared.live.borrow().phone_rotation, Some(180));
+    handle_message(&shared, &tx, state("stream.bitrate", 2500.into()));
+    assert_eq!(shared.bitrate_kbps.load(Ordering::Relaxed), 2500);
+
+    let seq = shared.next_ping();
+    handle_message(&shared, &tx, Message::Pong { seq: seq + 1 }); // someone else's answer: no round trip
+    assert_eq!(shared.rtt_ms.load(Ordering::Relaxed), 0);
+    handle_message(&shared, &tx, Message::Pong { seq });
+    assert!(shared.rtt_ms.load(Ordering::Relaxed) >= 1);
+    shared.reset_link();
+    assert_eq!(shared.rtt_ms.load(Ordering::Relaxed), 0, "a new connection forgets the old measurements");
+    assert_eq!(shared.live.borrow().phone_rotation, None);
 }
 
 #[tokio::test]
@@ -321,6 +320,325 @@ async fn decoder_restarts_only_when_the_orientation_changes_with_the_camera() {
     let _ = stop_tx.send(());
     task.await.unwrap();
     let _ = std::fs::remove_file(&marker);
+}
+
+/// Runs a session that must end by itself with an error; returns everything it logged and the problem it reported.
+async fn run_to_failure_with_problem(cfg: Config) -> (String, Option<Problem>) {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (_stop_tx, stop_rx) = oneshot::channel();
+    tokio::time::timeout(Duration::from_secs(10), run(cfg, tx, stop_rx)).await.expect("run must end by itself");
+    let mut logs = String::new();
+    let mut problem = None;
+    for e in drain(&mut rx) {
+        match e {
+            Event::Log(t) => logs.push_str(&t),
+            Event::Problem(p) => problem = Some(p),
+            _ => {}
+        }
+    }
+    (logs, problem)
+}
+
+async fn run_to_failure(cfg: Config) -> String {
+    run_to_failure_with_problem(cfg).await.0
+}
+
+#[tokio::test]
+async fn a_phone_with_another_token_is_refused_with_a_clear_message() {
+    let phone = Phone { token: Some([1; TOKEN_LEN]), ..Phone::normal() };
+    let (port, _) = start_phone_as(false, phone).await;
+    let (logs, problem) = run_to_failure_with_problem(test_config(port)).await;
+    assert!(logs.contains("رفض مفتاح الجلسة"), "{logs}");
+    assert_eq!(problem.map(|p| p.code), Some(ProblemCode::AuthRejected));
+}
+
+#[tokio::test]
+async fn a_phone_that_was_never_provisioned_says_so() {
+    let phone = Phone { token: None, ..Phone::normal() };
+    let (port, _) = start_phone_as(false, phone).await;
+    let logs = run_to_failure(test_config(port)).await;
+    assert!(logs.contains("لم يستلم مفتاح الجلسة"), "{logs}");
+}
+
+#[tokio::test]
+async fn an_old_phone_app_is_reported_instead_of_waiting_forever() {
+    let phone = Phone { version: 0, ..Phone::normal() };
+    let (port, _) = start_phone_as(false, phone).await;
+    let (logs, problem) = run_to_failure_with_problem(test_config(port)).await;
+    assert!(logs.contains("بروتوكولاً مختلفاً") && logs.contains("النسخة 0"), "{logs}");
+    assert_eq!(problem.map(|p| p.code), Some(ProblemCode::VersionMismatch));
+}
+
+/// A stand-in for `adb`: records its arguments, accepts `forward`, and answers `shell content call` like the
+/// provider does.
+fn fake_adb(dir: &std::path::Path) -> (String, std::path::PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let log = dir.join("adb.log");
+    let script = dir.join("adb");
+    std::fs::write(
+        &script,
+        format!("#!/bin/sh\necho \"$@\" >> {}\nif [ \"$1\" = shell ]; then echo 'Result: Bundle[{{ok=true}}]'; fi\n", log.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    (script.display().to_string(), log)
+}
+
+#[tokio::test]
+async fn the_token_goes_to_the_phone_through_adb_and_streaming_starts() {
+    let dir = std::env::temp_dir().join(format!("enki-adb-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (adb, log) = fake_adb(&dir);
+    let needed = Arc::new(std::sync::atomic::AtomicUsize::new(1));
+    let phone = Phone { adb_log: Some((log.clone(), needed)), ..Phone::normal() };
+    let (port, _) = start_phone_as(true, phone).await;
+    let mut cfg = test_config(port);
+    cfg.setup_adb = true;
+    cfg.adb = adb;
+    cfg.sink_override = Some(("sh".into(), vec!["-c".into(), "cat > /dev/null".into()]));
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (stop_tx, stop_rx) = oneshot::channel();
+    let task = tokio::spawn(run(cfg, tx, stop_rx));
+    let mut streaming = false;
+    for _ in 0..80 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        streaming |= drain(&mut rx).iter().any(|e| matches!(e, Event::State(State::Streaming)));
+        if streaming {
+            break;
+        }
+    }
+    let _ = stop_tx.send(());
+    task.await.unwrap();
+    assert!(streaming, "must stream once the phone has the token");
+
+    let text = std::fs::read_to_string(&log).unwrap();
+    let call = text.lines().find(|l| l.contains("content call")).expect("provisioning call");
+    assert_eq!(
+        call,
+        format!(
+            "shell content call --uri content://io.github.oopnm.enki.provision --method provision --arg {}",
+            to_hex(&TEST_TOKEN)
+        )
+    );
+    assert!(text.lines().any(|l| l.starts_with("forward tcp:")));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn a_phone_that_restarted_and_lost_the_token_is_provisioned_again() {
+    let dir = std::env::temp_dir().join(format!("enki-adb-again-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (adb, log) = fake_adb(&dir);
+    let needed = Arc::new(std::sync::atomic::AtomicUsize::new(1));
+    let phone = Phone { adb_log: Some((log.clone(), needed.clone())), ..Phone::normal() };
+    let (port, _) = start_phone_as(false, phone).await; // media closes by itself, so the receiver reconnects
+    let mut cfg = test_config(port);
+    cfg.setup_adb = true;
+    cfg.adb = adb;
+    cfg.sink_override = Some(("sh".into(), vec!["-c".into(), "cat > /dev/null".into()]));
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (stop_tx, stop_rx) = oneshot::channel();
+    let task = tokio::spawn(run(cfg, tx, stop_rx));
+    let mut streams = 0;
+    let mut logs = String::new();
+    for _ in 0..150 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        for e in drain(&mut rx) {
+            match e {
+                Event::State(State::Streaming) => {
+                    streams += 1;
+                    if streams == 1 {
+                        needed.store(2, Ordering::Relaxed); // the phone app "restarts": it needs a second provisioning
+                    }
+                }
+                Event::Log(t) => logs.push_str(&t),
+                _ => {}
+            }
+        }
+        if streams >= 2 {
+            break;
+        }
+    }
+    let _ = stop_tx.send(());
+    task.await.unwrap();
+    assert!(streams >= 2, "must stream again after provisioning again: {logs}");
+    assert!(logs.contains("أعيد تزويده"), "{logs}");
+    let given = std::fs::read_to_string(&log).unwrap().lines().filter(|l| l.contains("content call")).count();
+    assert_eq!(given, 2);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn failed_provisioning_is_a_clear_error() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("enki-adb-fail-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let script = dir.join("adb");
+    std::fs::write(&script, "#!/bin/sh\nif [ \"$1\" = shell ]; then echo 'Error: No content provider found' >&2; exit 1; fi\n").unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let (port, _) = start_phone(false).await;
+    let mut cfg = test_config(port);
+    cfg.setup_adb = true;
+    cfg.adb = script.display().to_string();
+    let (logs, problem) = run_to_failure_with_problem(cfg).await;
+    assert!(logs.contains("تعذر تزويد الهاتف بمفتاح الجلسة") && logs.contains("No content provider found"), "{logs}");
+    assert_eq!(problem.map(|p| p.code), Some(ProblemCode::ProvisionFailed));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn missing_adb_is_reported_with_its_own_code() {
+    let (port, _) = start_phone(false).await;
+    let mut cfg = test_config(port);
+    cfg.setup_adb = true;
+    cfg.adb = "/nonexistent/adb".into();
+    let (logs, problem) = run_to_failure_with_problem(cfg).await;
+    assert_eq!(problem.map(|p| p.code), Some(ProblemCode::AdbMissing), "{logs}");
+}
+
+#[tokio::test]
+async fn no_phone_on_adb_is_reported_with_its_own_code() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("enki-adb-nodev-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let script = dir.join("adb");
+    std::fs::write(&script, "#!/bin/sh\necho 'error: no devices/emulators found' >&2\nexit 1\n").unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let (port, _) = start_phone(false).await;
+    let mut cfg = test_config(port);
+    cfg.setup_adb = true;
+    cfg.adb = script.display().to_string();
+    let (_, problem) = run_to_failure_with_problem(cfg).await;
+    assert_eq!(problem.map(|p| p.code), Some(ProblemCode::NoDevice));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Streams from a fake phone until `done` says enough events arrived (or 20 s pass); returns every event.
+async fn collect_events(
+    cfg: Config,
+    mut done: impl FnMut(&[Event]) -> bool,
+    mut on_event: impl FnMut(&Event),
+) -> Vec<Event> {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (stop_tx, stop_rx) = oneshot::channel();
+    let task = tokio::spawn(run(cfg, tx, stop_rx));
+    let mut all = Vec::new();
+    for _ in 0..200 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        for e in drain(&mut rx) {
+            on_event(&e);
+            all.push(e);
+        }
+        if done(&all) {
+            break;
+        }
+    }
+    let _ = stop_tx.send(());
+    task.await.unwrap();
+    all
+}
+
+fn sink_to_null(mut cfg: Config) -> Config {
+    cfg.sink_override = Some(("sh".into(), vec!["-c".into(), "cat > /dev/null".into()]));
+    cfg
+}
+
+#[tokio::test]
+async fn link_states_and_capabilities_follow_the_connection() {
+    let (port, _) = start_phone(true).await;
+    let events = collect_events(
+        sink_to_null(test_config(port)),
+        |e| e.iter().any(|x| matches!(x, Event::Link(LinkState::Streaming))),
+        |_| {},
+    )
+    .await;
+    let position = |want: LinkState| events.iter().position(|e| *e == Event::Link(want.clone())).expect("state reported");
+    assert!(position(LinkState::Ready) < position(LinkState::Streaming), "{events:?}");
+    let caps = events.iter().find_map(|e| if let Event::Capabilities(c) = e { Some(c) } else { None }).expect("capabilities");
+    assert_eq!(caps.cameras.len(), 2);
+    assert_eq!(caps.camera("front").unwrap().sensor_orientation, 270);
+    let logs: String = events.iter().filter_map(|e| if let Event::Log(t) = e { Some(t.as_str()) } else { None }).collect();
+    assert!(logs.contains("كاميرات الهاتف") && logs.contains("Fake phone"), "{logs}");
+}
+
+#[tokio::test]
+async fn round_trip_time_is_measured_and_reported_in_the_stats() {
+    let (port, _) = start_phone(true).await;
+    let events = collect_events(
+        sink_to_null(test_config(port)),
+        |e| e.iter().any(|x| matches!(x, Event::Stats(s) if s.rtt_ms.is_some())),
+        |_| {},
+    )
+    .await;
+    let rtt = events.iter().find_map(|e| if let Event::Stats(s) = e { s.rtt_ms } else { None });
+    assert!(rtt.is_some_and(|ms| ms < 500), "loopback round trip should be tiny: {rtt:?}");
+}
+
+#[tokio::test]
+async fn a_frozen_phone_is_noticed_and_the_receiver_reconnects() {
+    use std::sync::atomic::AtomicUsize;
+    let mut behavior = Behavior::new(TEST_TOKEN);
+    behavior.hold_media = true;
+    let pings = behavior.answer_pings.clone();
+    let (port, _) = enki_fakephone::spawn(behavior).await;
+    let streams = Arc::new(AtomicUsize::new(0));
+    let (seen_by_done, seen_by_events) = (streams.clone(), streams.clone());
+    let events = collect_events(
+        sink_to_null(test_config(port)),
+        move |e| {
+            seen_by_done.load(Ordering::Relaxed) >= 2
+                && e.iter().any(|x| matches!(x, Event::Link(LinkState::Reconnecting(_))))
+        },
+        move |e| {
+            if let Event::Link(LinkState::Streaming) = e {
+                match seen_by_events.fetch_add(1, Ordering::Relaxed) + 1 {
+                    1 => pings.store(false, Ordering::Relaxed), // the link freezes: connected, but silent
+                    2 => pings.store(true, Ordering::Relaxed),
+                    _ => {}
+                }
+            }
+        },
+    )
+    .await;
+    assert!(
+        events.iter().any(|e| matches!(e, Event::Link(LinkState::Reconnecting(r)) if r == "no heartbeat")),
+        "the missing pongs must be noticed: {events:?}"
+    );
+    let logs: String = events.iter().filter_map(|e| if let Event::Log(t) = e { Some(t.as_str()) } else { None }).collect();
+    assert!(logs.contains("انقطع الاتصال بالهاتف"), "{logs}");
+    assert!(streams.load(Ordering::Relaxed) >= 2, "must stream again after the link recovers");
+}
+
+/// The whole desktop path with real video: the fake phone's ffmpeg test pattern goes through the NAL splitter and
+/// the protocol into the receiver, whose sink is an ffmpeg that decodes it. Skipped where ffmpeg is missing.
+#[tokio::test]
+async fn real_h264_from_the_fake_phone_decodes() {
+    if std::process::Command::new("ffmpeg").arg("-version").output().is_err() {
+        eprintln!("ffmpeg not installed: skipping");
+        return;
+    }
+    let mut behavior = Behavior::new(TEST_TOKEN);
+    behavior.hold_media = true;
+    behavior.media = enki_fakephone::testsrc_command("ffmpeg");
+    let (port, _) = enki_fakephone::spawn(behavior).await;
+    let mut cfg = test_config(port);
+    // The decoder reads Annex-B H.264 on stdin, like the real sink, and throws the pictures away.
+    cfg.sink_override = Some((
+        "ffmpeg".into(),
+        ["-loglevel", "error", "-f", "h264", "-i", "-", "-f", "null", "-"].iter().map(|s| s.to_string()).collect(),
+    ));
+    let events = collect_events(cfg, |e| e.iter().any(|x| matches!(x, Event::Stats(s) if s.fps >= 10)), |_| {}).await;
+    let logs: String = events.iter().filter_map(|e| if let Event::Log(t) = e { Some(t.as_str()) } else { None }).collect();
+    let fps = events.iter().filter_map(|e| if let Event::Stats(s) = e { Some(s.fps) } else { None }).max();
+    assert!(fps.is_some_and(|f| f >= 10), "video must flow at a real frame rate: {fps:?}\n{logs}");
+    assert!(!events.iter().any(|e| matches!(e, Event::Problem(_))), "{logs}");
+}
+
+#[test]
+fn every_config_gets_its_own_token() {
+    assert_ne!(Config::new("/dev/null").token, Config::new("/dev/null").token);
 }
 
 #[test]

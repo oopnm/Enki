@@ -1,0 +1,11 @@
+# Enki Link v1 control message vectors (shared by Rust and Android tests)
+# name|json. Rust must decode each line; the Android encoder must produce the hello, pong, capabilities and state lines byte for byte.
+hello|{"type":"hello","version":1,"app":"enki-android","app_version":"0.2.0","device":"Pixel 6","android":28}
+capabilities|{"type":"capabilities","cameras":[{"id":"0","facing":"back","sensor_orientation":90,"sizes":[[1920,1080],[1280,720]],"fps_ranges":[[15,30],[30,30]],"zoom_max":8.0,"flash":true,"focus_modes":["continuous","auto"],"ev_range":[-4,4],"ev_step":0.5}],"codecs":["h264","hevc"]}
+ping|{"type":"ping","seq":7}
+pong|{"type":"pong","seq":7}
+state_rotation|{"type":"state","key":"image.rotation","value":180}
+state_bitrate|{"type":"state","key":"stream.bitrate","value":3000}
+set_facing|{"type":"set","key":"camera.facing","value":"front"}
+error|{"type":"error","code":"bad_value","message":"camera.facing must be \"front\" or \"back\""}
+future_type|{"type":"hologram","brightness":9}

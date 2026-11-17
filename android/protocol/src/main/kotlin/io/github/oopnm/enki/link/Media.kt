@@ -46,6 +46,7 @@ class FrameQueue(private val capacity: Int) {
     private val notEmpty = lock.newCondition()
     private var waitingForKey = false
     private var closed = false
+    private var dropped = 0L
 
     init {
         require(capacity >= 2) { "capacity must hold a config + key frame" }
@@ -57,8 +58,13 @@ class FrameQueue(private val capacity: Int) {
      */
     fun offerDelta(frame: EncodedFrame): Boolean {
         lock.withLock {
-            if (closed || waitingForKey) return false
+            if (closed) return false
+            if (waitingForKey) {
+                dropped++
+                return false
+            }
             if (items.size >= capacity) {
+                dropped++
                 waitingForKey = true
                 return true
             }
@@ -73,7 +79,10 @@ class FrameQueue(private val capacity: Int) {
         lock.withLock {
             if (closed) return
             val gap = waitingForKey || items.size + 2 > capacity
-            if (gap) items.clear()
+            if (gap) {
+                dropped += items.size
+                items.clear()
+            }
             val flag = if (gap) FLAG_DISCONTINUITY else 0
             if (config != null) {
                 items.addLast(config.withFlags(flag))
@@ -85,6 +94,9 @@ class FrameQueue(private val capacity: Int) {
             notEmpty.signal()
         }
     }
+
+    /** Frames discarded so far because the reader was too slow. The bit-rate controller watches this. */
+    fun droppedFrames(): Long = lock.withLock { dropped }
 
     /** Blocks until a frame is available. Returns null once the queue is closed and empty. */
     fun take(): EncodedFrame? {
