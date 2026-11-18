@@ -3,15 +3,21 @@ package io.github.oopnm.enki
 import android.content.Context
 import android.os.Build
 import android.util.Log
+import io.github.oopnm.enki.link.Applied
 import io.github.oopnm.enki.link.Auth
 import io.github.oopnm.enki.link.AuthStatus
 import io.github.oopnm.enki.link.Capabilities
 import io.github.oopnm.enki.link.ControlMessages
 import io.github.oopnm.enki.link.Channel
 import io.github.oopnm.enki.link.FrameQueue
+import io.github.oopnm.enki.link.Hlc
 import io.github.oopnm.enki.link.Link
 import io.github.oopnm.enki.link.MediaFrameWriter
 import io.github.oopnm.enki.link.ProtocolException
+import io.github.oopnm.enki.link.Reject
+import io.github.oopnm.enki.link.RejectCode
+import io.github.oopnm.enki.link.RejectedException
+import io.github.oopnm.enki.link.SettingEntry
 import io.github.oopnm.enki.link.UnsupportedVersionException
 import io.github.oopnm.enki.link.decodePreamble
 import io.github.oopnm.enki.link.encodeControlMessage
@@ -55,7 +61,7 @@ class LinkServer(
     private var server: ServerSocket? = null
 
     /** Which camera the next (or running) media session uses: "back" or "front". Guarded by [mediaLock]. */
-    private var facing = "back"
+    private var facing = EnkiSettings.getString("camera.facing").ifEmpty { "back" }
     private val mediaLock = Any()
     private var activeMedia: MediaSession? = null
 
@@ -157,6 +163,8 @@ class LinkServer(
             throw e
         }
         server = s
+        synchronized(mediaLock) { facing = EnkiSettings.getString("camera.facing").ifEmpty { "back" } }
+        EnkiSettings.userChangeListener = { entry, key, value -> onUserChange(entry, key, value) }
         deviceOrientation.enable()
         Thread({ acceptLoop(s) }, "enki-accept").start()
         status(WAITING)
@@ -164,6 +172,7 @@ class LinkServer(
 
     fun stop() {
         if (!stopped.compareAndSet(false, true)) return
+        EnkiSettings.userChangeListener = null
         deviceOrientation.disable()
         SessionToken.clear()
         notifier.shutdownNow()
@@ -259,8 +268,14 @@ class LinkServer(
         val control = ControlOut(out)
         controls.add(control)
         try {
-            control.send(ControlMessages.hello(appVersion, Build.MODEL ?: "", Build.VERSION.SDK_INT))
+            control.send(
+                ControlMessages.hello(
+                    appVersion, Build.MODEL ?: "", Build.VERSION.SDK_INT, EnkiSettings.deviceId, listOf(FEATURE_SETTINGS),
+                ),
+            )
             control.send(runCatching { capabilitiesJson }.getOrElse { ControlMessages.capabilities(Capabilities(emptyList(), emptyList())) })
+            // What this phone has set; the PC answers with only what it has newer or the phone lacks.
+            control.send(ControlMessages.settingsSnapshot(false, EnkiSettings.snapshot()))
             socket.soTimeout = CONTROL_TIMEOUT_MS
             while (true) {
                 val len = input.readInt()
@@ -269,6 +284,16 @@ class LinkServer(
                 val message = try { JSONObject(String(body, Charsets.UTF_8)) } catch (e: JSONException) { continue }
                 when (message.optString("type")) {
                     "ping" -> control.send(ControlMessages.pong(message.optLong("seq")))
+                    "setting" -> parseEntry(message)?.let { handleSetting(control, it) }
+                    "settings_snapshot" -> handleSnapshot(control, message)
+                    "setting_ack" -> parseStamp(message)?.let { (hlc, device) ->
+                        EnkiSettings.acked(message.optString("key"), hlc, device)
+                    }
+                    "setting_reject" -> parseStamp(message)?.let { (hlc, device) ->
+                        val reject = Reject(RejectCode.parse(message.optString("code")), message.optString("message"))
+                        val rolled = EnkiSettings.rejected(message.optString("key"), hlc, device, reject)
+                        if (rolled != null) applyEffect(control, rolled.key, rolled.value)
+                    }
                     "set" -> if (message.optString("key") == "camera.facing") {
                         val value = message.optString("value")
                         if (value == "front" || value == "back") {
@@ -290,7 +315,73 @@ class LinkServer(
         }
     }
 
+    /** A setting changed on the phone's screen: tell every PC, and move the camera if that was the setting. */
+    private fun onUserChange(entry: SettingEntry?, key: String, value: Any) {
+        try {
+            notifier.execute {
+                if (entry != null) broadcastState(ControlMessages.setting(entry))
+                if (key == "camera.facing" && value is String) {
+                    setFacing(value)
+                    broadcastRotation()
+                }
+            }
+        } catch (e: RejectedExecutionException) {
+            // stopping
+        }
+    }
+
+    /** A change from the PC that was accepted (or rolled back): make it real. Only the camera needs the phone. */
+    private fun applyEffect(control: ControlOut, key: String, value: Any) {
+        if (key != "camera.facing" || value !is String) return
+        setFacing(value)
+        // The rotation depends on the camera, so it goes out first; the PC waits for the facing confirmation.
+        rotationMessage()?.let { control.send(it) }
+        control.send(ControlMessages.stateString("camera.facing", value))
+    }
+
+    private fun handleSetting(control: ControlOut, entry: SettingEntry) {
+        try {
+            when (val applied = EnkiSettings.applyRemote(entry)) {
+                is Applied.Changed -> {
+                    control.send(ControlMessages.settingAck(entry.key, entry.hlc, entry.device))
+                    applyEffect(control, applied.key, applied.value)
+                }
+                Applied.Unchanged -> control.send(ControlMessages.settingAck(entry.key, entry.hlc, entry.device))
+                is Applied.Stale -> control.send(ControlMessages.setting(applied.current))
+            }
+        } catch (e: RejectedException) {
+            control.send(ControlMessages.settingReject(entry.key, entry.hlc, entry.device, e.reject.code.wire, e.reject.message))
+        }
+    }
+
+    /** The PC's answer to our snapshot: applied, never answered. */
+    private fun handleSnapshot(control: ControlOut, message: JSONObject) {
+        if (!message.optBoolean("reply")) return
+        val array = message.optJSONArray("settings") ?: return
+        val entries = (0 until array.length()).mapNotNull { i -> array.optJSONObject(i)?.let { parseEntry(it) } }
+        val merge = EnkiSettings.mergeSnapshot(entries)
+        merge.changed.firstOrNull { it.first == "camera.facing" }?.let { applyEffect(control, it.first, it.second) }
+    }
+
+    private fun parseEntry(o: JSONObject): SettingEntry? = try {
+        val hlc = o.getJSONArray("hlc")
+        val raw = o.get("value")
+        val value: Any = if (raw is Int) raw.toLong() else raw
+        SettingEntry(o.getString("key"), value, Hlc(hlc.getLong(0), hlc.getInt(1)), o.getString("device"))
+    } catch (e: JSONException) {
+        null
+    }
+
+    private fun parseStamp(o: JSONObject): Pair<Hlc, String>? = try {
+        val hlc = o.getJSONArray("hlc")
+        Hlc(hlc.getLong(0), hlc.getInt(1)) to o.getString("device")
+    } catch (e: JSONException) {
+        null
+    }
+
     companion object {
+        /** Announced in `hello.features`: this app speaks settings sync. */
+        const val FEATURE_SETTINGS = "settings"
         const val WAITING = "Ready. Waiting for the PC to connect"
         const val STREAMING = "Streaming camera to the PC"
         private const val QUEUE_FRAMES = 30

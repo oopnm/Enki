@@ -62,7 +62,10 @@ pub struct Preamble {
 
 impl Preamble {
     pub fn new(channel: Channel) -> Self {
-        Self { version: VERSION, channel }
+        Self {
+            version: VERSION,
+            channel,
+        }
     }
 
     pub fn encode(&self) -> [u8; PREAMBLE_LEN] {
@@ -88,7 +91,10 @@ impl Preamble {
             1 => Channel::Control,
             c => return Err(Error::UnknownChannel(c)),
         };
-        Ok(Self { version: b[4], channel })
+        Ok(Self {
+            version: b[4],
+            channel,
+        })
     }
 }
 
@@ -158,8 +164,13 @@ impl FrameHeader {
 
 /// Answer to the phone's challenge: `HMAC-SHA256(token, "ENKI-AUTH-1" || channel || nonce)`.
 /// The channel is part of the message, so an answer for one channel cannot be replayed on the other.
-pub fn auth_mac(token: &[u8; TOKEN_LEN], channel: Channel, nonce: &[u8; NONCE_LEN]) -> [u8; MAC_LEN] {
-    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(token).expect("HMAC accepts any key length");
+pub fn auth_mac(
+    token: &[u8; TOKEN_LEN],
+    channel: Channel,
+    nonce: &[u8; NONCE_LEN],
+) -> [u8; MAC_LEN] {
+    let mut mac =
+        <Hmac<Sha256> as Mac>::new_from_slice(token).expect("HMAC accepts any key length");
     mac.update(AUTH_CONTEXT);
     mac.update(&[channel as u8]);
     mac.update(nonce);
@@ -197,7 +208,10 @@ pub fn from_hex(s: &str) -> Option<Vec<u8>> {
     if s.len() % 2 != 0 || !s.is_ascii() {
         return None;
     }
-    (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok()).collect()
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+        .collect()
 }
 
 #[cfg(test)]
@@ -214,7 +228,10 @@ mod tests {
     fn shared_vectors() {
         let text = include_str!("../../../../protocol/vectors/frame_header.txt");
         let mut n = 0;
-        for line in text.lines().filter(|l| !l.starts_with('#') && !l.trim().is_empty()) {
+        for line in text
+            .lines()
+            .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
+        {
             let f: Vec<&str> = line.split('|').collect();
             let hex: [u8; FRAME_HEADER_LEN] = unhex(f[6]).try_into().unwrap();
             let h = FrameHeader {
@@ -246,7 +263,10 @@ mod tests {
     fn shared_auth_vectors() {
         let text = include_str!("../../../../protocol/vectors/auth.txt");
         let mut n = 0;
-        for line in text.lines().filter(|l| !l.starts_with('#') && !l.trim().is_empty()) {
+        for line in text
+            .lines()
+            .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
+        {
             let f: Vec<&str> = line.split('|').collect();
             let token: [u8; TOKEN_LEN] = unhex(f[1]).try_into().unwrap();
             let channel = match f[2] {
@@ -265,7 +285,11 @@ mod tests {
         let token = [7u8; TOKEN_LEN];
         let nonce = [1u8; NONCE_LEN];
         let base = auth_mac(&token, Channel::Control, &nonce);
-        assert_ne!(base, auth_mac(&token, Channel::Media, &nonce), "no replay across channels");
+        assert_ne!(
+            base,
+            auth_mac(&token, Channel::Media, &nonce),
+            "no replay across channels"
+        );
         assert_ne!(base, auth_mac(&[8u8; TOKEN_LEN], Channel::Control, &nonce));
         assert_ne!(base, auth_mac(&token, Channel::Control, &[2u8; NONCE_LEN]));
     }
@@ -283,15 +307,35 @@ mod tests {
     #[test]
     fn rejects_bad_input() {
         assert_eq!(Preamble::decode(b"HTTP/1.1"), Err(Error::BadMagic));
-        assert_eq!(Preamble::decode(b"ENKI\x09\0\0\0"), Err(Error::UnsupportedVersion(9)));
-        assert_eq!(Preamble::decode(b"ENKI\0\0\0\0"), Err(Error::UnsupportedVersion(0)), "an old phone app");
-        assert_eq!(Preamble::decode(b"ENKI\x01\x07\0\0"), Err(Error::UnknownChannel(7)));
-        let mut h = FrameHeader { stream_id: 0, kind: Kind::VideoKey, flags: 0, len: 1, pts_us: 0 }.encode();
+        assert_eq!(
+            Preamble::decode(b"ENKI\x09\0\0\0"),
+            Err(Error::UnsupportedVersion(9))
+        );
+        assert_eq!(
+            Preamble::decode(b"ENKI\0\0\0\0"),
+            Err(Error::UnsupportedVersion(0)),
+            "an old phone app"
+        );
+        assert_eq!(
+            Preamble::decode(b"ENKI\x01\x07\0\0"),
+            Err(Error::UnknownChannel(7))
+        );
+        let mut h = FrameHeader {
+            stream_id: 0,
+            kind: Kind::VideoKey,
+            flags: 0,
+            len: 1,
+            pts_us: 0,
+        }
+        .encode();
         h[1] = 99;
         assert_eq!(FrameHeader::decode(&h), Err(Error::UnknownKind(99)));
         h[1] = 1;
         h[4..8].copy_from_slice(&(MAX_PAYLOAD + 1).to_be_bytes());
-        assert_eq!(FrameHeader::decode(&h), Err(Error::PayloadTooLarge(MAX_PAYLOAD + 1)));
+        assert_eq!(
+            FrameHeader::decode(&h),
+            Err(Error::PayloadTooLarge(MAX_PAYLOAD + 1))
+        );
         h[4..8].copy_from_slice(&1u32.to_be_bytes());
         h[3] = 1;
         assert_eq!(FrameHeader::decode(&h), Err(Error::Reserved));

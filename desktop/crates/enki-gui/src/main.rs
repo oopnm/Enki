@@ -1,3 +1,10 @@
+//! Enki desktop window. The settings controls are built from the shared schema (`protocol/settings.json`), so this
+//! window shows the same settings as the phone app, and a change made on either side shows on the other. Texts come
+//! from the Fluent files in `desktop/i18n`; changing the language rebuilds the window in the new language, with
+//! right-to-left layout for Arabic.
+
+use enki_i18n::I18n;
+use enki_receiver::enki_settings::{Hub, Kind, Scope, SettingsHandle, Store};
 use gtk::glib;
 use gtk::prelude::*;
 use gtk::Box as GtkBox;
@@ -5,7 +12,9 @@ use gtk::{
     Application, ApplicationWindow, Button, CheckButton, DropDown, Entry, Label, Orientation,
     ScrolledWindow, TextBuffer, TextView,
 };
-use std::cell::RefCell;
+use serde_json::{json, Value};
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::process::Stdio;
 use std::rc::Rc;
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
@@ -14,29 +23,94 @@ use tokio::runtime::Handle;
 use tokio::sync::{mpsc, oneshot};
 
 const APP_ID: &str = "io.github.oopnm.Enki";
-const DEFAULT_DEVICE: &str = "/dev/video10";
+/// Named colors shared with the phone app (generated from protocol/tokens.json).
+const TOKENS_CSS: &str = include_str!("tokens.css");
+
+/// What the status line says. Rendered with the current language each time, so a language change updates it.
+#[derive(Debug, Clone, PartialEq)]
+enum Status {
+    Stopped,
+    Preparing,
+    WaitingApp,
+    OpeningCamera,
+    Connected,
+    Reconnecting,
+    Streaming {
+        fps: u32,
+        mbps: f64,
+        rtt_ms: Option<u32>,
+        target_mbps: Option<f64>,
+    },
+}
 
 /// رسائل تُرسل من مهام Tokio إلى واجهة GTK (تُعالَج فقط على الخيط الرئيسي).
 enum UiEvent {
     Log(String),
     Running(bool),
-    /// نص حالة البث (يُعرض بجانب «الحالة:»).
-    Status(String),
+    Status(Status),
     /// مشكلة أنهت الجلسة: يظهر زر الإصلاح المناسب لها إن وُجد.
     Problem(enki_receiver::Problem),
+    /// A setting (or the phone profile) changed behind the window's back: redraw the controls.
+    Refresh,
+    /// The phone refused a change made here (already rolled back in the settings).
+    RolledBack {
+        key: String,
+        message: String,
+    },
+}
+
+type EventTx = mpsc::UnboundedSender<UiEvent>;
+
+/// One settings control, so it can be set from the stored value.
+enum Control {
+    Choice(DropDown, Vec<String>),
+    Toggle(CheckButton),
+    Text(Entry),
+}
+
+/// Message id of a setting label (`camera.facing` → `setting-camera-facing`) and of one choice.
+fn setting_id(key: &str) -> String {
+    format!("setting-{}", key.replace(['.', '_'], "-"))
+}
+
+fn choice_id(key: &str, value: &str) -> String {
+    format!("{}--{}", setting_id(key), value.replace(['.', '_'], "-"))
 }
 
 /// نص زر الإصلاح لكل نوع مشكلة (None = لا يوجد إصلاح بزر؛ الرسالة في السجل تكفي).
-fn fix_label(code: enki_receiver::ProblemCode) -> Option<&'static str> {
+fn fix_message(code: enki_receiver::ProblemCode) -> Option<&'static str> {
     use enki_receiver::ProblemCode::*;
     match code {
-        OutputDevice => Some("🔧 تفعيل درايفر النواة"),
-        NoDevice | ProvisionFailed | AuthRejected | Other => Some("🔄 إعادة المحاولة"),
+        OutputDevice => Some("fix-load-module"),
+        NoDevice | ProvisionFailed | AuthRejected | Other => Some("fix-retry"),
         AdbMissing | FfmpegMissing | VersionMismatch => None,
     }
 }
 
-type EventTx = mpsc::UnboundedSender<UiEvent>;
+struct App {
+    rt: Handle,
+    hub: SettingsHandle,
+    tx: EventTx,
+    window: ApplicationWindow,
+    i18n: RefCell<I18n>,
+    status: RefCell<Status>,
+    log_buffer: TextBuffer,
+    controls: RefCell<HashMap<String, Control>>,
+    /// True while controls are being set from the stored values, so that does not count as a user change.
+    refreshing: Cell<bool>,
+    status_label: RefCell<Label>,
+    phone_label: RefCell<Label>,
+    start_btn: RefCell<Button>,
+    fix_btn: RefCell<Button>,
+    resolution: RefCell<DropDown>,
+    audio: RefCell<CheckButton>,
+    /// مرسل الإيقاف للجلسة الحالية (None = لا يوجد بث).
+    stop_slot: RefCell<Option<oneshot::Sender<()>>>,
+    /// مرسل أوامر الجلسة الحالية (تغيير الإعدادات أثناء البث).
+    control_slot: RefCell<Option<mpsc::UnboundedSender<enki_receiver::Control>>>,
+    /// نوع المشكلة التي يعالجها زر الإصلاح الظاهر حالياً.
+    fix_slot: RefCell<Option<enki_receiver::ProblemCode>>,
+}
 
 fn main() -> glib::ExitCode {
     // GTK يملك الخيط الرئيسي، لذلك يعمل Tokio في خيط خلفي منفصل.
@@ -54,422 +128,641 @@ fn main() -> glib::ExitCode {
 }
 
 fn build_ui(app: &Application, rt: Handle) {
+    if let Some(display) = gtk::gdk::Display::default() {
+        let provider = gtk::CssProvider::new();
+        provider.load_from_data(TOKENS_CSS);
+        gtk::style_context_add_provider_for_display(
+            &display,
+            &provider,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+    }
+
+    let (hub, warning) = Hub::open(Store::new(Store::default_dir()));
+    let hub = hub.handle();
+    // اكتشاف تلقائي: إن وُجد جهاز v4l2loopback باسم Enki نستخدمه بدل الكتابة اليدوية (إن لم يختر المستخدم جهازاً)
+    {
+        let mut h = hub.lock().unwrap();
+        if h.engine().entry("output.device").is_none() {
+            if let Some(found) =
+                enki_receiver::pick_default_device(&enki_receiver::list_v4l2_devices())
+            {
+                let _ = h.set_local("output.device", &json!(found));
+            }
+        }
+    }
+    let i18n = I18n::new(&hub.lock().unwrap().get_string("ui.language"));
+
     let window = ApplicationWindow::builder()
         .application(app)
         .title("Enki")
-        .default_width(650)
-        .default_height(600)
+        .default_width(680)
+        .default_height(720)
         .build();
-
-    let main_box = GtkBox::new(Orientation::Vertical, 12);
-    main_box.set_margin_start(16);
-    main_box.set_margin_end(16);
-    main_box.set_margin_top(16);
-    main_box.set_margin_bottom(16);
-
-    main_box.append(
-        &Label::builder()
-            .label("<b>Enki</b>")
-            .use_markup(true)
-            .xalign(0.0)
-            .build(),
-    );
-
-    // مؤشر حالة البث
-    let status_label = Label::builder().xalign(0.0).use_markup(true).build();
-    set_status(&status_label, false);
-    main_box.append(&status_label);
-
-    let settings_box = GtkBox::new(Orientation::Vertical, 8);
-
-    // مصدر البث: الكاميرا أو الشاشة (الشاشة يبثّها scrcpy)
-    let source_box = GtkBox::new(Orientation::Horizontal, 10);
-    source_box.append(&row_label("المصدر:"));
-    let source_dropdown = DropDown::new(
-        Some(gtk::StringList::new(&[
-            "كاميرا الهاتف (تطبيق Enki) → جهاز V4L2",
-            "كاميرا الهاتف (scrcpy، أندرويد 12+) → جهاز V4L2",
-            "شاشة الهاتف → نافذة",
-            "شاشة الهاتف → جهاز V4L2",
-        ])),
-        gtk::Expression::NONE,
-    );
-    source_box.append(&source_dropdown);
-    settings_box.append(&source_box);
-
-    // كاميرا الهاتف (أمامية / خلفية)
-    let facing_box = GtkBox::new(Orientation::Horizontal, 10);
-    facing_box.append(&row_label("كاميرا الهاتف:"));
-    let facing_dropdown = DropDown::new(
-        Some(gtk::StringList::new(&["خلفية (Back)", "أمامية (Front)"])),
-        gtk::Expression::NONE,
-    );
-    facing_box.append(&facing_dropdown);
-    settings_box.append(&facing_box);
-
-    // الدقة
-    let res_box = GtkBox::new(Orientation::Horizontal, 10);
-    res_box.append(&row_label("دقة البث (Resolution):"));
-    let res_dropdown = DropDown::new(
-        Some(gtk::StringList::new(&["1920x1080", "1280x720", "3840x2160 (4K)"])),
-        gtk::Expression::NONE,
-    );
-    res_dropdown.set_selected(0);
-    res_box.append(&res_dropdown);
-    settings_box.append(&res_box);
-
-    // تدوير الصورة / مرآة لكاميرا تطبيق Enki (تلقائي = الإعداد الأنسب لكل كاميرا، ويتبدّل مع تبديلها)
-    let rot_box = GtkBox::new(Orientation::Horizontal, 10);
-    rot_box.append(&row_label("تدوير الصورة:"));
-    let rot_dropdown = DropDown::new(
-        Some(gtk::StringList::new(&["تلقائي (حسب الكاميرا)", "0°", "90°", "180°", "270°"])),
-        gtk::Expression::NONE,
-    );
-    rot_box.append(&rot_dropdown);
-    rot_box.append(&Label::new(Some("مرآة أفقية:")));
-    let mirror_dropdown = DropDown::new(
-        Some(gtk::StringList::new(&["تلقائي", "مفعّلة", "متوقفة"])),
-        gtk::Expression::NONE,
-    );
-    rot_box.append(&mirror_dropdown);
-    settings_box.append(&rot_box);
-    let auto_rotate_check = CheckButton::builder()
-        .label("تدوير تلقائي حسب مستشعر الهاتف (يتبع طريقة إمساكه: أفقي/عمودي)")
-        .active(false)
-        .build();
-    settings_box.append(&auto_rotate_check);
-
-    // جهاز V4L2
-    let device_box = GtkBox::new(Orientation::Horizontal, 10);
-    device_box.append(&row_label("جهاز V4L2:"));
-    let device_entry = Entry::builder().text(DEFAULT_DEVICE).build();
-    // اكتشاف تلقائي: إن وُجد جهاز v4l2loopback باسم Enki نستخدمه بدل الكتابة اليدوية
-    if let Some(found) = enki_receiver::pick_default_device(&enki_receiver::list_v4l2_devices()) {
-        device_entry.set_text(&found);
-    }
-    device_box.append(&device_entry);
-    settings_box.append(&device_box);
-
-    let audio_check = CheckButton::builder()
-        .label("تضمين صوت المايكروفون (Audio Forwarding)")
-        .active(false)
-        .build();
-    settings_box.append(&audio_check);
-    main_box.append(&settings_box);
-
-    // أزرار التحكم
-    let action_box = GtkBox::new(Orientation::Horizontal, 10);
-    let modprobe_btn = Button::builder()
-        .label("1. تفعيل درايفر النواة (Modprobe)")
-        .build();
-    let start_btn = Button::builder().label("2. تشغيل الكاميرا 🟢").build();
-    let stop_btn = Button::builder().label("إيقاف البث 🛑").build();
-    action_box.append(&modprobe_btn);
-    action_box.append(&start_btn);
-    action_box.append(&stop_btn);
-    // يظهر فقط بعد مشكلة لها إصلاح (انظر fix_label).
-    let fix_btn = Button::builder().label("🔧").visible(false).build();
-    action_box.append(&fix_btn);
-    main_box.append(&action_box);
-
-    // السجلات
-    main_box.append(
-        &Label::builder()
-            .label("<b>سجلات النظام والأخطاء الفورية:</b>")
-            .use_markup(true)
-            .xalign(0.0)
-            .build(),
-    );
-    let text_view = TextView::builder()
-        .editable(false)
-        .monospace(true)
-        .wrap_mode(gtk::WrapMode::WordChar)
-        .build();
-    let text_buffer = text_view.buffer();
-    main_box.append(
-        &ScrolledWindow::builder()
-            .hscrollbar_policy(gtk::PolicyType::Automatic)
-            .vscrollbar_policy(gtk::PolicyType::Automatic)
-            .child(&text_view)
-            .vexpand(true)
-            .build(),
-    );
-
-    window.set_child(Some(&main_box));
-
-    // --- قناة الأحداث: Tokio -> GTK ---
-    // tokio::sync::mpsc لا يحتاج runtime لانتظار الاستقبال، فيمكن انتظاره
-    // مباشرة داخل حلقة GLib الرئيسية بدون أي استدعاء GTK من خيط آخر.
+    // tokio::sync::mpsc لا يحتاج runtime لانتظار الاستقبال، فيمكن انتظاره مباشرة داخل حلقة GLib الرئيسية.
     let (tx, mut rx) = mpsc::unbounded_channel::<UiEvent>();
 
-    // مرسل الإيقاف للجلسة الحالية (None = لا يوجد بث).
-    let stop_slot: Rc<RefCell<Option<oneshot::Sender<()>>>> = Rc::new(RefCell::new(None));
-    // مرسل أوامر الجلسة الحالية (تبديل الكاميرا أثناء البث).
-    let control_slot: Rc<RefCell<Option<mpsc::UnboundedSender<enki_receiver::Control>>>> =
-        Rc::new(RefCell::new(None));
-    // نوع المشكلة التي يعالجها زر الإصلاح الظاهر حالياً.
-    let fix_slot: Rc<RefCell<Option<enki_receiver::ProblemCode>>> = Rc::new(RefCell::new(None));
+    let app_state = Rc::new(App {
+        rt,
+        hub,
+        tx: tx.clone(),
+        window,
+        i18n: RefCell::new(i18n),
+        status: RefCell::new(Status::Stopped),
+        log_buffer: TextBuffer::new(None),
+        controls: RefCell::new(HashMap::new()),
+        refreshing: Cell::new(false),
+        status_label: RefCell::new(Label::new(None)),
+        phone_label: RefCell::new(Label::new(None)),
+        start_btn: RefCell::new(Button::new()),
+        fix_btn: RefCell::new(Button::new()),
+        resolution: RefCell::new(DropDown::new(
+            None::<gtk::StringList>,
+            gtk::Expression::NONE,
+        )),
+        audio: RefCell::new(CheckButton::new()),
+        stop_slot: RefCell::new(None),
+        control_slot: RefCell::new(None),
+        fix_slot: RefCell::new(None),
+    });
+    if let Some(w) = warning {
+        let message = app_state
+            .i18n
+            .borrow()
+            .tr_args("log-settings-warning", &[("message", w.as_str().into())]);
+        append_log(&app_state.log_buffer, &format!("⚠️ {message}\n"));
+    }
+    app_state.rebuild();
 
+    // --- قناة الأحداث: Tokio -> GTK ---
     {
-        let buffer = text_buffer.clone();
-        let status = status_label.clone();
-        let start = start_btn.clone();
-        let slot = stop_slot.clone();
-        let control = control_slot.clone();
-        let fix = fix_btn.clone();
-        let fix_code = fix_slot.clone();
+        let app = app_state.clone();
         glib::spawn_future_local(async move {
             while let Some(event) = rx.recv().await {
-                match event {
-                    UiEvent::Log(text) => append_log(&buffer, &text),
-                    UiEvent::Status(text) => {
-                        status.set_markup(&format!("<b>الحالة: {text}</b>"));
-                    }
-                    UiEvent::Problem(problem) => match fix_label(problem.code) {
-                        Some(label) => {
-                            fix.set_label(label);
-                            fix.set_visible(true);
-                            *fix_code.borrow_mut() = Some(problem.code);
-                        }
-                        None => fix.set_visible(false),
-                    },
-                    UiEvent::Running(running) => {
-                        if running {
-                            fix.set_visible(false); // جلسة جديدة: المشكلة السابقة لم تعد قائمة
-                        } else {
-                            slot.borrow_mut().take();
-                            control.borrow_mut().take();
-                        }
-                        start.set_sensitive(!running);
-                        set_status(&status, running);
-                    }
-                }
+                app.handle_event(event);
             }
         });
     }
+    app_state.window.present();
+}
 
-    // --- ربط الأحداث ---
-
-    // 1. تفعيل v4l2loopback (رقم الجهاز يؤخذ من حقل الإدخال)
-    {
-        let tx = tx.clone();
-        let rt = rt.clone();
-        let entry = device_entry.clone();
-        modprobe_btn.connect_clicked(move |_| {
-            let device = entry.text().to_string();
-            match parse_video_nr(&device) {
-                Some(nr) => {
-                    rt.spawn(load_module(nr, tx.clone()));
-                }
-                None => log(
-                    &tx,
-                    format!("❌ مسار غير صالح: «{device}». الصيغة المطلوبة: /dev/videoN\n"),
-                ),
-            }
-        });
+impl App {
+    fn tr(&self, id: &str) -> String {
+        self.i18n.borrow().tr(id)
     }
 
-    // زر الإصلاح: يعالج آخر مشكلة أنهت الجلسة (تفعيل الدرايفر، أو إعادة المحاولة)
-    {
-        let tx = tx.clone();
-        let rt = rt.clone();
-        let entry = device_entry.clone();
-        let start = start_btn.clone();
-        let fix = fix_btn.clone();
-        let code = fix_slot.clone();
-        fix_btn.connect_clicked(move |_| {
-            let problem = code.borrow_mut().take();
-            fix.set_visible(false);
-            match problem {
-                Some(enki_receiver::ProblemCode::OutputDevice) => {
-                    let device = entry.text().to_string();
-                    match parse_video_nr(&device) {
-                        Some(nr) => {
-                            rt.spawn(load_module(nr, tx.clone()));
-                        }
-                        None => log(&tx, format!("❌ مسار غير صالح: «{device}». الصيغة المطلوبة: /dev/videoN\n")),
+    fn log(&self, text: &str) {
+        append_log(&self.log_buffer, text);
+    }
+
+    /// Builds the window content in the current language. Called at start and whenever the language changes; the log
+    /// text, the running session and the stored settings survive it.
+    fn rebuild(self: &Rc<Self>) {
+        let (lang_rtl, schema) = {
+            let i18n = self.i18n.borrow();
+            (i18n.rtl(), self.hub.lock().unwrap().schema().clone())
+        };
+        gtk::Widget::set_default_direction(if lang_rtl {
+            gtk::TextDirection::Rtl
+        } else {
+            gtk::TextDirection::Ltr
+        });
+        self.controls.borrow_mut().clear();
+
+        let main_box = GtkBox::new(Orientation::Vertical, 12);
+        for set in [
+            GtkBox::set_margin_start,
+            GtkBox::set_margin_end,
+            GtkBox::set_margin_top,
+            GtkBox::set_margin_bottom,
+        ] {
+            set(&main_box, 16);
+        }
+        main_box.append(
+            &Label::builder()
+                .label(format!("<b>{}</b>", self.tr("app-title")))
+                .use_markup(true)
+                .xalign(0.0)
+                .build(),
+        );
+
+        // مؤشر حالة البث واسم الهاتف
+        let status_label = Label::builder().xalign(0.0).use_markup(true).build();
+        let phone_label = Label::builder().xalign(0.0).build();
+        main_box.append(&status_label);
+        main_box.append(&phone_label);
+        *self.status_label.borrow_mut() = status_label;
+        *self.phone_label.borrow_mut() = phone_label;
+
+        // الإعدادات: تُبنى من المخطط المشترك، مجموعة بعد مجموعة.
+        let settings_box = GtkBox::new(Orientation::Vertical, 8);
+        for group in &schema.groups {
+            let defs: Vec<_> = schema
+                .settings
+                .iter()
+                .filter(|d| &d.group == group && d.on_desktop())
+                .collect();
+            if defs.is_empty() {
+                continue;
+            }
+            settings_box.append(
+                &Label::builder()
+                    .label(format!("<b>{}</b>", self.tr(&format!("group-{group}"))))
+                    .use_markup(true)
+                    .xalign(0.0)
+                    .build(),
+            );
+            for def in defs {
+                if let Some(row) = self.control_row(def) {
+                    settings_box.append(&row);
+                }
+            }
+        }
+
+        // خيارات scrcpy فقط (ليست جزءاً من المخطط بعد)
+        let res_box = GtkBox::new(Orientation::Horizontal, 10);
+        res_box.append(&row_label(&self.tr("label-resolution")));
+        let resolution = DropDown::new(
+            Some(gtk::StringList::new(&[
+                "1920x1080",
+                "1280x720",
+                "3840x2160 (4K)",
+            ])),
+            gtk::Expression::NONE,
+        );
+        resolution.set_selected(self.resolution.borrow().selected().min(2));
+        res_box.append(&resolution);
+        settings_box.append(&res_box);
+        *self.resolution.borrow_mut() = resolution;
+        let audio = CheckButton::builder()
+            .label(self.tr("check-audio"))
+            .active(self.audio.borrow().is_active())
+            .build();
+        settings_box.append(&audio);
+        *self.audio.borrow_mut() = audio;
+        main_box.append(&settings_box);
+
+        // أزرار التحكم
+        let action_box = GtkBox::new(Orientation::Horizontal, 10);
+        let modprobe_btn = Button::builder().label(self.tr("button-modprobe")).build();
+        let start_btn = Button::builder()
+            .label(self.tr("button-start"))
+            .sensitive(self.stop_slot.borrow().is_none())
+            .build();
+        let stop_btn = Button::builder().label(self.tr("button-stop")).build();
+        // يظهر فقط بعد مشكلة لها إصلاح (انظر fix_message).
+        let fix_btn = Button::builder().visible(false).build();
+        if let Some(code) = *self.fix_slot.borrow() {
+            if let Some(id) = fix_message(code) {
+                fix_btn.set_label(&self.tr(id));
+                fix_btn.set_visible(true);
+            }
+        }
+        for b in [&modprobe_btn, &start_btn, &stop_btn, &fix_btn] {
+            action_box.append(b);
+        }
+        main_box.append(&action_box);
+        *self.start_btn.borrow_mut() = start_btn.clone();
+        *self.fix_btn.borrow_mut() = fix_btn.clone();
+
+        // السجلات
+        main_box.append(
+            &Label::builder()
+                .label(format!("<b>{}</b>", self.tr("log-title")))
+                .use_markup(true)
+                .xalign(0.0)
+                .build(),
+        );
+        let text_view = TextView::builder()
+            .buffer(&self.log_buffer)
+            .editable(false)
+            .monospace(true)
+            .wrap_mode(gtk::WrapMode::WordChar)
+            .build();
+        main_box.append(
+            &ScrolledWindow::builder()
+                .hscrollbar_policy(gtk::PolicyType::Automatic)
+                .vscrollbar_policy(gtk::PolicyType::Automatic)
+                .child(&text_view)
+                .vexpand(true)
+                .build(),
+        );
+        self.window.set_child(Some(&main_box));
+
+        // --- ربط الأزرار ---
+        {
+            let app = self.clone();
+            modprobe_btn.connect_clicked(move |_| app.load_module_from_settings());
+        }
+        {
+            let app = self.clone();
+            fix_btn.connect_clicked(move |btn| {
+                let problem = app.fix_slot.borrow_mut().take();
+                btn.set_visible(false);
+                match problem {
+                    Some(enki_receiver::ProblemCode::OutputDevice) => {
+                        app.load_module_from_settings()
                     }
+                    Some(_) => app.start_btn.borrow().emit_clicked(),
+                    None => {}
                 }
-                Some(_) => start.emit_clicked(),
-                None => {}
-            }
-        });
+            });
+        }
+        {
+            let app = self.clone();
+            start_btn.connect_clicked(move |_| app.start());
+        }
+        {
+            let app = self.clone();
+            stop_btn.connect_clicked(move |_| match app.stop_slot.borrow_mut().take() {
+                Some(stop_tx) => {
+                    let _ = stop_tx.send(());
+                }
+                None => app.log(&format!("{}\n", app.tr("log-no-stream"))),
+            });
+        }
+
+        self.refresh_controls();
+        self.render_status();
     }
 
-    // 2. بدء البث
-    {
-        let tx = tx.clone();
-        let rt = rt.clone();
-        let slot = stop_slot.clone();
-        let source_dd = source_dropdown.clone();
-        let facing_dd = facing_dropdown.clone();
-        let res_dd = res_dropdown.clone();
-        let entry = device_entry.clone();
-        let audio = audio_check.clone();
-        let rot_dd = rot_dropdown.clone();
-        let mirror_dd = mirror_dropdown.clone();
-        let auto_cb = auto_rotate_check.clone();
-        let control = control_slot.clone();
-        start_btn.connect_clicked(move |_| {
-            if slot.borrow().is_some() {
-                return; // يوجد بث شغال أصلاً
-            }
-            // 0 = كاميرا Enki، 1 = كاميرا scrcpy، 2 = شاشة إلى نافذة، 3 = شاشة إلى V4L2
-            let source = source_dd.selected();
-            let device = entry.text().to_string();
-            if source != 2 && parse_video_nr(&device).is_none() {
-                log(
-                    &tx,
-                    format!("❌ مسار غير صالح: «{device}». الصيغة المطلوبة: /dev/videoN\n"),
-                );
-                return;
-            }
-            if source == 0 {
-                // كاميرا تطبيق Enki: يستقبلها enki-receiver ويمررها إلى V4L2 (تعمل من أندرويد 7)
-                let facing = if facing_dd.selected() == 1 {
-                    enki_receiver::Facing::Front
-                } else {
-                    enki_receiver::Facing::Back
-                };
-                let mut cfg = enki_receiver::Config::new(device.clone());
-                cfg.facing = facing;
-                cfg.rotate = match rot_dd.selected() {
-                    0 => None,
-                    n => Some([0, 90, 180, 270][(n as usize - 1).min(3)]),
-                };
-                cfg.auto_rotate = auto_cb.is_active();
-                cfg.mirror = match mirror_dd.selected() {
-                    0 => None,
-                    1 => Some(true),
-                    _ => Some(false),
-                };
-                log(&tx, format!("> كاميرا Enki ({}) → {device}...\n", facing.as_str()));
-                let (stop_tx, stop_rx) = oneshot::channel();
-                *slot.borrow_mut() = Some(stop_tx);
-                let _ = tx.send(UiEvent::Running(true));
-                let (ev_tx, mut ev_rx) = mpsc::unbounded_channel();
-                let (ctl_tx, ctl_rx) = mpsc::unbounded_channel();
-                *control.borrow_mut() = Some(ctl_tx);
-                rt.spawn(enki_receiver::run_with_commands(cfg, ev_tx, stop_rx, ctl_rx));
-                let ui = tx.clone();
-                rt.spawn(async move {
-                    use enki_receiver::{Event, LinkState, State};
-                    while let Some(event) = ev_rx.recv().await {
-                        let ui_event = match event {
-                            Event::Log(text) => Some(UiEvent::Log(text)),
-                            Event::Link(LinkState::Preparing) => Some(UiEvent::Status("🟡 تجهيز الاتصال بالهاتف".to_string())),
-                            Event::Link(LinkState::WaitingForApp) => Some(UiEvent::Status("🟡 بانتظار تطبيق الهاتف".to_string())),
-                            Event::Link(LinkState::Ready) => Some(UiEvent::Status("🟡 فتح الكاميرا".to_string())),
-                            Event::Link(LinkState::Streaming) => Some(UiEvent::Status("🟢 متصل".to_string())),
-                            Event::Link(LinkState::Reconnecting(_)) => Some(UiEvent::Status("🟠 إعادة الاتصال".to_string())),
-                            Event::State(State::Stopped) => Some(UiEvent::Running(false)),
-                            Event::State(_) | Event::Capabilities(_) => None,
-                            Event::Problem(problem) => Some(UiEvent::Problem(problem)),
-                            Event::Stats(s) => {
-                                let mut text = format!("🟢 متصل · {} fps · {:.1} Mbps", s.fps, s.kbps as f64 / 1000.0);
-                                if let Some(ms) = s.rtt_ms {
-                                    text.push_str(&format!(" · {ms} ms"));
-                                }
-                                if let Some(target) = s.bitrate_kbps {
-                                    text.push_str(&format!(" · الهدف {:.1} Mbps", target as f64 / 1000.0));
-                                }
-                                Some(UiEvent::Status(text))
-                            }
-                        };
-                        if let Some(ui_event) = ui_event {
-                            let _ = ui.send(ui_event);
-                        }
+    /// One row for a setting, or `None` for kinds this window has no control for yet.
+    fn control_row(self: &Rc<Self>, def: &enki_receiver::enki_settings::Def) -> Option<GtkBox> {
+        let row = GtkBox::new(Orientation::Horizontal, 10);
+        let key = def.key.clone();
+        let label = self.tr(&setting_id(&key));
+        match &def.kind {
+            Kind::Enum(values) => {
+                row.append(&row_label(&label));
+                let names: Vec<String> = values
+                    .iter()
+                    .map(|v| self.tr(&choice_id(&key, v)))
+                    .collect();
+                let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+                let dropdown =
+                    DropDown::new(Some(gtk::StringList::new(&refs)), gtk::Expression::NONE);
+                row.append(&dropdown);
+                let app = self.clone();
+                let (k, vals) = (key.clone(), values.clone());
+                dropdown.connect_selected_notify(move |dd| {
+                    if let Some(value) = vals.get(dd.selected() as usize) {
+                        app.user_set(&k, json!(value));
                     }
                 });
-                return;
+                self.controls
+                    .borrow_mut()
+                    .insert(key, Control::Choice(dropdown, values.clone()));
             }
-            let facing = if facing_dd.selected() == 1 { "front" } else { "back" };
-            let size = match res_dd.selected() {
-                1 => "1280x720",
-                2 => "3840x2160",
-                _ => "1920x1080",
-            };
+            Kind::Bool => {
+                let check = CheckButton::builder().label(label).build();
+                row.append(&check);
+                let app = self.clone();
+                let k = key.clone();
+                check.connect_toggled(move |c| app.user_set(&k, json!(c.is_active())));
+                self.controls
+                    .borrow_mut()
+                    .insert(key, Control::Toggle(check));
+            }
+            Kind::Str { .. } => {
+                row.append(&row_label(&label));
+                let entry = Entry::builder().hexpand(true).build();
+                row.append(&entry);
+                let app = self.clone();
+                let k = key.clone();
+                entry.connect_changed(move |e| app.user_set(&k, json!(e.text().to_string())));
+                self.controls.borrow_mut().insert(key, Control::Text(entry));
+            }
+            _ => return None, // أرقام: لا عنصر تحكم لها قبل المرحلة 5
+        }
+        Some(row)
+    }
 
-            let mut args: Vec<String>;
-            let what;
-            if source == 1 {
-                args = vec![
-                    "--video-source=camera".to_string(),
-                    format!("--camera-facing={facing}"),
-                    format!("--camera-size={size}"),
-                    format!("--v4l2-sink={device}"),
-                    // لا نافذة معاينة (يُبقي الصوت شغال إذا فُعّل)
-                    "--no-video-playback".to_string(),
-                ];
-                what = format!("كاميرا: {facing}, دقة: {size}, الجهاز: {device}");
-            } else {
-                // الشاشة: --max-size هو أكبر بُعد للصورة
-                let max = size.split('x').next().unwrap_or("1920");
-                args = vec![format!("--max-size={max}")];
-                if source == 3 {
-                    args.push(format!("--v4l2-sink={device}"));
-                    args.push("--no-video-playback".to_string());
-                    what = format!("شاشة → {device}, أكبر بُعد: {max}");
-                } else {
-                    what = format!("شاشة → نافذة, أكبر بُعد: {max}");
+    /// Sets every control from the stored values (without counting that as a user change).
+    fn refresh_controls(&self) {
+        self.refreshing.set(true);
+        {
+            let hub = self.hub.lock().unwrap();
+            for (key, control) in self.controls.borrow().iter() {
+                let Some(value) = hub.get(key) else { continue };
+                match control {
+                    Control::Choice(dd, values) => {
+                        if let Some(i) = value
+                            .as_str()
+                            .and_then(|s| values.iter().position(|v| v == s))
+                        {
+                            if dd.selected() as usize != i {
+                                dd.set_selected(i as u32);
+                            }
+                        }
+                    }
+                    Control::Toggle(c) => c.set_active(value.as_bool().unwrap_or(false)),
+                    Control::Text(e) => {
+                        let text = value.as_str().unwrap_or("");
+                        if e.text() != text {
+                            e.set_text(text);
+                        }
+                    }
                 }
             }
-            if audio.is_active() {
-                args.push("--audio-source=mic".to_string());
+            let name = hub.phone_name();
+            self.phone_label.borrow().set_label(&if name.is_empty() {
+                String::new()
             } else {
-                args.push("--no-audio".to_string());
-            }
-
-            log(
-                &tx,
-                format!("> تشغيل scrcpy ({what})...\n"),
-            );
-
-            let (stop_tx, stop_rx) = oneshot::channel();
-            *slot.borrow_mut() = Some(stop_tx);
-            let _ = tx.send(UiEvent::Running(true));
-            rt.spawn(run_scrcpy(args, stop_rx, tx.clone()));
-        });
+                self.i18n
+                    .borrow()
+                    .tr_args("status-phone", &[("name", name.into())])
+            });
+        }
+        self.refreshing.set(false);
     }
 
-    // تبديل الكاميرا الأمامية/الخلفية أثناء بث كاميرا Enki
-    {
-        let control = control_slot.clone();
-        facing_dropdown.connect_selected_notify(move |dd| {
-            if let Some(ctl) = control.borrow().as_ref() {
-                let facing = if dd.selected() == 1 {
-                    enki_receiver::Facing::Front
+    /// A change made with a control. Synced settings go through the running session, which stores them, applies them
+    /// and sends them to the phone; otherwise (no session, or a setting of this computer) they are stored here and
+    /// travel in the exchange at the next connection.
+    fn user_set(self: &Rc<Self>, key: &str, value: Value) {
+        if self.refreshing.get() {
+            return;
+        }
+        let synced = self
+            .hub
+            .lock()
+            .unwrap()
+            .schema()
+            .get(key)
+            .map(|d| d.scope == Scope::Synced)
+            .unwrap_or(false);
+        if synced {
+            if let Some(ctl) = self.control_slot.borrow().as_ref() {
+                let _ = ctl.send(enki_receiver::Control::Set(key.to_string(), value));
+                return;
+            }
+        }
+        let result = self.hub.lock().unwrap().set_local(key, &value);
+        if let Err(reject) = result {
+            self.log(&format!("⚠️ {}\n", reject.message));
+            self.refresh_controls();
+        }
+        if let Some(error) = self.hub.lock().unwrap().take_save_error() {
+            self.log(&format!("⚠️ {error}\n"));
+        }
+        if key == "ui.language" {
+            let lang = self.hub.lock().unwrap().get_string("ui.language");
+            *self.i18n.borrow_mut() = I18n::new(&lang);
+            // Rebuild after this handler returns: the control that fired it is destroyed by the rebuild.
+            let app = self.clone();
+            glib::idle_add_local_once(move || app.rebuild());
+        }
+    }
+
+    fn render_status(&self) {
+        let i18n = self.i18n.borrow();
+        let text = match &*self.status.borrow() {
+            Status::Stopped => i18n.tr("status-stopped"),
+            Status::Preparing => format!("🟡 {}", i18n.tr("status-preparing")),
+            Status::WaitingApp => format!("🟡 {}", i18n.tr("status-waiting-app")),
+            Status::OpeningCamera => format!("🟡 {}", i18n.tr("status-opening-camera")),
+            Status::Connected => format!("🟢 {}", i18n.tr("status-connected")),
+            Status::Reconnecting => format!("🟠 {}", i18n.tr("status-reconnecting")),
+            Status::Streaming {
+                fps,
+                mbps,
+                rtt_ms,
+                target_mbps,
+            } => {
+                let mut text = format!(
+                    "🟢 {}",
+                    i18n.tr_args(
+                        "status-streaming",
+                        &[
+                            ("fps", (*fps as i64).into()),
+                            ("mbps", format!("{mbps:.1}").into())
+                        ]
+                    )
+                );
+                if let Some(ms) = rtt_ms {
+                    text.push_str(&format!(
+                        " · {}",
+                        i18n.tr_args("status-rtt", &[("ms", (*ms as i64).into())])
+                    ));
+                }
+                if let Some(target) = target_mbps {
+                    text.push_str(&format!(
+                        " · {}",
+                        i18n.tr_args("status-target", &[("mbps", format!("{target:.1}").into())])
+                    ));
+                }
+                text
+            }
+        };
+        let dot = if matches!(*self.status.borrow(), Status::Stopped) {
+            "⚪ "
+        } else {
+            ""
+        };
+        self.status_label.borrow().set_markup(&format!(
+            "<b>{}: {dot}{}</b>",
+            i18n.tr("status-label"),
+            glib::markup_escape_text(&text)
+        ));
+    }
+
+    fn handle_event(self: &Rc<Self>, event: UiEvent) {
+        match event {
+            UiEvent::Log(text) => self.log(&text),
+            UiEvent::Status(status) => {
+                *self.status.borrow_mut() = status;
+                self.render_status();
+            }
+            UiEvent::Problem(problem) => match fix_message(problem.code) {
+                Some(id) => {
+                    self.fix_btn.borrow().set_label(&self.tr(id));
+                    self.fix_btn.borrow().set_visible(true);
+                    *self.fix_slot.borrow_mut() = Some(problem.code);
+                }
+                None => self.fix_btn.borrow().set_visible(false),
+            },
+            UiEvent::Running(running) => {
+                if running {
+                    self.fix_btn.borrow().set_visible(false); // جلسة جديدة: المشكلة السابقة لم تعد قائمة
                 } else {
-                    enki_receiver::Facing::Back
-                };
-                let _ = ctl.send(enki_receiver::Control::SetFacing(facing));
+                    self.stop_slot.borrow_mut().take();
+                    self.control_slot.borrow_mut().take();
+                    *self.status.borrow_mut() = Status::Stopped;
+                }
+                self.start_btn.borrow().set_sensitive(!running);
+                if running && matches!(*self.status.borrow(), Status::Stopped) {
+                    *self.status.borrow_mut() = Status::Preparing;
+                }
+                self.render_status();
             }
-        });
+            UiEvent::Refresh => self.refresh_controls(),
+            UiEvent::RolledBack { key, message } => {
+                self.refresh_controls();
+                let setting = self.tr(&setting_id(&key));
+                let text = self.i18n.borrow().tr_args(
+                    "log-setting-rolled-back",
+                    &[
+                        ("setting", setting.as_str().into()),
+                        ("message", message.as_str().into()),
+                    ],
+                );
+                self.log(&format!("⚠️ {text}\n"));
+            }
+        }
+        if let Some(error) = self.hub.lock().unwrap().take_save_error() {
+            self.log(&format!("⚠️ {error}\n"));
+        }
     }
 
-    // تشغيل/إيقاف التدوير التلقائي أثناء البث
-    {
-        let control = control_slot.clone();
-        auto_rotate_check.connect_toggled(move |check| {
-            if let Some(ctl) = control.borrow().as_ref() {
-                let _ = ctl.send(enki_receiver::Control::SetAutoRotate(check.is_active()));
-            }
-        });
+    fn output_device(&self) -> String {
+        self.hub.lock().unwrap().get_string("output.device")
     }
 
-    // 3. إيقاف البث (فقط الجلسة التي شغلها التطبيق، بدون pkill)
-    {
-        let tx = tx.clone();
-        let slot = stop_slot.clone();
-        stop_btn.connect_clicked(move |_| match slot.borrow_mut().take() {
-            Some(stop_tx) => {
-                let _ = stop_tx.send(());
+    fn load_module_from_settings(&self) {
+        let device = self.output_device();
+        match parse_video_nr(&device) {
+            Some(nr) => {
+                self.rt.spawn(load_module(nr, self.tx.clone()));
             }
-            None => log(&tx, "لا يوجد بث نشط حالياً.\n".to_string()),
-        });
+            None => self.invalid_device(&device),
+        }
     }
 
-    window.present();
+    fn invalid_device(&self, device: &str) {
+        let text = self
+            .i18n
+            .borrow()
+            .tr_args("log-invalid-device", &[("device", device.into())]);
+        self.log(&format!("❌ {text}\n"));
+    }
+
+    /// 2. بدء البث
+    fn start(self: &Rc<Self>) {
+        if self.stop_slot.borrow().is_some() {
+            return; // يوجد بث شغال أصلاً
+        }
+        let (source, facing, device) = {
+            let hub = self.hub.lock().unwrap();
+            (
+                hub.get_string("source.mode"),
+                hub.get_string("camera.facing"),
+                hub.get_string("output.device"),
+            )
+        };
+        let tx = self.tx.clone();
+        if source != "screen_window" && parse_video_nr(&device).is_none() {
+            self.invalid_device(&device);
+            return;
+        }
+        if source == "enki_camera" {
+            // كاميرا تطبيق Enki: يستقبلها enki-receiver ويمررها إلى V4L2 (تعمل من أندرويد 7).
+            // كل الإعدادات (الكاميرا، التدوير، المرآة) تُقرأ من الإعدادات المشتركة نفسها.
+            let mut cfg = enki_receiver::Config::new(device.clone());
+            cfg.facing = if facing == "front" {
+                enki_receiver::Facing::Front
+            } else {
+                enki_receiver::Facing::Back
+            };
+            cfg.settings = self.hub.clone();
+            let text = self.i18n.borrow().tr_args(
+                "log-starting-enki",
+                &[
+                    ("facing", facing.as_str().into()),
+                    ("device", device.as_str().into()),
+                ],
+            );
+            self.log(&format!("> {text}\n"));
+            let (stop_tx, stop_rx) = oneshot::channel();
+            *self.stop_slot.borrow_mut() = Some(stop_tx);
+            let _ = tx.send(UiEvent::Running(true));
+            let (ev_tx, mut ev_rx) = mpsc::unbounded_channel();
+            let (ctl_tx, ctl_rx) = mpsc::unbounded_channel();
+            *self.control_slot.borrow_mut() = Some(ctl_tx);
+            self.rt.spawn(enki_receiver::run_with_commands(
+                cfg, ev_tx, stop_rx, ctl_rx,
+            ));
+            self.rt.spawn(async move {
+                use enki_receiver::{Event, LinkState, State};
+                while let Some(event) = ev_rx.recv().await {
+                    let ui_event = match event {
+                        Event::Log(text) => Some(UiEvent::Log(text)),
+                        Event::Link(LinkState::Preparing) => {
+                            Some(UiEvent::Status(Status::Preparing))
+                        }
+                        Event::Link(LinkState::WaitingForApp) => {
+                            Some(UiEvent::Status(Status::WaitingApp))
+                        }
+                        Event::Link(LinkState::Ready) => {
+                            Some(UiEvent::Status(Status::OpeningCamera))
+                        }
+                        Event::Link(LinkState::Streaming) => {
+                            Some(UiEvent::Status(Status::Connected))
+                        }
+                        Event::Link(LinkState::Reconnecting(_)) => {
+                            Some(UiEvent::Status(Status::Reconnecting))
+                        }
+                        Event::State(State::Stopped) => Some(UiEvent::Running(false)),
+                        Event::State(_) | Event::Capabilities(_) => None,
+                        Event::Problem(problem) => Some(UiEvent::Problem(problem)),
+                        Event::Setting { .. } => Some(UiEvent::Refresh),
+                        Event::SettingRolledBack { key, message, .. } => {
+                            Some(UiEvent::RolledBack { key, message })
+                        }
+                        Event::Stats(s) => Some(UiEvent::Status(Status::Streaming {
+                            fps: s.fps,
+                            mbps: s.kbps as f64 / 1000.0,
+                            rtt_ms: s.rtt_ms,
+                            target_mbps: s.bitrate_kbps.map(|k| k as f64 / 1000.0),
+                        })),
+                    };
+                    if let Some(ui_event) = ui_event {
+                        let _ = tx.send(ui_event);
+                    }
+                }
+            });
+            return;
+        }
+
+        let size = match self.resolution.borrow().selected() {
+            1 => "1280x720",
+            2 => "3840x2160",
+            _ => "1920x1080",
+        };
+        let mut args: Vec<String>;
+        let what;
+        if source == "scrcpy_camera" {
+            args = vec![
+                "--video-source=camera".to_string(),
+                format!("--camera-facing={facing}"),
+                format!("--camera-size={size}"),
+                format!("--v4l2-sink={device}"),
+                // لا نافذة معاينة (يُبقي الصوت شغال إذا فُعّل)
+                "--no-video-playback".to_string(),
+            ];
+            what = format!("camera: {facing}, {size}, {device}");
+        } else {
+            // الشاشة: --max-size هو أكبر بُعد للصورة
+            let max = size.split('x').next().unwrap_or("1920");
+            args = vec![format!("--max-size={max}")];
+            if source == "screen_v4l2" {
+                args.push(format!("--v4l2-sink={device}"));
+                args.push("--no-video-playback".to_string());
+                what = format!("screen → {device}, max {max}");
+            } else {
+                what = format!("screen → window, max {max}");
+            }
+        }
+        if self.audio.borrow().is_active() {
+            args.push("--audio-source=mic".to_string());
+        } else {
+            args.push("--no-audio".to_string());
+        }
+        self.log(&format!("> scrcpy ({what})...\n"));
+        let (stop_tx, stop_rx) = oneshot::channel();
+        *self.stop_slot.borrow_mut() = Some(stop_tx);
+        let _ = tx.send(UiEvent::Running(true));
+        self.rt.spawn(run_scrcpy(args, stop_rx, tx));
+    }
 }
 
 /// تحميل وحدة النواة عبر pkexec (نافذة مصادقة رسومية؛ sudo لا يعمل بدون طرفية).
@@ -503,7 +796,10 @@ async fn load_module(nr: u32, tx: EventTx) {
                 Some(126) | Some(127) => " (أُلغيت المصادقة أو رُفضت)",
                 _ => "",
             };
-            log(&tx, format!("❌ فشل تفعيل الدرايفر{hint}: {}\n", stderr.trim()));
+            log(
+                &tx,
+                format!("❌ فشل تفعيل الدرايفر{hint}: {}\n", stderr.trim()),
+            );
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => log(
             &tx,
@@ -537,6 +833,7 @@ async fn run_scrcpy(args: Vec<String>, mut stop_rx: oneshot::Receiver<()>, tx: E
             return;
         }
     };
+    let _ = tx.send(UiEvent::Status(Status::Connected));
 
     let out_task = child
         .stdout
@@ -585,18 +882,55 @@ fn parse_video_nr(device: &str) -> Option<u32> {
 }
 
 fn row_label(text: &str) -> Label {
-    Label::builder().label(text).xalign(0.0).width_request(140).build()
-}
-
-fn set_status(label: &Label, running: bool) {
-    label.set_markup(if running {
-        "<b>الحالة: 🟢 متصل</b>"
-    } else {
-        "<b>الحالة: ⚪ متوقف</b>"
-    });
+    Label::builder()
+        .label(text)
+        .xalign(0.0)
+        .width_request(160)
+        .build()
 }
 
 fn append_log(buffer: &TextBuffer, text: &str) {
     let mut end = buffer.end_iter();
     buffer.insert(&mut end, text);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn message_ids_follow_the_documented_rule() {
+        assert_eq!(setting_id("camera.facing"), "setting-camera-facing");
+        assert_eq!(setting_id("video.auto_rotate"), "setting-video-auto-rotate");
+        assert_eq!(
+            choice_id("source.mode", "enki_camera"),
+            "setting-source-mode--enki-camera"
+        );
+        assert_eq!(choice_id("video.rotate", "90"), "setting-video-rotate--90");
+    }
+
+    /// Every setting the window shows has its texts: the same rule as tools/check_i18n.py, checked from Rust too.
+    #[test]
+    fn every_desktop_setting_and_choice_has_a_translation() {
+        let schema = enki_receiver::enki_settings::Schema::builtin();
+        for lang in ["en", "ar", "zh"] {
+            let i18n = I18n::new(lang);
+            for def in schema.settings.iter().filter(|d| d.on_desktop()) {
+                assert_ne!(
+                    i18n.tr(&setting_id(&def.key)),
+                    setting_id(&def.key),
+                    "{lang}: label of {}",
+                    def.key
+                );
+                if let Kind::Enum(values) = &def.kind {
+                    for v in values {
+                        let id = choice_id(&def.key, v);
+                        assert_ne!(i18n.tr(&id), id, "{lang}: {id}");
+                    }
+                }
+                let heading = format!("group-{}", def.group);
+                assert_ne!(i18n.tr(&heading), heading, "{lang}: {heading}");
+            }
+        }
+    }
 }

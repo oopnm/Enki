@@ -27,8 +27,44 @@ data class Capabilities(val cameras: List<CameraCaps>, /** "h264", "hevc". */ va
  * protocol/vectors/control.txt). Incoming messages are parsed by the app with org.json.
  */
 object ControlMessages {
-    fun hello(appVersion: String, device: String, androidSdk: Int): String =
-        """{"type":"hello","version":${Link.VERSION},"app":"enki-android","app_version":${quote(appVersion)},"device":${quote(device)},"android":$androidSdk}"""
+    /** `deviceId` and `features` are left out when empty, like an app from before settings sync. */
+    fun hello(
+        appVersion: String,
+        device: String,
+        androidSdk: Int,
+        deviceId: String = "",
+        features: List<String> = emptyList(),
+    ): String = buildString {
+        append("""{"type":"hello","version":${Link.VERSION},"app":"enki-android","app_version":${quote(appVersion)},""")
+        append(""""device":${quote(device)},"android":$androidSdk""")
+        if (deviceId.isNotEmpty()) append(""","device_id":${quote(deviceId)},"features":${strings(features)}""")
+        append('}')
+    }
+
+    private fun hlc(h: Hlc) = "[${h.wall},${h.counter}]"
+
+    private fun value(v: Any): String = when (v) {
+        is Boolean -> v.toString()
+        is Float -> number(v)
+        is Double -> if (v.isFinite()) v.toString() else "0.0"
+        is Number -> v.toLong().toString()
+        else -> quote(v.toString())
+    }
+
+    private fun entry(e: SettingEntry) =
+        """{"key":${quote(e.key)},"value":${value(e.value)},"hlc":${hlc(e.hlc)},"device":${quote(e.device)}}"""
+
+    /** One setting changed on the phone. */
+    fun setting(e: SettingEntry): String = """{"type":"setting","key":${quote(e.key)},"value":${value(e.value)},"hlc":${hlc(e.hlc)},"device":${quote(e.device)}}"""
+
+    fun settingsSnapshot(reply: Boolean, entries: List<SettingEntry>): String =
+        """{"type":"settings_snapshot","schema":${SettingsSchema.VERSION},"reply":$reply,"settings":${entries.joinToString(",", "[", "]") { entry(it) }}}"""
+
+    fun settingAck(key: String, hlc: Hlc, device: String): String =
+        """{"type":"setting_ack","key":${quote(key)},"hlc":${hlc(hlc)},"device":${quote(device)}}"""
+
+    fun settingReject(key: String, hlc: Hlc, device: String, code: String, message: String): String =
+        """{"type":"setting_reject","key":${quote(key)},"hlc":${hlc(hlc)},"device":${quote(device)},"code":${quote(code)},"message":${quote(message)}}"""
 
     fun pong(seq: Long): String = """{"type":"pong","seq":$seq}"""
 

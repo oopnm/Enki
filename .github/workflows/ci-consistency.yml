@@ -1,0 +1,19 @@
+name: CI Consistency
+
+# The apps must stay in step: generated files match their source, and every language has every text.
+on:
+  push:
+    branches: [main]
+    paths: ['protocol/**', 'tools/**', 'desktop/i18n/**', 'android/**/res/**', 'android/protocol/**', '.github/workflows/ci-consistency.yml']
+  pull_request:
+    paths: ['protocol/**', 'tools/**', 'desktop/i18n/**', 'android/**/res/**', 'android/protocol/**', '.github/workflows/ci-consistency.yml']
+  workflow_dispatch:
+
+jobs:
+  consistency:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 tools/gen_settings.py --check
+      - run: python3 tools/gen_tokens.py --check
+      - run: python3 tools/check_i18n.py

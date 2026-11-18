@@ -15,11 +15,37 @@ class ControlMessagesTest {
 
     @Test
     fun simpleMessagesMatchTheSharedVectors() {
-        assertEquals(vector("hello"), ControlMessages.hello("0.2.0", "Pixel 6", 28))
+        assertEquals(
+            vector("hello"),
+            ControlMessages.hello("0.2.0", "Pixel 6", 28, "0123456789abcdef0123456789abcdef", listOf("settings")),
+        )
+        assertEquals(vector("hello_legacy"), ControlMessages.hello("0.2.0", "Pixel 6", 28))
         assertEquals(vector("pong"), ControlMessages.pong(7))
         assertEquals(vector("state_rotation"), ControlMessages.stateInt("image.rotation", 180))
         assertEquals(vector("state_bitrate"), ControlMessages.stateInt("stream.bitrate", 3000))
         assertEquals(vector("error"), ControlMessages.error("bad_value", "camera.facing must be \"front\" or \"back\""))
+    }
+
+    private val phoneId = "0123456789abcdef0123456789abcdef"
+    private val pcId = "fedcba9876543210fedcba9876543210"
+
+    @Test
+    fun settingsMessagesMatchTheSharedVectors() {
+        val snapshot = listOf(
+            SettingEntry("camera.facing", "front", Hlc(1_700_000_000_000, 2), phoneId),
+            SettingEntry("video.auto_rotate", true, Hlc(1_700_000_000_500, 0), phoneId),
+        )
+        assertEquals(vector("settings_snapshot"), ControlMessages.settingsSnapshot(false, snapshot))
+        val reply = listOf(SettingEntry("video.rotate", "90", Hlc(1_700_000_001_000, 0), pcId))
+        assertEquals(vector("settings_snapshot_reply"), ControlMessages.settingsSnapshot(true, reply))
+        assertEquals(vector("setting"), ControlMessages.setting(reply[0]))
+        assertEquals(vector("setting_ack"), ControlMessages.settingAck("video.rotate", Hlc(1_700_000_001_000, 0), pcId))
+        assertEquals(
+            vector("setting_reject"),
+            ControlMessages.settingReject(
+                "camera.facing", Hlc(1_700_000_002_000, 1), pcId, "unsupported", "this phone has no front camera",
+            ),
+        )
     }
 
     @Test

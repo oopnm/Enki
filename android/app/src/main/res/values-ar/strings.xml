@@ -1,0 +1,30 @@
+<resources>
+    <string name="app_name">Enki</string>
+    <string name="start">تشغيل</string>
+    <string name="stop">إيقاف</string>
+    <string name="camera_permission_needed">يلزم إذن الكاميرا للبث</string>
+    <string name="hint_connect">وصّل الهاتف بكابل USB وافتح Enki على الحاسوب. الحاسوب يجهّز الاتصال بنفسه (adb forward tcp:%1$d).</string>
+
+    <string name="group_video">الفيديو</string>
+    <string name="group_app">التطبيق</string>
+
+    <string name="setting_camera_facing">الكاميرا</string>
+    <string name="setting_camera_facing__back">الخلفية</string>
+    <string name="setting_camera_facing__front">الأمامية</string>
+    <string name="setting_video_auto_rotate">التدوير مع الهاتف</string>
+    <string name="setting_video_rotate">التدوير</string>
+    <string name="setting_video_rotate__auto">تلقائي</string>
+    <string name="setting_video_rotate__0">0°</string>
+    <string name="setting_video_rotate__90">90°</string>
+    <string name="setting_video_rotate__180">180°</string>
+    <string name="setting_video_rotate__270">270°</string>
+    <string name="setting_video_mirror">المرآة</string>
+    <string name="setting_video_mirror__auto">تلقائي</string>
+    <string name="setting_video_mirror__on">مفعّلة</string>
+    <string name="setting_video_mirror__off">متوقفة</string>
+    <string name="setting_ui_language">اللغة</string>
+    <string name="setting_ui_language__system">مثل الهاتف</string>
+    <string name="setting_ui_language__en">English</string>
+    <string name="setting_ui_language__ar">العربية</string>
+    <string name="setting_ui_language__zh">中文</string>
+</resources>

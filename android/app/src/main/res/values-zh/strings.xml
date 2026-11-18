@@ -1,0 +1,30 @@
+<resources>
+    <string name="app_name">Enki</string>
+    <string name="start">开始</string>
+    <string name="stop">停止</string>
+    <string name="camera_permission_needed">需要相机权限才能传输</string>
+    <string name="hint_connect">用 USB 连接手机，并在电脑上打开 Enki。电脑会自动建立连接（adb forward tcp:%1$d）。</string>
+
+    <string name="group_video">视频</string>
+    <string name="group_app">应用</string>
+
+    <string name="setting_camera_facing">摄像头</string>
+    <string name="setting_camera_facing__back">后置</string>
+    <string name="setting_camera_facing__front">前置</string>
+    <string name="setting_video_auto_rotate">随手机旋转</string>
+    <string name="setting_video_rotate">旋转</string>
+    <string name="setting_video_rotate__auto">自动</string>
+    <string name="setting_video_rotate__0">0°</string>
+    <string name="setting_video_rotate__90">90°</string>
+    <string name="setting_video_rotate__180">180°</string>
+    <string name="setting_video_rotate__270">270°</string>
+    <string name="setting_video_mirror">镜像</string>
+    <string name="setting_video_mirror__auto">自动</string>
+    <string name="setting_video_mirror__on">开</string>
+    <string name="setting_video_mirror__off">关</string>
+    <string name="setting_ui_language">语言</string>
+    <string name="setting_ui_language__system">跟随手机</string>
+    <string name="setting_ui_language__en">English</string>
+    <string name="setting_ui_language__ar">العربية</string>
+    <string name="setting_ui_language__zh">中文</string>
+</resources>
