@@ -1,3 +1,30 @@
 <resources>
     <string name="app_name">Enki</string>
+    <string name="start">Start</string>
+    <string name="stop">Stop</string>
+    <string name="camera_permission_needed">Camera permission is needed to stream</string>
+    <string name="hint_connect">Connect the phone by USB and open Enki on the computer. The computer sets up the link by itself (adb forward tcp:%1$d).</string>
+
+    <string name="group_video">Video</string>
+    <string name="group_app">App</string>
+
+    <string name="setting_camera_facing">Camera</string>
+    <string name="setting_camera_facing__back">Back</string>
+    <string name="setting_camera_facing__front">Front</string>
+    <string name="setting_video_auto_rotate">Rotate with the phone</string>
+    <string name="setting_video_rotate">Rotation</string>
+    <string name="setting_video_rotate__auto">Automatic</string>
+    <string name="setting_video_rotate__0">0°</string>
+    <string name="setting_video_rotate__90">90°</string>
+    <string name="setting_video_rotate__180">180°</string>
+    <string name="setting_video_rotate__270">270°</string>
+    <string name="setting_video_mirror">Mirror</string>
+    <string name="setting_video_mirror__auto">Automatic</string>
+    <string name="setting_video_mirror__on">On</string>
+    <string name="setting_video_mirror__off">Off</string>
+    <string name="setting_ui_language">Language</string>
+    <string name="setting_ui_language__system">Same as the phone</string>
+    <string name="setting_ui_language__en">English</string>
+    <string name="setting_ui_language__ar">العربية</string>
+    <string name="setting_ui_language__zh">中文</string>
 </resources>

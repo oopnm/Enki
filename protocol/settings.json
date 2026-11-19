@@ -1,0 +1,100 @@
+{
+  "schema_version": 1,
+  "groups": [
+    "video",
+    "app"
+  ],
+  "settings": [
+    {
+      "key": "camera.facing",
+      "group": "video",
+      "type": "enum",
+      "values": [
+        "back",
+        "front"
+      ],
+      "default": "back",
+      "scope": "synced",
+      "apply": "live"
+    },
+    {
+      "key": "video.auto_rotate",
+      "group": "video",
+      "type": "bool",
+      "default": false,
+      "scope": "synced",
+      "apply": "live"
+    },
+    {
+      "key": "video.rotate",
+      "group": "video",
+      "type": "enum",
+      "values": [
+        "auto",
+        "0",
+        "90",
+        "180",
+        "270"
+      ],
+      "default": "auto",
+      "scope": "synced",
+      "apply": "live"
+    },
+    {
+      "key": "video.mirror",
+      "group": "video",
+      "type": "enum",
+      "values": [
+        "auto",
+        "on",
+        "off"
+      ],
+      "default": "auto",
+      "scope": "synced",
+      "apply": "live"
+    },
+    {
+      "key": "ui.language",
+      "group": "app",
+      "type": "enum",
+      "values": [
+        "system",
+        "en",
+        "ar",
+        "zh"
+      ],
+      "default": "system",
+      "scope": "local",
+      "apply": "passive"
+    },
+    {
+      "key": "source.mode",
+      "group": "app",
+      "type": "enum",
+      "values": [
+        "enki_camera",
+        "scrcpy_camera",
+        "screen_window",
+        "screen_v4l2"
+      ],
+      "default": "enki_camera",
+      "scope": "local",
+      "apply": "passive",
+      "apps": [
+        "desktop"
+      ]
+    },
+    {
+      "key": "output.device",
+      "group": "app",
+      "type": "string",
+      "max_len": 64,
+      "default": "/dev/video10",
+      "scope": "local",
+      "apply": "passive",
+      "apps": [
+        "desktop"
+      ]
+    }
+  ]
+}

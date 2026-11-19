@@ -1,0 +1,16 @@
+[package]
+name = "enki-settings"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Enki settings: the shared schema, validation, two-way sync engine (hybrid logical clock, per-key versions) and TOML storage"
+
+[dependencies]
+enki-protocol = { path = "../enki-protocol" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+[dev-dependencies]
+tempfile = "3"

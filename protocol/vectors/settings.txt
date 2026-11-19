@@ -1,0 +1,21 @@
+# Settings sync decisions (shared by the Rust and Kotlin tests).
+# name|current entry|incoming entry|expected outcome
+# entry: key=value@wall.counter#device  ("-" = nothing stored). Values: "text", true/false, numbers.
+# The engine under test has device id "x" and a clock fixed at 1000000, and `current` is loaded as saved state.
+# expected: changed | unchanged | stale | reject:<code>
+newer_write_wins|camera.facing="back"@1000001.0#pc-1|camera.facing="front"@1000002.0#phone-1|changed
+older_write_is_stale|camera.facing="front"@1000002.0#phone-1|camera.facing="back"@1000001.0#pc-1|stale
+same_wall_higher_counter_wins|video.rotate="90"@1000001.0#pc-1|video.rotate="270"@1000001.1#pc-1|changed
+tie_goes_to_the_higher_device_id|video.rotate="90"@1000001.0#pc-1|video.rotate="270"@1000001.0#phone-1|changed
+tie_goes_to_the_higher_device_id_reverse|video.rotate="270"@1000001.0#phone-1|video.rotate="90"@1000001.0#pc-1|stale
+duplicate_message|video.mirror="on"@1000001.0#pc-1|video.mirror="on"@1000001.0#pc-1|unchanged
+newer_stamp_same_value|camera.facing="front"@1000001.0#pc-1|camera.facing="front"@1000002.0#phone-1|unchanged
+first_write|-|video.mirror="on"@1000001.0#pc-1|changed
+first_write_equal_to_default|-|camera.facing="back"@1000001.0#pc-1|unchanged
+bool_value|-|video.auto_rotate=true@1000001.0#pc-1|changed
+bad_enum_value|-|video.rotate="45"@1000001.0#pc-1|reject:bad_value
+wrong_type|-|video.auto_rotate="yes"@1000001.0#pc-1|reject:bad_value
+number_for_text|-|video.mirror=1@1000001.0#pc-1|reject:bad_value
+unknown_key|-|audio.gain=3@1000001.0#pc-1|reject:unknown_key
+local_setting_is_not_accepted|-|ui.language="ar"@1000001.0#pc-1|reject:local_only
+clock_far_in_the_future|-|video.mirror="on"@99999999999999.0#phone-1|reject:clock_skew

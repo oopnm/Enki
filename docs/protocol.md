@@ -81,12 +81,16 @@ After the preamble: a sequence of messages, each a `u32` length followed by that
 
 | Type | Direction | Purpose |
 |---|---|---|
-| `hello` | phone → PC | First message: `{"type":"hello","version":1,"app":"enki-android","app_version":"0.2.0","device":"Pixel 6","android":28}` |
+| `hello` | phone → PC | First message: `{"type":"hello","version":1,"app":"enki-android","app_version":"0.2.0","device":"Pixel 6","android":28,"device_id":"<32 hex>","features":["settings"]}`. `device_id` (random, stable) and `features` are absent from apps older than settings sync |
 | `capabilities` | phone → PC | Sent right after `hello`: what each camera can do (below) |
 | `ping` / `pong` | PC → phone / phone → PC | Heartbeat, `{"type":"ping","seq":7}` answered by `{"type":"pong","seq":7}` |
 | `set` | PC → phone | Change one setting live: `{"type":"set","key":"camera.facing","value":"front"}` |
 | `state` | phone → PC | A setting's current value: `{"type":"state","key":"image.rotation","value":180}` |
 | `error` | phone → PC | `{"type":"error","code":"bad_value","message":"..."}` |
+| `settings_snapshot` | both | Connect-time exchange of the synced settings each side has explicitly set (see "Settings sync") |
+| `setting` | both | One synced setting changed: `{"type":"setting","key":"video.rotate","value":"90","hlc":[1700000001000,0],"device":"<id>"}` |
+| `setting_ack` | both | The change with this `key`/`hlc`/`device` was applied |
+| `setting_reject` | both | It was refused: `code` is `unknown_key`, `bad_value`, `local_only`, `unsupported`, `apply_failed` or `clock_skew`, plus a `message` |
 
 The exact JSON of each message is in `protocol/vectors/control.txt`; the Rust and the Android tests both check it.
 
@@ -130,6 +134,33 @@ The PC opens the control connection first, reads `hello` (and `capabilities`), s
 for the `state` reply, and only then opens the media connection.
 
 Unknown message types and unknown keys are ignored, so newer peers can talk to older ones.
+
+## Settings sync
+
+The settings are described once, in `protocol/settings.json` (key, type, range, default, `scope` synced or local, and
+which apps show it). The desktop reads that file at build time; `tools/gen_settings.py` turns it into Kotlin, and CI
+fails if the generated file is stale or a setting lacks a translation (`tools/check_i18n.py`). Only `synced` settings
+travel; `local` ones (language, V4L2 device, source) never do, and a `setting` for one is refused with `local_only`.
+
+**Stamp.** Every write carries `hlc` = `[wall_ms, counter]`, a hybrid logical clock, and the `device` id of the writer.
+The newest `(hlc, device)` wins; equal clocks are decided by the device id, so both sides pick the same winner without
+talking. A clock keeps moving forward past every stamp it has seen, so a wrong system clock never loses a newer edit.
+A stamp more than 24 h ahead is refused with `clock_skew`.
+
+**Connect.** When `hello.features` contains `"settings"`: the PC switches to that phone's profile (`device_id`), the
+phone sends its capabilities and a `settings_snapshot` (`reply:false`) of what it has set, the PC merges it and answers
+with a `settings_snapshot` (`reply:true`) holding only what it has newer or the phone lacks. The phone applies it and
+never answers. If that includes `camera.facing`, the phone confirms with `image.rotation` then `state camera.facing`
+(as with `set`), which the PC waits for (up to 1 s) before opening the media connection. Against a phone without the
+feature the PC still sends the old `set camera.facing`.
+
+**Changes.** A change is sent once as `setting`. The receiver answers `setting_ack` when it applied it, replies with its
+own newer `setting` when the change was stale, or `setting_reject`; a duplicate is acknowledged again and changes
+nothing. A change received from the other side is never sent back. A rejected change is rolled back to the last value
+both sides agreed on, so the screen always shows the truth.
+
+Vectors: `protocol/vectors/control.txt` (messages, byte for byte) and `protocol/vectors/settings.txt` (decisions);
+both the Rust and the Android tests run them.
 
 ## Compatibility
 

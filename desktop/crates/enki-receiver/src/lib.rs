@@ -7,10 +7,10 @@
 //!
 //! Everything is reported through [`Event`]s, so any UI (GTK today) can show the state.
 
-use enki_protocol::control::Message;
+use enki_protocol::control::{Message, SettingEntry, Value, FEATURE_SETTINGS};
 use enki_protocol::{
-    auth_mac, to_hex, AuthStatus, Channel, FrameHeader, Kind, Preamble, FLAG_DISCONTINUITY, FRAME_HEADER_LEN, MAC_LEN,
-    NONCE_LEN, PREAMBLE_LEN, TOKEN_LEN,
+    auth_mac, to_hex, AuthStatus, Channel, FrameHeader, Kind, Preamble, FLAG_DISCONTINUITY,
+    FRAME_HEADER_LEN, MAC_LEN, NONCE_LEN, PREAMBLE_LEN, TOKEN_LEN,
 };
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -22,13 +22,18 @@ use tokio::net::TcpStream;
 use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot, Notify};
 
+use enki_settings::{Applied, Hub, Reject, RejectCode, SettingsHandle};
+
 pub use enki_protocol::control::Capabilities;
+pub use enki_settings;
 
 pub const DEFAULT_PORT: u16 = 28200;
 const RETRY_DELAY: Duration = Duration::from_millis(1500);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3);
 /// How long to wait for the phone to confirm a setting before streaming anyway (older apps never confirm).
 const ACK_TIMEOUT: Duration = Duration::from_secs(1);
+/// How long to wait for a phone that announced settings sync to send its snapshot.
+const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(2);
 /// How often the PC pings the phone, and how long without any message from the phone counts as a lost link.
 const PING_INTERVAL: Duration = Duration::from_secs(1);
 const LINK_TIMEOUT: Duration = Duration::from_secs(3);
@@ -48,22 +53,17 @@ impl Facing {
             Facing::Front => "front",
         }
     }
-
-    fn label(self) -> &'static str {
-        match self {
-            Facing::Back => "الخلفية",
-            Facing::Front => "الأمامية",
-        }
-    }
 }
 
 /// Requests a UI can send to a running session.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Control {
-    /// Switch the phone camera, also while streaming.
+    /// Switch the phone camera, also while streaming (same as setting `camera.facing`).
     SetFacing(Facing),
-    /// Turn the sensor-driven rotation on or off.
+    /// Turn the sensor-driven rotation on or off (same as setting `video.auto_rotate`).
     SetAutoRotate(bool),
+    /// Change any synced or local setting by its schema key. The change is stored, applied and sent to the phone.
+    Set(String, Value),
 }
 
 /// Settings that can change while streaming. The decoder is restarted when they change the picture orientation.
@@ -71,6 +71,10 @@ pub enum Control {
 struct Live {
     facing: Facing,
     auto_rotate: bool,
+    /// Fixed rotation chosen by the user (`None` = the default for the active camera).
+    rotate: Option<u16>,
+    /// Mirror chosen by the user (`None` = the default for the active camera).
+    mirror: Option<bool>,
     /// Clockwise rotation the phone asked for (from its orientation sensor), if it reported one.
     phone_rotation: Option<u16>,
 }
@@ -82,15 +86,19 @@ pub struct Config {
     pub port: u16,
     /// Frame rate the decoder assumes (the stream carries no reliable rate in the H.264 headers).
     pub fps: u32,
-    /// Which phone camera to use at the start (can be changed live with [`Control::SetFacing`]).
+    /// Which phone camera to use at the start (can be changed live with [`Control::SetFacing`]). When it differs
+    /// from the stored `camera.facing` it counts as the user's choice now and replaces it.
     pub facing: Facing,
-    /// Rotate the picture clockwise (0, 90, 180, 270). `None` = the default for the active camera.
+    /// Rotate the picture clockwise (0, 90, 180, 270). `None` = leave the stored `video.rotate` as it is.
     pub rotate: Option<u16>,
-    /// Mirror the picture horizontally. `None` = the default for the active camera.
+    /// Mirror the picture horizontally. `None` = leave the stored `video.mirror` as it is.
     pub mirror: Option<bool>,
     /// Follow the phone's orientation sensor: the phone says how the picture must be rotated to be upright
-    /// and that overrides `rotate`. Can be switched live with [`Control::SetAutoRotate`].
+    /// and that overrides `rotate`. Replaces the stored `video.auto_rotate` only when true.
     pub auto_rotate: bool,
+    /// The settings this session reads and writes: shared with the window, so a change made in either place shows
+    /// in the other. A fresh in-memory set for every [`Config`] unless the window gives its own.
+    pub settings: SettingsHandle,
     /// Secret for this session: given to the phone through adb and proven on every connection, so another
     /// app on the phone cannot read the camera. A fresh random value for every [`Config`].
     pub token: [u8; TOKEN_LEN],
@@ -112,6 +120,7 @@ impl Config {
             rotate: None,
             mirror: None,
             auto_rotate: false,
+            settings: Hub::in_memory(enki_settings::random_device_id()).handle(),
             token: random_token(),
             adb: "adb".into(),
             ffmpeg: "ffmpeg".into(),
@@ -192,7 +201,10 @@ pub struct Problem {
 
 impl Problem {
     fn new(code: ProblemCode, message: impl Into<String>) -> Self {
-        Problem { code, message: message.into() }
+        Problem {
+            code,
+            message: message.into(),
+        }
     }
 }
 
@@ -210,6 +222,18 @@ pub enum Event {
     Link(LinkState),
     /// What the phone's cameras can do (sent once per connection).
     Capabilities(Capabilities),
+    /// A setting now has this value because the phone (or the exchange at connect time) changed it: refresh the control.
+    Setting {
+        key: String,
+        value: Value,
+    },
+    /// The phone refused a change made here; the setting went back to `value`. Show `message` once.
+    SettingRolledBack {
+        key: String,
+        value: Value,
+        code: String,
+        message: String,
+    },
     /// The session ended because of this; also logged.
     Problem(Problem),
 }
@@ -223,6 +247,9 @@ fn log(tx: &Tx, text: impl Into<String>) {
 /// State shared between the session loop and the command task.
 struct Shared {
     live: tokio::sync::watch::Sender<Live>,
+    hub: SettingsHandle,
+    /// The phone on this connection announced settings sync in its `hello`.
+    peer_settings: std::sync::atomic::AtomicBool,
     /// Write half of the current control connection (None while not connected).
     writer: tokio::sync::Mutex<Option<OwnedWriteHalf>>,
     epoch: Instant,
@@ -237,9 +264,11 @@ struct Shared {
 }
 
 impl Shared {
-    fn new(live: Live) -> Self {
+    fn new(live: Live, hub: SettingsHandle) -> Self {
         Shared {
             live: tokio::sync::watch::channel(live).0,
+            hub,
+            peer_settings: std::sync::atomic::AtomicBool::new(false),
             writer: tokio::sync::Mutex::new(None),
             epoch: Instant::now(),
             last_seen_ms: AtomicU64::new(0),
@@ -250,7 +279,8 @@ impl Shared {
     }
 
     fn touch(&self) {
-        self.last_seen_ms.store(self.epoch.elapsed().as_millis() as u64, Ordering::Relaxed);
+        self.last_seen_ms
+            .store(self.epoch.elapsed().as_millis() as u64, Ordering::Relaxed);
     }
 
     fn since_seen(&self) -> Duration {
@@ -269,7 +299,10 @@ impl Shared {
     fn pong(&self, seq: u64) {
         let p = self.ping.lock().unwrap();
         if let (true, Some(sent)) = (p.0 == seq, p.1) {
-            self.rtt_ms.store((sent.elapsed().as_millis() as u32).max(1), Ordering::Relaxed);
+            self.rtt_ms.store(
+                (sent.elapsed().as_millis() as u32).max(1),
+                Ordering::Relaxed,
+            );
         }
     }
 
@@ -277,6 +310,7 @@ impl Shared {
     fn reset_link(&self) {
         self.rtt_ms.store(0, Ordering::Relaxed);
         self.bitrate_kbps.store(0, Ordering::Relaxed);
+        self.peer_settings.store(false, Ordering::Relaxed);
         self.live.send_modify(|l| l.phone_rotation = None); // a rotation from an earlier connection is stale
         self.touch();
     }
@@ -295,20 +329,33 @@ pub async fn run_with_commands(
     stop: oneshot::Receiver<()>,
     mut cmds: mpsc::UnboundedReceiver<Control>,
 ) {
-    let shared = Arc::new(Shared::new(Live { facing: cfg.facing, auto_rotate: cfg.auto_rotate, phone_rotation: None }));
+    seed_settings(&cfg);
+    let shared = Arc::new(Shared::new(
+        Live {
+            facing: cfg.facing,
+            auto_rotate: cfg.auto_rotate,
+            rotate: None,
+            mirror: None,
+            phone_rotation: None,
+        },
+        cfg.settings.clone(),
+    ));
+    sync_live(&shared);
     let command_task = {
         let shared = shared.clone();
         let tx = tx.clone();
         tokio::spawn(async move {
             while let Some(request) = cmds.recv().await {
-                match request {
-                    Control::SetFacing(facing) => apply_facing(&shared, &tx, facing).await,
-                    Control::SetAutoRotate(on) => {
-                        shared.live.send_modify(|l| l.auto_rotate = on);
-                        let text = if on { "🧭 التدوير التلقائي حسب مستشعر الهاتف: مفعّل" } else { "🧭 التدوير التلقائي: متوقف" };
-                        log(&tx, format!("{text}\n"));
+                let (key, value) = match request {
+                    Control::SetFacing(facing) => {
+                        ("camera.facing".to_string(), Value::from(facing.as_str()))
                     }
-                }
+                    Control::SetAutoRotate(on) => {
+                        ("video.auto_rotate".to_string(), Value::from(on))
+                    }
+                    Control::Set(key, value) => (key, value),
+                };
+                set_setting(&shared, &tx, &key, value).await;
             }
         })
     };
@@ -326,19 +373,114 @@ pub async fn run_with_commands(
     let _ = tx.send(Event::State(State::Stopped));
 }
 
-async fn apply_facing(shared: &Shared, tx: &Tx, facing: Facing) {
-    shared.live.send_modify(|l| l.facing = facing);
+/// What the user chose when starting (a facing different from the stored one, a fixed rotation or mirror, auto
+/// rotate on) becomes the stored setting; everything else keeps the stored value.
+fn seed_settings(cfg: &Config) {
+    let mut hub = cfg.settings.lock().unwrap();
+    let mut put = |key: &str, value: Value| {
+        let _ = hub.set_local(key, &value);
+    };
+    put("camera.facing", cfg.facing.as_str().into());
+    if let Some(r) = cfg.rotate {
+        put("video.rotate", r.to_string().into());
+    }
+    if let Some(m) = cfg.mirror {
+        put("video.mirror", (if m { "on" } else { "off" }).into());
+    }
+    if cfg.auto_rotate {
+        put("video.auto_rotate", true.into());
+    }
+}
+
+/// Copies the settings that shape the picture into the live state the decoder watches.
+fn sync_live(shared: &Shared) {
+    let (facing, auto_rotate, rotate, mirror) = {
+        let hub = shared.hub.lock().unwrap();
+        let facing = if hub.get_string("camera.facing") == "front" {
+            Facing::Front
+        } else {
+            Facing::Back
+        };
+        let rotate = hub.get_string("video.rotate").parse::<u16>().ok();
+        let mirror = match hub.get_string("video.mirror").as_str() {
+            "on" => Some(true),
+            "off" => Some(false),
+            _ => None,
+        };
+        (facing, hub.get_bool("video.auto_rotate"), rotate, mirror)
+    };
+    shared.live.send_modify(|l| {
+        l.facing = facing;
+        l.auto_rotate = auto_rotate;
+        l.rotate = rotate;
+        l.mirror = mirror;
+    });
+}
+
+fn describe(key: &str, value: &Value) -> String {
+    match value {
+        Value::String(s) => format!("{key} = {s}"),
+        other => format!("{key} = {other}"),
+    }
+}
+
+/// A change made on this computer: stored, applied here at once and sent to the phone when it is connected. An
+/// older phone (no settings sync) only understands `camera.facing`, sent as the old `set`. A refused value is logged.
+async fn set_setting(shared: &Shared, tx: &Tx, key: &str, value: Value) {
+    let outcome = shared.hub.lock().unwrap().set_local(key, &value);
+    let out = match outcome {
+        Ok(out) => out,
+        Err(reject) => {
+            log(tx, format!("⚠️ {}\n", reject.message));
+            return;
+        }
+    };
+    if !out.changed {
+        return;
+    }
+    sync_live(shared);
+    log(tx, format!("⚙️ {}\n", describe(key, &value)));
+    let Some(entry) = out.send else { return };
+    // Not connected yet: the new value reaches the phone in the exchange when the next connection is made.
+    let mut writer = shared.writer.lock().await;
+    let Some(w) = writer.as_mut() else { return };
+    let message = if shared.peer_settings.load(Ordering::Relaxed) {
+        Message::Setting(entry)
+    } else if key == "camera.facing" {
+        Message::set("camera.facing", entry.value)
+    } else {
+        return; // an old phone has no use for the other settings
+    };
+    if let Err(e) = write_message(w, &message).await {
+        *writer = None;
+        log(tx, format!("⚠️ تعذر إرسال الإعداد إلى الهاتف: {e}\n"));
+    }
+}
+
+/// Sends the messages a handler asked for on the open control connection.
+async fn send_all(shared: &Shared, messages: Vec<Message>) {
+    if messages.is_empty() {
+        return;
+    }
     let mut writer = shared.writer.lock().await;
     if let Some(w) = writer.as_mut() {
-        match write_message(w, &Message::set("camera.facing", facing.as_str())).await {
-            Ok(()) => log(tx, format!("🔄 تبديل الكاميرا إلى {}\n", facing.label())),
-            Err(e) => {
+        for m in messages {
+            if write_message(w, &m).await.is_err() {
                 *writer = None;
-                log(tx, format!("⚠️ تعذر إرسال تبديل الكاميرا إلى الهاتف: {e}\n"));
+                return;
             }
         }
     }
-    // Not connected yet: the new value is sent as soon as the next connection is made.
+}
+
+fn reject_message(entry: &SettingEntry, reject: &Reject) -> Message {
+    Message::SettingReject {
+        key: entry.key.clone(),
+        hlc: entry.hlc,
+        device: entry.device.clone(),
+        code: reject.code.as_str().into(),
+        message: reject.message.clone(),
+    }
 }
 
 fn valid_rotation(value: &enki_protocol::control::Value) -> Option<u16> {
@@ -346,27 +488,54 @@ fn valid_rotation(value: &enki_protocol::control::Value) -> Option<u16> {
     (v < 360 && v % 90 == 0).then_some(v as u16)
 }
 
-/// Applies one control message from the phone. Any message proves the link is alive.
-fn handle_message(shared: &Shared, tx: &Tx, message: Message) {
+/// Applies one control message from the phone and returns what must be sent back (acknowledgements and the like).
+/// Any message proves the link is alive.
+#[must_use]
+fn handle_message(shared: &Shared, tx: &Tx, message: Message) -> Vec<Message> {
     shared.touch();
+    let mut replies = Vec::new();
     match message {
         Message::State { key, value } => match key.as_str() {
             "image.rotation" => {
                 if let Some(rotation) = valid_rotation(&value) {
-                    shared.live.send_modify(|l| l.phone_rotation = Some(rotation));
+                    shared
+                        .live
+                        .send_modify(|l| l.phone_rotation = Some(rotation));
                 }
             }
             "stream.bitrate" => {
                 if let Some(kbps) = value.as_u64() {
-                    shared.bitrate_kbps.store(kbps.min(u32::MAX as u64) as u32, Ordering::Relaxed);
+                    shared
+                        .bitrate_kbps
+                        .store(kbps.min(u32::MAX as u64) as u32, Ordering::Relaxed);
                 }
             }
             _ => {}
         },
         Message::Pong { seq } => shared.pong(seq),
-        Message::Hello { device, app_version, .. } => {
-            let device = if device.is_empty() { "?" } else { &device };
-            log(tx, format!("📱 الهاتف: {device} (Enki {app_version})\n"));
+        Message::Hello {
+            device,
+            app_version,
+            device_id,
+            features,
+            ..
+        } => {
+            let device_label = if device.is_empty() { "?" } else { &device };
+            log(
+                tx,
+                format!("📱 الهاتف: {device_label} (Enki {app_version})\n"),
+            );
+            if features.iter().any(|f| f == FEATURE_SETTINGS) {
+                shared.peer_settings.store(true, Ordering::Relaxed);
+                // Each phone keeps its own synced settings; the one that connected now is the one in use.
+                let changed = shared.hub.lock().unwrap().switch_phone(&device_id, &device);
+                if !changed.is_empty() {
+                    sync_live(shared);
+                }
+                for (key, value) in changed {
+                    let _ = tx.send(Event::Setting { key, value });
+                }
+            }
         }
         Message::Capabilities(caps) => {
             let cameras: Vec<String> = caps
@@ -378,14 +547,95 @@ fn handle_message(shared: &Shared, tx: &Tx, message: Message) {
                 })
                 .collect();
             log(tx, format!("📷 كاميرات الهاتف: {}\n", cameras.join("، ")));
+            if let Ok(json) = serde_json::to_string(&Message::Capabilities(caps.clone())) {
+                shared.hub.lock().unwrap().cache_capabilities(json);
+            }
             let _ = tx.send(Event::Capabilities(caps));
         }
         Message::Error { code, message } => log(tx, format!("⚠️ الهاتف: {code}: {message}\n")),
+        Message::SettingsSnapshot {
+            reply, settings, ..
+        } => {
+            let merge = shared.hub.lock().unwrap().merge_snapshot(&settings);
+            for (key, reject) in &merge.ignored {
+                log(
+                    tx,
+                    format!("ℹ️ تجاهل إعداد من الهاتف ({key}): {}\n", reject.message),
+                );
+            }
+            if !merge.changed.is_empty() {
+                sync_live(shared);
+            }
+            for (key, value) in merge.changed {
+                let _ = tx.send(Event::Setting { key, value });
+            }
+            // The phone's own snapshot is answered once, with only what it lacks or has older. Its reply is not.
+            if !reply {
+                replies.push(Message::SettingsSnapshot {
+                    schema: 1,
+                    reply: true,
+                    settings: merge.send_back,
+                });
+            }
+        }
+        Message::Setting(entry) => {
+            let outcome = shared.hub.lock().unwrap().apply_remote(&entry);
+            match outcome {
+                Ok(Applied::Changed { key, value }) => {
+                    sync_live(shared);
+                    log(tx, format!("📲 من الهاتف: {}\n", describe(&key, &value)));
+                    let _ = tx.send(Event::Setting { key, value });
+                    replies.push(Message::SettingAck {
+                        key: entry.key,
+                        hlc: entry.hlc,
+                        device: entry.device,
+                    });
+                }
+                Ok(Applied::Unchanged) => replies.push(Message::SettingAck {
+                    key: entry.key,
+                    hlc: entry.hlc,
+                    device: entry.device,
+                }),
+                Ok(Applied::Stale(newer)) => replies.push(Message::Setting(newer)),
+                Err(reject) => replies.push(reject_message(&entry, &reject)),
+            }
+        }
+        Message::SettingAck { key, hlc, device } => {
+            shared.hub.lock().unwrap().acked(&key, hlc, &device);
+        }
+        Message::SettingReject {
+            key,
+            hlc,
+            device,
+            code,
+            message,
+        } => {
+            let reject = Reject::new(RejectCode::parse(&code), message);
+            let rolled = shared
+                .hub
+                .lock()
+                .unwrap()
+                .rejected(&key, hlc, &device, &reject);
+            if let Some(r) = rolled {
+                sync_live(shared);
+                log(tx, format!("⚠️ الهاتف رفض {key}: {}\n", reject.message));
+                let _ = tx.send(Event::SettingRolledBack {
+                    key: r.key,
+                    value: r.value,
+                    code,
+                    message: reject.message,
+                });
+            }
+        }
         _ => {}
     }
+    replies
 }
 
-async fn write_message<W: AsyncWriteExt + Unpin>(w: &mut W, message: &Message) -> std::io::Result<()> {
+async fn write_message<W: AsyncWriteExt + Unpin>(
+    w: &mut W,
+    message: &Message,
+) -> std::io::Result<()> {
     w.write_all(&message.encode()).await?;
     w.flush().await
 }
@@ -396,7 +646,10 @@ async fn read_message<R: AsyncReadExt + Unpin>(r: &mut R) -> std::io::Result<Mes
     r.read_exact(&mut len).await?;
     let len = u32::from_be_bytes(len) as usize;
     if len > enki_protocol::control::MAX_CONTROL {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "control message too large"));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "control message too large",
+        ));
     }
     let mut body = vec![0u8; len];
     r.read_exact(&mut body).await?;
@@ -451,57 +704,114 @@ async fn read_within(s: &mut TcpStream, buf: &mut [u8]) -> Result<(), ConnectErr
 /// Opens a connection for `channel`: preambles both ways, then the phone's random challenge, our HMAC answer
 /// and the phone's one-byte verdict (docs/protocol.md). The phone serves nothing before that succeeds.
 async fn connect_authenticated(cfg: &Config, channel: Channel) -> Result<TcpStream, ConnectError> {
-    let mut s = TcpStream::connect(("127.0.0.1", cfg.port)).await.map_err(|_| ConnectError::NotListening)?;
+    let mut s = TcpStream::connect(("127.0.0.1", cfg.port))
+        .await
+        .map_err(|_| ConnectError::NotListening)?;
     let _ = s.set_nodelay(true);
-    s.write_all(&Preamble::new(channel).encode()).await.map_err(|_| ConnectError::NotListening)?;
+    s.write_all(&Preamble::new(channel).encode())
+        .await
+        .map_err(|_| ConnectError::NotListening)?;
     let mut reply = [0u8; PREAMBLE_LEN];
     read_within(&mut s, &mut reply).await?;
     match Preamble::decode(&reply) {
         Ok(p) if p.channel == channel => {}
         Ok(_) => return Err(ConnectError::Protocol("قناة غير متوقعة".into())),
-        Err(enki_protocol::Error::UnsupportedVersion(v)) => return Err(ConnectError::OtherVersion(v)),
+        Err(enki_protocol::Error::UnsupportedVersion(v)) => {
+            return Err(ConnectError::OtherVersion(v))
+        }
         Err(e) => return Err(ConnectError::Protocol(e.to_string())),
     }
     let mut nonce = [0u8; NONCE_LEN];
     read_within(&mut s, &mut nonce).await?;
     let answer: [u8; MAC_LEN] = auth_mac(&cfg.token, channel, &nonce);
-    s.write_all(&answer).await.map_err(|_| ConnectError::NotListening)?;
+    s.write_all(&answer)
+        .await
+        .map_err(|_| ConnectError::NotListening)?;
     let mut verdict = [0u8; 1];
     read_within(&mut s, &mut verdict).await?;
     match AuthStatus::from_u8(verdict[0]) {
         Some(AuthStatus::Ok) => Ok(s),
         Some(status) => Err(ConnectError::Auth(status)),
-        None => Err(ConnectError::Protocol(format!("رمز توثيق غير معروف {}", verdict[0]))),
+        None => Err(ConnectError::Protocol(format!(
+            "رمز توثيق غير معروف {}",
+            verdict[0]
+        ))),
     }
 }
 
 /// Connects the control channel, tells the phone which camera to use and waits briefly for its
 /// confirmation, so the camera that opens next is the right one. Returns a task that reads the rest of the
 /// connection (rotation, bit rate, pongs, errors) until the phone closes it.
-async fn open_control(cfg: &Config, shared: &Arc<Shared>, tx: &Tx) -> Result<tokio::task::JoinHandle<()>, ConnectError> {
+async fn open_control(
+    cfg: &Config,
+    shared: &Arc<Shared>,
+    tx: &Tx,
+) -> Result<tokio::task::JoinHandle<()>, ConnectError> {
     shared.reset_link();
     let mut s = connect_authenticated(cfg, Channel::Control).await?;
     let hello = tokio::time::timeout(HANDSHAKE_TIMEOUT, read_message(&mut s))
         .await
         .map_err(|_| ConnectError::NotListening)?
         .map_err(|_| ConnectError::NotListening)?;
-    handle_message(shared, tx, hello);
+    // `hello` carries no reply. It also tells us which phone this is, which switches the settings profile.
+    let _ = handle_message(shared, tx, hello);
 
-    let facing = shared.live.borrow().facing;
-    write_message(&mut s, &Message::set("camera.facing", facing.as_str()))
-        .await
-        .map_err(|_| ConnectError::NotListening)?;
-    let _ = tokio::time::timeout(ACK_TIMEOUT, async {
-        // The phone sends its capabilities and picture rotation first and then confirms the camera.
-        while let Ok(message) = read_message(&mut s).await {
-            let confirmed = matches!(&message, Message::State { key, .. } if key == "camera.facing");
-            handle_message(shared, tx, message);
-            if confirmed {
-                break;
+    if shared.peer_settings.load(Ordering::Relaxed) {
+        // Settings sync: the phone sends its capabilities and its settings snapshot; we merge, answer with only
+        // what the phone lacks or has older, and, when that includes the camera, wait for the phone to switch.
+        let mut sent_facing = false;
+        let _ = tokio::time::timeout(SNAPSHOT_TIMEOUT, async {
+            while let Ok(message) = read_message(&mut s).await {
+                let is_snapshot =
+                    matches!(&message, Message::SettingsSnapshot { reply: false, .. });
+                for reply in handle_message(shared, tx, message) {
+                    if let Message::SettingsSnapshot { settings, .. } = &reply {
+                        sent_facing |= settings.iter().any(|e| e.key == "camera.facing");
+                    }
+                    if write_message(&mut s, &reply).await.is_err() {
+                        return;
+                    }
+                }
+                if is_snapshot {
+                    break;
+                }
             }
+        })
+        .await;
+        if sent_facing {
+            let _ = tokio::time::timeout(ACK_TIMEOUT, async {
+                while let Ok(message) = read_message(&mut s).await {
+                    let confirmed =
+                        matches!(&message, Message::State { key, .. } if key == "camera.facing");
+                    for reply in handle_message(shared, tx, message) {
+                        let _ = write_message(&mut s, &reply).await;
+                    }
+                    if confirmed {
+                        break;
+                    }
+                }
+            })
+            .await;
         }
-    })
-    .await;
+    } else {
+        // An older phone app: tell it which camera to use and wait briefly for its confirmation.
+        let facing = shared.live.borrow().facing;
+        write_message(&mut s, &Message::set("camera.facing", facing.as_str()))
+            .await
+            .map_err(|_| ConnectError::NotListening)?;
+        let _ = tokio::time::timeout(ACK_TIMEOUT, async {
+            // The phone sends its capabilities and picture rotation first and then confirms the camera.
+            while let Ok(message) = read_message(&mut s).await {
+                let confirmed =
+                    matches!(&message, Message::State { key, .. } if key == "camera.facing");
+                let _ = handle_message(shared, tx, message);
+                if confirmed {
+                    break;
+                }
+            }
+        })
+        .await;
+    }
 
     let (mut read_half, write_half) = s.into_split();
     *shared.writer.lock().await = Some(write_half);
@@ -509,7 +819,8 @@ async fn open_control(cfg: &Config, shared: &Arc<Shared>, tx: &Tx) -> Result<tok
     let shared = shared.clone();
     Ok(tokio::spawn(async move {
         while let Ok(message) = read_message(&mut read_half).await {
-            handle_message(&shared, &tx, message);
+            let replies = handle_message(&shared, &tx, message);
+            send_all(&shared, replies).await;
         }
     }))
 }
@@ -577,18 +888,22 @@ async fn run_inner(cfg: &Config, tx: &Tx, shared: &Arc<Shared>) -> Result<(), Pr
             }
             Err(ConnectError::Auth(status)) if cfg.setup_adb && !fresh => {
                 // The phone app was restarted since we gave it the token, so it lost it: give it again.
-                log(tx, format!("🔑 الهاتف لا يملك المفتاح الحالي ({status:?})، أعيد تزويده.\n"));
+                log(
+                    tx,
+                    format!("🔑 الهاتف لا يملك المفتاح الحالي ({status:?})، أعيد تزويده.\n"),
+                );
                 link.set(tx, LinkState::Preparing);
                 provision(cfg).await?;
                 fresh = true;
                 continue;
             }
             Err(e) => return Err(e.problem()),
-            Ok(mut control_reader) => {
+            Ok(control_reader) => {
+                let mut control_reader = AbortOnDrop(control_reader);
                 fresh = false;
                 link.set(tx, LinkState::Ready);
                 let dead = Arc::new(Notify::new());
-                let beat = tokio::spawn(heartbeat(shared.clone(), dead.clone()));
+                let _beat = AbortOnDrop(tokio::spawn(heartbeat(shared.clone(), dead.clone())));
                 let outcome = tokio::select! {
                     r = async {
                         match connect_authenticated(cfg, Channel::Media).await {
@@ -602,14 +917,12 @@ async fn run_inner(cfg: &Config, tx: &Tx, shared: &Arc<Shared>) -> Result<(), Pr
                         link.set(tx, LinkState::Reconnecting("no heartbeat".into()));
                         Ok(0)
                     }
-                    _ = &mut control_reader => {
+                    _ = &mut control_reader.0 => {
                         log(tx, "⚠️ الهاتف أغلق قناة التحكم. أعيد الاتصال...\n");
                         link.set(tx, LinkState::Reconnecting("control channel closed".into()));
                         Ok(0)
                     }
                 };
-                beat.abort();
-                control_reader.abort();
                 *shared.writer.lock().await = None;
                 if outcome? > 0 {
                     log(tx, "الهاتف أنهى البث. بانتظار اتصال جديد...\n");
@@ -628,22 +941,44 @@ async fn run_inner(cfg: &Config, tx: &Tx, shared: &Arc<Shared>) -> Result<(), Pr
 /// from the adb shell. Another app on the phone cannot do that, so it never learns the token.
 async fn provision(cfg: &Config) -> Result<(), Problem> {
     let out = Command::new(&cfg.adb)
-        .args(["shell", "content", "call", "--uri", PROVISION_URI, "--method", "provision", "--arg", &to_hex(&cfg.token)])
+        .args([
+            "shell",
+            "content",
+            "call",
+            "--uri",
+            PROVISION_URI,
+            "--method",
+            "provision",
+            "--arg",
+            &to_hex(&cfg.token),
+        ])
         .stdin(Stdio::null())
         .output()
         .await
         .map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
-                Problem::new(ProblemCode::AdbMissing, "adb غير مثبت (ثبّت android-tools / adb).")
+                Problem::new(
+                    ProblemCode::AdbMissing,
+                    "adb غير مثبت (ثبّت android-tools / adb).",
+                )
             } else {
                 Problem::new(ProblemCode::Other, format!("تعذر تشغيل adb: {e}"))
             }
         })?;
-    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
     if out.status.success() && text.contains("ok=true") {
         return Ok(());
     }
-    let detail = text.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("لا يوجد ردّ").to_string();
+    let detail = text
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("لا يوجد ردّ")
+        .to_string();
     Err(Problem::new(
         ProblemCode::ProvisionFailed,
         format!("تعذر تزويد الهاتف بمفتاح الجلسة ({detail}). تأكد أن تطبيق Enki على الهاتف من نفس إصدار برنامج الحاسوب، وأن الهاتف مصرّح له بـ adb."),
@@ -659,7 +994,10 @@ async fn adb_forward(cfg: &Config) -> Result<(), Problem> {
         .await
         .map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
-                Problem::new(ProblemCode::AdbMissing, "adb غير مثبت (ثبّت android-tools / adb).")
+                Problem::new(
+                    ProblemCode::AdbMissing,
+                    "adb غير مثبت (ثبّت android-tools / adb).",
+                )
             } else {
                 Problem::new(ProblemCode::Other, format!("تعذر تشغيل adb: {e}"))
             }
@@ -674,7 +1012,10 @@ async fn adb_forward(cfg: &Config) -> Result<(), Problem> {
             "لا يوجد هاتف جاهز: وصّله بـ USB، فعّل USB debugging، ووافق على نافذة التصريح في الهاتف.",
         ))
     } else {
-        Err(Problem::new(ProblemCode::Other, format!("فشل adb forward: {}", stderr.trim())))
+        Err(Problem::new(
+            ProblemCode::Other,
+            format!("فشل adb forward: {}", stderr.trim()),
+        ))
     }
 }
 
@@ -689,16 +1030,16 @@ struct Counters {
 /// a phone held landscape with the screen facing you: back = 180° + mirror, front = 180°. With auto-rotate the
 /// phone's own rotation (from its orientation sensor) replaces the degrees; `Config` overrides come first
 /// when auto-rotate is off, and the mirror setting always applies.
-fn orientation(cfg: &Config, live: &Live) -> (u16, bool) {
+fn orientation(live: &Live) -> (u16, bool) {
     let (default_rotate, default_mirror) = match live.facing {
         Facing::Back => (180, true),
         Facing::Front => (180, false),
     };
     let rotate = match (live.auto_rotate, live.phone_rotation) {
         (true, Some(phone)) => phone,
-        _ => cfg.rotate.unwrap_or(default_rotate),
+        _ => live.rotate.unwrap_or(default_rotate),
     };
-    (rotate, cfg.mirror.unwrap_or(default_mirror))
+    (rotate, live.mirror.unwrap_or(default_mirror))
 }
 
 /// The decoder process that writes to the V4L2 device.
@@ -719,12 +1060,18 @@ impl Sink {
             .spawn()
             .map_err(|e| {
                 if e.kind() == std::io::ErrorKind::NotFound {
-                    Problem::new(ProblemCode::FfmpegMissing, format!("{program} غير مثبت أو غير موجود في PATH."))
+                    Problem::new(
+                        ProblemCode::FfmpegMissing,
+                        format!("{program} غير مثبت أو غير موجود في PATH."),
+                    )
                 } else {
                     Problem::new(ProblemCode::Other, format!("فشل تشغيل {program}: {e}"))
                 }
             })?;
-        let stdin = child.stdin.take().ok_or_else(|| Problem::from("تعذر فتح مدخل ffmpeg".to_string()))?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| Problem::from("تعذر فتح مدخل ffmpeg".to_string()))?;
         if let Some(stderr) = child.stderr.take() {
             let tx = tx.clone();
             tokio::spawn(async move {
@@ -734,13 +1081,19 @@ impl Sink {
                 }
             });
         }
-        Ok(Sink { child, stdin: Some(stdin) })
+        Ok(Sink {
+            child,
+            stdin: Some(stdin),
+        })
     }
 
     /// Closing stdin lets the decoder drain what is left and exit; it is killed only if it does not.
     async fn stop(&mut self) {
         self.stdin = None;
-        if tokio::time::timeout(Duration::from_secs(2), self.child.wait()).await.is_err() {
+        if tokio::time::timeout(Duration::from_secs(2), self.child.wait())
+            .await
+            .is_err()
+        {
             let _ = self.child.kill().await;
         }
     }
@@ -748,9 +1101,14 @@ impl Sink {
 
 /// One authenticated media connection to the phone. Returns the number of video frames received (0 means
 /// the phone side went away at once). Fatal problems (bad protocol, ffmpeg failure) are returned as `Err`.
-async fn session(cfg: &Config, mut stream: TcpStream, tx: &Tx, shared: &Arc<Shared>) -> Result<u64, Problem> {
+async fn session(
+    cfg: &Config,
+    mut stream: TcpStream,
+    tx: &Tx,
+    shared: &Arc<Shared>,
+) -> Result<u64, Problem> {
     let mut live_rx = shared.live.subscribe();
-    let mut current = orientation(cfg, &live_rx.borrow_and_update());
+    let mut current = orientation(&live_rx.borrow_and_update());
     let mut sink = Sink::spawn(cfg, current, tx).await?;
 
     log(tx, format!("✓ اتصل بالهاتف، البث إلى {}\n", cfg.device));
@@ -758,16 +1116,33 @@ async fn session(cfg: &Config, mut stream: TcpStream, tx: &Tx, shared: &Arc<Shar
     let _ = tx.send(Event::Link(LinkState::Streaming));
 
     let counters = Arc::new(Counters::default());
-    let ticker = tokio::spawn(report_stats(counters.clone(), shared.clone(), tx.clone()));
-    let result = pump_frames(&mut stream, &mut sink, &counters, cfg, tx, &mut live_rx, &mut current).await;
-    ticker.abort();
+    // Stops with this function even when the future is dropped (stop pressed, heartbeat lost): a detached ticker
+    // would keep reporting "connected, 0 fps" long after the phone is gone.
+    let _ticker = AbortOnDrop(tokio::spawn(report_stats(
+        counters.clone(),
+        shared.clone(),
+        tx.clone(),
+    )));
+    let result = pump_frames(
+        &mut stream,
+        &mut sink,
+        &counters,
+        cfg,
+        tx,
+        &mut live_rx,
+        &mut current,
+    )
+    .await;
 
     let frames = counters.frames.load(Ordering::Relaxed);
     match result {
         Ok(()) | Err(PumpError::PhoneClosed) => {}
         Err(PumpError::Protocol(e)) => {
             sink.stop().await;
-            return Err(Problem::new(ProblemCode::Other, format!("بيانات تالفة من الهاتف: {e}")));
+            return Err(Problem::new(
+                ProblemCode::Other,
+                format!("بيانات تالفة من الهاتف: {e}"),
+            ));
         }
         Err(PumpError::Fatal(message)) => return Err(message),
         Err(PumpError::SinkClosed) => {
@@ -811,25 +1186,38 @@ async fn pump_frames(
     // After a restart the new decoder must start at a config frame (the phone sends one before every key frame).
     let mut wait_for_config = false;
     loop {
-        stream.read_exact(&mut header).await.map_err(|_| PumpError::PhoneClosed)?;
+        stream
+            .read_exact(&mut header)
+            .await
+            .map_err(|_| PumpError::PhoneClosed)?;
         let h = FrameHeader::decode(&header).map_err(PumpError::Protocol)?;
         payload.resize(h.len as usize, 0);
-        stream.read_exact(&mut payload).await.map_err(|_| PumpError::PhoneClosed)?;
+        stream
+            .read_exact(&mut payload)
+            .await
+            .map_err(|_| PumpError::PhoneClosed)?;
 
         // The picture orientation depends on the camera and on how the phone is held. It can only change by
         // restarting the decoder, which only happens when the resulting orientation really differs.
         if live_rx.has_changed().unwrap_or(false) {
-            let wanted = orientation(cfg, &live_rx.borrow_and_update());
+            let wanted = orientation(&live_rx.borrow_and_update());
             if wanted != *current {
                 *current = wanted;
                 sink.stop().await;
-                *sink = Sink::spawn(cfg, wanted, tx).await.map_err(PumpError::Fatal)?;
+                *sink = Sink::spawn(cfg, wanted, tx)
+                    .await
+                    .map_err(PumpError::Fatal)?;
                 wait_for_config = true;
             }
         }
 
         // Only camera video goes to the decoder; audio arrives in a later phase.
-        if h.stream_id != 0 || !matches!(h.kind, Kind::VideoConfig | Kind::VideoKey | Kind::VideoDelta) {
+        if h.stream_id != 0
+            || !matches!(
+                h.kind,
+                Kind::VideoConfig | Kind::VideoKey | Kind::VideoDelta
+            )
+        {
             continue;
         }
         if wait_for_config {
@@ -842,11 +1230,23 @@ async fn pump_frames(
             counters.gaps.fetch_add(1, Ordering::Relaxed);
         }
         let stdin = sink.stdin.as_mut().ok_or(PumpError::SinkClosed)?;
-        stdin.write_all(&payload).await.map_err(|_| PumpError::SinkClosed)?;
+        stdin
+            .write_all(&payload)
+            .await
+            .map_err(|_| PumpError::SinkClosed)?;
         if h.kind != Kind::VideoConfig {
             counters.frames.fetch_add(1, Ordering::Relaxed);
         }
         counters.bytes.fetch_add(h.len as u64, Ordering::Relaxed);
+    }
+}
+
+/// A spawned task that is aborted when this guard is dropped, including when the owning future is cancelled.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
@@ -877,7 +1277,10 @@ async fn report_stats(counters: Arc<Counters>, shared: Arc<Shared>, tx: Tx) {
 fn sink_command(cfg: &Config, rotate: u16, mirror: bool) -> (String, Vec<String>) {
     match &cfg.sink_override {
         Some((program, args)) => (program.clone(), args.clone()),
-        None => (cfg.ffmpeg.clone(), ffmpeg_args(&cfg.device, cfg.fps, rotate, mirror)),
+        None => (
+            cfg.ffmpeg.clone(),
+            ffmpeg_args(&cfg.device, cfg.fps, rotate, mirror),
+        ),
     }
 }
 
@@ -886,14 +1289,32 @@ fn sink_command(cfg: &Config, rotate: u16, mirror: bool) -> (String, Vec<String>
 /// The filter chain pins the output size, so it stays constant when the phone switches camera or the picture is rotated.
 pub fn ffmpeg_args(device: &str, fps: u32, rotate: u16, mirror: bool) -> Vec<String> {
     [
-        "-hide_banner", "-loglevel", "warning",
-        "-fflags", "nobuffer", "-flags", "low_delay",
-        "-probesize", "200000", "-analyzeduration", "0",
-        "-framerate", &fps.to_string(),
-        "-f", "h264", "-i", "-",
-        "-vf", &video_filter(rotate, mirror),
-        "-pix_fmt", "yuv420p", "-fps_mode", "passthrough",
-        "-f", "v4l2", device,
+        "-hide_banner",
+        "-loglevel",
+        "warning",
+        "-fflags",
+        "nobuffer",
+        "-flags",
+        "low_delay",
+        "-probesize",
+        "200000",
+        "-analyzeduration",
+        "0",
+        "-framerate",
+        &fps.to_string(),
+        "-f",
+        "h264",
+        "-i",
+        "-",
+        "-vf",
+        &video_filter(rotate, mirror),
+        "-pix_fmt",
+        "yuv420p",
+        "-fps_mode",
+        "passthrough",
+        "-f",
+        "v4l2",
+        device,
     ]
     .iter()
     .map(|s| s.to_string())
@@ -926,18 +1347,29 @@ pub fn list_v4l2_devices() -> Vec<(String, String)> {
     if let Ok(entries) = std::fs::read_dir("/sys/class/video4linux") {
         for entry in entries.flatten() {
             let file = entry.file_name().to_string_lossy().into_owned();
-            let Some(n) = file.strip_prefix("video").and_then(|n| n.parse::<u32>().ok()) else { continue };
+            let Some(n) = file
+                .strip_prefix("video")
+                .and_then(|n| n.parse::<u32>().ok())
+            else {
+                continue;
+            };
             let name = std::fs::read_to_string(entry.path().join("name")).unwrap_or_default();
             found.push((n, name.trim().to_string()));
         }
     }
     found.sort();
-    found.into_iter().map(|(n, name)| (format!("/dev/video{n}"), name)).collect()
+    found
+        .into_iter()
+        .map(|(n, name)| (format!("/dev/video{n}"), name))
+        .collect()
 }
 
 /// The loopback device Enki created (its `card_label` is "Enki"), if present.
 pub fn pick_default_device(devices: &[(String, String)]) -> Option<String> {
-    devices.iter().find(|(_, name)| name.contains("Enki")).map(|(path, _)| path.clone())
+    devices
+        .iter()
+        .find(|(_, name)| name.contains("Enki"))
+        .map(|(path, _)| path.clone())
 }
 
 #[cfg(test)]

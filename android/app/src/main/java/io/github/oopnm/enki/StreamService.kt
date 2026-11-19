@@ -37,6 +37,7 @@ class StreamService : Service() {
     }
 
     private fun startServer() {
+        EnkiSettings.init(applicationContext)
         createChannel()
         val initial = notification("Starting…")
         if (Build.VERSION.SDK_INT >= 29) {

@@ -45,6 +45,20 @@ impl Capabilities {
     }
 }
 
+/// One setting value with the stamp of the write that produced it (docs/protocol.md, "Settings sync").
+/// `hlc` is the hybrid logical clock `[wall_ms, counter]`; `device` is the id of the app that wrote it.
+/// The newest `(hlc, device)` pair wins on both sides.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SettingEntry {
+    pub key: String,
+    pub value: Value,
+    pub hlc: (u64, u32),
+    pub device: String,
+}
+
+/// Feature flag in `hello.features`: the peer speaks the settings messages.
+pub const FEATURE_SETTINGS: &str = "settings";
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Message {
@@ -59,21 +73,66 @@ pub enum Message {
         device: String,
         #[serde(default)]
         android: u32,
+        /// The phone app's own random id (stable across launches). Empty for an app that predates settings sync.
+        #[serde(default)]
+        device_id: String,
+        /// Optional features, e.g. [`FEATURE_SETTINGS`].
+        #[serde(default)]
+        features: Vec<String>,
     },
     /// Phone → PC, right after `hello`.
     Capabilities(Capabilities),
     /// PC → phone: change one setting.
-    Set { key: String, value: Value },
+    Set {
+        key: String,
+        value: Value,
+    },
     /// Phone → PC: a setting's current value.
-    State { key: String, value: Value },
+    State {
+        key: String,
+        value: Value,
+    },
     Error {
         code: String,
         #[serde(default)]
         message: String,
     },
     /// PC → phone, once a second. The phone answers with a [`Message::Pong`] carrying the same `seq`.
-    Ping { seq: u64 },
-    Pong { seq: u64 },
+    Ping {
+        seq: u64,
+    },
+    Pong {
+        seq: u64,
+    },
+    /// Both directions: every synced setting the sender has explicitly set. The phone sends one right after its
+    /// capabilities; the PC merges it and answers with a snapshot of only the entries where its own write is
+    /// newer or the phone has none (`reply: true`, which the phone applies and never answers).
+    SettingsSnapshot {
+        #[serde(default)]
+        schema: u32,
+        #[serde(default)]
+        reply: bool,
+        #[serde(default)]
+        settings: Vec<SettingEntry>,
+    },
+    /// Both directions: one setting was changed by the sender.
+    Setting(SettingEntry),
+    /// The receiver applied the change with this stamp (a stale change is answered with the newer `setting` instead).
+    SettingAck {
+        key: String,
+        hlc: (u64, u32),
+        device: String,
+    },
+    /// The receiver refused the change with this stamp; the sender rolls the setting back.
+    /// `code`: `unknown_key`, `bad_value`, `local_only`, `unsupported`, `apply_failed`, `clock_skew`.
+    SettingReject {
+        key: String,
+        hlc: (u64, u32),
+        device: String,
+        code: String,
+        #[serde(default)]
+        message: String,
+    },
     /// Any type this version does not know.
     #[serde(other)]
     Unknown,
@@ -81,7 +140,10 @@ pub enum Message {
 
 impl Message {
     pub fn set(key: &str, value: impl Into<Value>) -> Message {
-        Message::Set { key: key.to_string(), value: value.into() }
+        Message::Set {
+            key: key.to_string(),
+            value: value.into(),
+        }
     }
 
     pub fn to_json(&self) -> String {
@@ -123,7 +185,23 @@ mod tests {
     }
 
     fn vector(name: &str) -> String {
-        vectors().into_iter().find(|(n, _)| n == name).unwrap_or_else(|| panic!("no vector {name}")).1
+        vectors()
+            .into_iter()
+            .find(|(n, _)| n == name)
+            .unwrap_or_else(|| panic!("no vector {name}"))
+            .1
+    }
+
+    const PHONE_ID: &str = "0123456789abcdef0123456789abcdef";
+    const PC_ID: &str = "fedcba9876543210fedcba9876543210";
+
+    fn entry(key: &str, value: Value, hlc: (u64, u32), device: &str) -> SettingEntry {
+        SettingEntry {
+            key: key.into(),
+            value,
+            hlc,
+            device: device.into(),
+        }
     }
 
     /// The camera the Android tests encode into the `capabilities` vector.
@@ -154,24 +232,143 @@ mod tests {
                 app: "enki-android".into(),
                 app_version: "0.2.0".into(),
                 device: "Pixel 6".into(),
-                android: 28
+                android: 28,
+                device_id: PHONE_ID.into(),
+                features: vec![FEATURE_SETTINGS.into()],
             }
         );
-        assert_eq!(Message::from_json(&vector("capabilities")).unwrap(), Message::Capabilities(sample_caps()));
-        assert_eq!(Message::from_json(&vector("ping")).unwrap(), Message::Ping { seq: 7 });
-        assert_eq!(Message::from_json(&vector("pong")).unwrap(), Message::Pong { seq: 7 });
+        // An app from before settings sync has no id and no features.
+        assert_eq!(
+            Message::from_json(&vector("hello_legacy")).unwrap(),
+            Message::Hello {
+                version: 1,
+                app: "enki-android".into(),
+                app_version: "0.2.0".into(),
+                device: "Pixel 6".into(),
+                android: 28,
+                device_id: String::new(),
+                features: vec![],
+            }
+        );
+        assert_eq!(
+            Message::from_json(&vector("capabilities")).unwrap(),
+            Message::Capabilities(sample_caps())
+        );
+        assert_eq!(
+            Message::from_json(&vector("ping")).unwrap(),
+            Message::Ping { seq: 7 }
+        );
+        assert_eq!(
+            Message::from_json(&vector("pong")).unwrap(),
+            Message::Pong { seq: 7 }
+        );
         assert_eq!(
             Message::from_json(&vector("state_rotation")).unwrap(),
-            Message::State { key: "image.rotation".into(), value: 180.into() }
+            Message::State {
+                key: "image.rotation".into(),
+                value: 180.into()
+            }
         );
         assert_eq!(
             Message::from_json(&vector("state_bitrate")).unwrap(),
-            Message::State { key: "stream.bitrate".into(), value: 3000.into() }
+            Message::State {
+                key: "stream.bitrate".into(),
+                value: 3000.into()
+            }
         );
-        assert_eq!(Message::from_json(&vector("set_facing")).unwrap(), Message::set("camera.facing", "front"));
+        assert_eq!(
+            Message::from_json(&vector("set_facing")).unwrap(),
+            Message::set("camera.facing", "front")
+        );
         assert_eq!(
             Message::from_json(&vector("error")).unwrap(),
-            Message::Error { code: "bad_value".into(), message: "camera.facing must be \"front\" or \"back\"".into() }
+            Message::Error {
+                code: "bad_value".into(),
+                message: "camera.facing must be \"front\" or \"back\"".into()
+            }
+        );
+    }
+
+    #[test]
+    fn settings_messages_decode_and_encode_like_the_shared_vectors() {
+        let snapshot = Message::SettingsSnapshot {
+            schema: 1,
+            reply: false,
+            settings: vec![
+                entry(
+                    "camera.facing",
+                    "front".into(),
+                    (1_700_000_000_000, 2),
+                    PHONE_ID,
+                ),
+                entry(
+                    "video.auto_rotate",
+                    true.into(),
+                    (1_700_000_000_500, 0),
+                    PHONE_ID,
+                ),
+            ],
+        };
+        let reply = Message::SettingsSnapshot {
+            schema: 1,
+            reply: true,
+            settings: vec![entry(
+                "video.rotate",
+                "90".into(),
+                (1_700_000_001_000, 0),
+                PC_ID,
+            )],
+        };
+        let setting = Message::Setting(entry(
+            "video.rotate",
+            "90".into(),
+            (1_700_000_001_000, 0),
+            PC_ID,
+        ));
+        let ack = Message::SettingAck {
+            key: "video.rotate".into(),
+            hlc: (1_700_000_001_000, 0),
+            device: PC_ID.into(),
+        };
+        let reject = Message::SettingReject {
+            key: "camera.facing".into(),
+            hlc: (1_700_000_002_000, 1),
+            device: PC_ID.into(),
+            code: "unsupported".into(),
+            message: "this phone has no front camera".into(),
+        };
+        let as_value = |m: &Message| serde_json::from_str::<Value>(&m.to_json()).unwrap();
+        let from_vector = |n: &str| serde_json::from_str::<Value>(&vector(n)).unwrap();
+        for (name, message) in [
+            ("settings_snapshot", snapshot),
+            ("settings_snapshot_reply", reply),
+            ("setting", setting),
+            ("setting_ack", ack),
+            ("setting_reject", reject),
+        ] {
+            assert_eq!(
+                Message::from_json(&vector(name)).unwrap(),
+                message,
+                "{name} decodes"
+            );
+            assert_eq!(as_value(&message), from_vector(name), "{name} encodes");
+        }
+    }
+
+    #[test]
+    fn a_snapshot_without_optional_parts_still_decodes() {
+        let m = Message::from_json(r#"{"type":"settings_snapshot"}"#).unwrap();
+        assert_eq!(
+            m,
+            Message::SettingsSnapshot {
+                schema: 0,
+                reply: false,
+                settings: vec![]
+            }
+        );
+        assert!(
+            Message::from_json(r#"{"type":"setting","key":"a"}"#).is_err(),
+            "a setting needs value, hlc and device"
         );
     }
 
@@ -181,17 +378,29 @@ mod tests {
         let as_value = |m: &Message| serde_json::from_str::<Value>(&m.to_json()).unwrap();
         let from_vector = |n: &str| serde_json::from_str::<Value>(&vector(n)).unwrap();
         assert_eq!(as_value(&Message::Ping { seq: 7 }), from_vector("ping"));
-        assert_eq!(as_value(&Message::set("camera.facing", "front")), from_vector("set_facing"));
-        assert_eq!(as_value(&Message::Capabilities(sample_caps())), from_vector("capabilities"));
+        assert_eq!(
+            as_value(&Message::set("camera.facing", "front")),
+            from_vector("set_facing")
+        );
+        assert_eq!(
+            as_value(&Message::Capabilities(sample_caps())),
+            from_vector("capabilities")
+        );
     }
 
     #[test]
     fn unknown_types_and_fields_are_ignored() {
-        assert_eq!(Message::from_json(&vector("future_type")).unwrap(), Message::Unknown);
+        assert_eq!(
+            Message::from_json(&vector("future_type")).unwrap(),
+            Message::Unknown
+        );
         let m = Message::from_json(r#"{"type":"pong","seq":3,"extra":{"a":1}}"#).unwrap();
         assert_eq!(m, Message::Pong { seq: 3 });
         // A capabilities message from a newer phone with fields we do not know, and one missing optional parts.
-        let m = Message::from_json(r#"{"type":"capabilities","cameras":[{"id":"1","facing":"front","hdr":true}]}"#).unwrap();
+        let m = Message::from_json(
+            r#"{"type":"capabilities","cameras":[{"id":"1","facing":"front","hdr":true}]}"#,
+        )
+        .unwrap();
         match m {
             Message::Capabilities(c) => {
                 assert_eq!(c.cameras[0].facing, "front");
@@ -205,7 +414,10 @@ mod tests {
     fn garbage_is_an_error_not_a_panic() {
         assert!(Message::from_json("not json").is_err());
         assert!(Message::from_json(r#"{"no_type":1}"#).is_err());
-        assert!(Message::from_json(r#"{"type":"ping"}"#).is_err(), "ping needs a seq");
+        assert!(
+            Message::from_json(r#"{"type":"ping"}"#).is_err(),
+            "ping needs a seq"
+        );
     }
 
     #[test]
