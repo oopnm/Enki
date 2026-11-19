@@ -717,7 +717,9 @@ impl App {
             }
             UiEvent::Preview(rgb) => {
                 let (w, h) = (enki_receiver::PREVIEW_W, enki_receiver::PREVIEW_H);
-                if rgb.len() == w * h * 3 {
+                if rgb.len() != w * h * 3 {
+                    self.log(&format!("Preview: unexpected frame size {}\n", rgb.len()));
+                } else {
                     let texture = gtk::gdk::MemoryTexture::new(
                         w as i32,
                         h as i32,

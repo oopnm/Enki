@@ -1203,11 +1203,20 @@ impl Sink {
             let tx = tx.clone();
             tokio::spawn(async move {
                 let mut frame = vec![0u8; PREVIEW_W * PREVIEW_H * 3];
+                let mut count = 0u64;
                 while stdout.read_exact(&mut frame).await.is_ok() {
+                    count += 1;
+                    if count == 1 {
+                        log(&tx, "Preview: first frame from ffmpeg.\n".to_string());
+                    }
                     if tx.send(Event::Preview(frame.clone())).is_err() {
                         break;
                     }
                 }
+                log(
+                    &tx,
+                    format!("Preview: ffmpeg's preview output ended after {count} frames.\n"),
+                );
             });
         }
         Ok(Sink {
