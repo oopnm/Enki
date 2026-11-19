@@ -20,6 +20,24 @@ impl Codec {
         }
     }
 
+    /// Tells the codec from the parameter sets the phone sends before every key frame: H.264 starts with an SPS
+    /// (NAL type 7), H.265 with a VPS or SPS (types 32 and 33). `None` when the bytes say neither.
+    pub fn detect(config: &[u8]) -> Option<Codec> {
+        let start = config
+            .windows(3)
+            .position(|w| w == [0, 0, 1])
+            .map(|i| i + 3)?;
+        let b = *config.get(start)?;
+        if b & 0x80 != 0 {
+            return None; // forbidden_zero_bit set: not a NAL header
+        }
+        match (b & 0x1f, (b >> 1) & 0x3f) {
+            (7, _) => Some(Codec::H264),
+            (_, 32) | (_, 33) => Some(Codec::Hevc),
+            _ => None,
+        }
+    }
+
     /// `None` for a name this program does not know (an unknown codec must not silently become H.264).
     pub fn from_wire(name: &str) -> Option<Codec> {
         match name {
@@ -270,6 +288,22 @@ mod tests {
             ..Look::default()
         };
         assert!(filter_chain(&look).contains("crop=trunc(iw*0.50/2)*2"));
+    }
+
+    #[test]
+    fn the_codec_is_recognised_from_the_parameter_sets() {
+        assert_eq!(
+            Codec::detect(&[0, 0, 0, 1, 0x67, 0x42, 0x00]),
+            Some(Codec::H264)
+        );
+        assert_eq!(Codec::detect(&[0, 0, 1, 0x67, 0x42]), Some(Codec::H264));
+        assert_eq!(
+            Codec::detect(&[0, 0, 0, 1, 0x40, 0x01, 0x0c]),
+            Some(Codec::Hevc)
+        );
+        assert_eq!(Codec::detect(&[0, 0, 0, 1, 0x42, 0x01]), Some(Codec::Hevc));
+        assert_eq!(Codec::detect(&[1, 2, 3]), None);
+        assert_eq!(Codec::detect(&[0, 0, 0, 1, 0x65]), None);
     }
 
     #[test]

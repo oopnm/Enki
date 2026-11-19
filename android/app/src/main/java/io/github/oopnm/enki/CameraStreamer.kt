@@ -6,6 +6,7 @@ import android.graphics.SurfaceTexture
 import android.hardware.camera2.CameraAccessException
 import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CameraConstrainedHighSpeedCaptureSession
 import android.hardware.camera2.CameraDevice
 import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CameraMetadata
@@ -65,6 +66,9 @@ class CameraStreamer(
     @Volatile private var adapterThread: Thread? = null
     @Volatile private var started = false
 
+    /** True when the frame rate needs Camera2's constrained high-speed mode (most phones: above 30 fps). */
+    @Volatile private var highSpeed = false
+
     /** Camera controls that can change while streaming; see [applyLens]. */
     @Volatile private var lens: LensControls = initialLens
 
@@ -86,12 +90,28 @@ class CameraStreamer(
         val characteristics = manager.getCameraCharacteristics(cameraId)
         val map = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
             ?: return fail("camera has no stream configuration")
-        val size = chooseSize(map.getOutputSizes(MediaCodec::class.java) ?: map.getOutputSizes(SurfaceTexture::class.java))
+        var size = chooseSize(map.getOutputSizes(MediaCodec::class.java) ?: map.getOutputSizes(SurfaceTexture::class.java))
             ?: return fail("camera reports no output sizes")
-        val fpsRange = chooseFpsRange(characteristics.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES))
+        var fpsRange = chooseFpsRange(characteristics.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES))
+        // Above what the normal modes offer (the Galaxy S8 stops at 30), try the high-speed modes.
+        var highSpeedInfo = ""
+        val normalRange = fpsRange
+        if (normalRange == null || normalRange.upper < video.fps) {
+            val candidates = runCatching { map.highSpeedVideoSizes }.getOrNull()?.mapNotNull { s ->
+                val ranges = runCatching { map.getHighSpeedVideoFpsRangesFor(s) }.getOrNull() ?: return@mapNotNull null
+                highSpeedInfo += "${s.width}x${s.height}:" + ranges.joinToString("/") { "${it.lower}-${it.upper}" } + " "
+                val r = ranges.filter { it.upper == video.fps }.maxByOrNull { it.lower } ?: return@mapNotNull null
+                Triple(s, r, abs(s.height - video.height))
+            }.orEmpty()
+            candidates.filter { it.first.width * 9 == it.first.height * 16 }.minByOrNull { it.third }?.let {
+                size = it.first
+                fpsRange = it.second
+                highSpeed = true
+            }
+        }
         activeCharacteristics = characteristics
         activeFps = fpsRange
-        onFpsInfo("${fpsRange?.upper ?: 0}|" + (characteristics.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)?.joinToString(",") { "${it.lower}-${it.upper}" } ?: ""))
+        onFpsInfo("${fpsRange?.upper ?: 0}|" + (if (highSpeed) "high-speed mode " else "") + (if (highSpeedInfo.isNotEmpty()) "[high-speed: ${highSpeedInfo.trim()}] " else "") + (characteristics.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)?.joinToString(",") { "${it.lower}-${it.upper}" } ?: ""))
 
         try {
             startEncoder(size, fpsRange?.upper ?: video.fps)
@@ -159,24 +179,39 @@ class CameraStreamer(
     private fun createSession(device: CameraDevice, handler: Handler) {
         val surface = inputSurface ?: return fail("no encoder surface")
         try {
-            @Suppress("DEPRECATION") // the SessionConfiguration variant needs API 28; minSdk is 24
-            device.createCaptureSession(listOf(surface), object : CameraCaptureSession.StateCallback() {
+            val callback = object : CameraCaptureSession.StateCallback() {
                 override fun onConfigured(s: CameraCaptureSession) {
                     synchronized(lock) {
                         if (stopped) { s.close(); return }
                         session = s
                     }
                     try {
-                        val current = lens
-                        s.setRepeatingRequest(buildRequest(device, surface, current, false), null, handler)
-                        if (current.focusMode == "once") s.capture(buildRequest(device, surface, current, true), null, handler)
+                        if (highSpeed && s is CameraConstrainedHighSpeedCaptureSession) {
+                            // High-speed mode accepts only a plain request; the camera controls are not applied.
+                            val request = device.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
+                                addTarget(surface)
+                                set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
+                                activeFps?.let { set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, it) }
+                            }.build()
+                            s.setRepeatingBurst(s.createHighSpeedRequestList(request), null, handler)
+                        } else {
+                            val current = lens
+                            s.setRepeatingRequest(buildRequest(device, surface, current, false), null, handler)
+                            if (current.focusMode == "once") s.capture(buildRequest(device, surface, current, true), null, handler)
+                        }
                     } catch (e: Exception) {
                         fail("cannot start capture: ${e.message}")
                     }
                 }
 
                 override fun onConfigureFailed(s: CameraCaptureSession) = fail("camera session configuration failed")
-            }, handler)
+            }
+            if (highSpeed) {
+                device.createConstrainedHighSpeedCaptureSession(listOf(surface), callback, handler)
+            } else {
+                @Suppress("DEPRECATION") // the SessionConfiguration variant needs API 28; minSdk is 24
+                device.createCaptureSession(listOf(surface), callback, handler)
+            }
         } catch (e: Exception) {
             fail("cannot create camera session: ${e.message}")
         }
@@ -186,6 +221,7 @@ class CameraStreamer(
     fun applyLens(next: LensControls) {
         val previous = lens
         lens = next
+        if (highSpeed) return // the camera controls do not apply in high-speed mode
         val s = session ?: return
         val device = activeDevice ?: return
         val surface = inputSurface ?: return

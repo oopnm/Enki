@@ -1338,7 +1338,8 @@ async fn pump_frames(
         // The picture orientation depends on the camera and on how the phone is held. It can only change by
         // restarting the decoder, which only happens when the resulting orientation really differs.
         if live_rx.has_changed().unwrap_or(false) {
-            let wanted = look(&live_rx.borrow_and_update(), cfg.preview);
+            let mut wanted = look(&live_rx.borrow_and_update(), cfg.preview);
+            wanted.codec = current.codec; // the codec comes from the stream itself, see below
             if wanted != *current {
                 *current = wanted;
                 sink.stop().await;
@@ -1357,6 +1358,20 @@ async fn pump_frames(
             )
         {
             continue;
+        }
+        // The parameter sets say which codec this is. Trusting them (and not a separate message that may arrive
+        // late) means the decoder always starts with the right demuxer.
+        if h.kind == Kind::VideoConfig {
+            if let Some(codec) = Codec::detect(&payload) {
+                if codec != current.codec {
+                    current.codec = codec;
+                    sink.stop().await;
+                    *sink = Sink::spawn(cfg, current, tx)
+                        .await
+                        .map_err(PumpError::Fatal)?;
+                    wait_for_config = false; // this very frame is the start of the new decoder's input
+                }
+            }
         }
         if wait_for_config {
             if h.kind != Kind::VideoConfig {
