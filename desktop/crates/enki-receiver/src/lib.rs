@@ -599,6 +599,23 @@ fn handle_message(shared: &Shared, tx: &Tx, message: Message) -> Vec<Message> {
                 };
                 let _ = tx.send(Event::Phone(info));
             }
+            "stream.fps_info" => {
+                if let Some((chosen, ranges)) = value.as_str().and_then(|v| v.split_once('|')) {
+                    let wanted = shared.live.borrow().fps;
+                    let chosen: u32 = chosen.parse().unwrap_or(0);
+                    let note = if chosen >= wanted {
+                        format!(
+                            "Phone camera runs at up to {chosen} fps (camera offers: {ranges}).\n"
+                        )
+                    } else {
+                        format!(
+                            "⚠️ {wanted} fps was asked for, but this camera only offers up to {chosen} fps \
+                             in normal mode (camera offers: {ranges}), so the picture stays at {chosen} fps.\n"
+                        )
+                    };
+                    let _ = tx.send(Event::Log(note));
+                }
+            }
             "stream.bitrate" => {
                 if let Some(kbps) = value.as_u64() {
                     shared

@@ -47,6 +47,8 @@ class CameraStreamer(
     private val onCodec: (String) -> Unit = {},
     /** Called once, when the first key frame of this stream came out of the encoder (the settings work). */
     private val onStarted: () -> Unit = {},
+    /** "chosen upper fps|every range the camera offers", e.g. "30|15-30,30-30"; for the PC's log. */
+    private val onFpsInfo: (String) -> Unit = {},
     initialLens: LensControls = LensControls.read(),
     initialBitrate: Int = video.autoBitrate(),
 ) {
@@ -89,6 +91,7 @@ class CameraStreamer(
         val fpsRange = chooseFpsRange(characteristics.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES))
         activeCharacteristics = characteristics
         activeFps = fpsRange
+        onFpsInfo("${fpsRange?.upper ?: 0}|" + (characteristics.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)?.joinToString(",") { "${it.lower}-${it.upper}" } ?: ""))
 
         try {
             startEncoder(size, fpsRange?.upper ?: video.fps)

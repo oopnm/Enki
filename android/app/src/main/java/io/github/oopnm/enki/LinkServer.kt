@@ -113,6 +113,7 @@ class LinkServer(
 
     /** Codec of the running encoder ("h264" or "hevc"), sent to a PC that connects while streaming. */
     @Volatile private var lastCodec: String? = null
+    @Volatile private var lastFpsInfo: String? = null
 
     /** True while the phone is too hot and "lower quality when hot" is on. */
     @Volatile private var phoneHot = false
@@ -148,6 +149,10 @@ class LinkServer(
                     broadcastState(ControlMessages.stateString("stream.codec", codec))
                 },
                 onStarted = { lastGood = video },
+                onFpsInfo = { info ->
+                    lastFpsInfo = info
+                    broadcastState(ControlMessages.stateString("stream.fps_info", info))
+                },
                 initialBitrate = target,
             ).also { it.bitrateCeiling = ceilingFor(target) }
         }
@@ -207,6 +212,7 @@ class LinkServer(
                 streamer?.stop()
                 streamer = null
                 lastCodec = null
+                lastFpsInfo = null
             }
         }
     }
@@ -374,6 +380,7 @@ class LinkServer(
             // What this phone has set; the PC answers with only what it has newer or the phone lacks.
             control.send(ControlMessages.settingsSnapshot(false, EnkiSettings.snapshot()))
             lastCodec?.let { control.send(ControlMessages.stateString("stream.codec", it)) }
+            lastFpsInfo?.let { control.send(ControlMessages.stateString("stream.fps_info", it)) }
             phoneMonitor.latest?.let {
                 control.send(ControlMessages.stateInt("phone.battery", it.percent))
                 control.send(ControlMessages.stateInt("phone.temperature", it.tempDc))
