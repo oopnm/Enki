@@ -1145,3 +1145,32 @@ async fn a_phone_without_settings_sync_still_gets_the_old_set_message() {
         "no phone id, no profile switch"
     );
 }
+
+#[tokio::test]
+async fn after_stop_nothing_keeps_running_or_reporting() {
+    let (port, _received) = start_phone(true).await;
+    let cfg = sink_to_null(test_config(port));
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (stop_tx, stop_rx) = oneshot::channel();
+    let task = tokio::spawn(run(cfg, tx, stop_rx));
+    let mut streaming = false;
+    for _ in 0..100 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if drain(&mut rx).iter().any(|e| matches!(e, Event::Stats(_))) {
+            streaming = true;
+            break;
+        }
+    }
+    assert!(streaming, "the session streamed");
+    let _ = stop_tx.send(());
+    task.await.unwrap();
+    // Every task holding the event sender must be gone: the channel closes instead of reporting stats forever.
+    let closed = tokio::time::timeout(Duration::from_secs(3), async {
+        while rx.recv().await.is_some() {}
+    })
+    .await;
+    assert!(
+        closed.is_ok(),
+        "a background task kept sending events after stop"
+    );
+}

@@ -898,11 +898,12 @@ async fn run_inner(cfg: &Config, tx: &Tx, shared: &Arc<Shared>) -> Result<(), Pr
                 continue;
             }
             Err(e) => return Err(e.problem()),
-            Ok(mut control_reader) => {
+            Ok(control_reader) => {
+                let mut control_reader = AbortOnDrop(control_reader);
                 fresh = false;
                 link.set(tx, LinkState::Ready);
                 let dead = Arc::new(Notify::new());
-                let beat = tokio::spawn(heartbeat(shared.clone(), dead.clone()));
+                let _beat = AbortOnDrop(tokio::spawn(heartbeat(shared.clone(), dead.clone())));
                 let outcome = tokio::select! {
                     r = async {
                         match connect_authenticated(cfg, Channel::Media).await {
@@ -916,14 +917,12 @@ async fn run_inner(cfg: &Config, tx: &Tx, shared: &Arc<Shared>) -> Result<(), Pr
                         link.set(tx, LinkState::Reconnecting("no heartbeat".into()));
                         Ok(0)
                     }
-                    _ = &mut control_reader => {
+                    _ = &mut control_reader.0 => {
                         log(tx, "⚠️ الهاتف أغلق قناة التحكم. أعيد الاتصال...\n");
                         link.set(tx, LinkState::Reconnecting("control channel closed".into()));
                         Ok(0)
                     }
                 };
-                beat.abort();
-                control_reader.abort();
                 *shared.writer.lock().await = None;
                 if outcome? > 0 {
                     log(tx, "الهاتف أنهى البث. بانتظار اتصال جديد...\n");
@@ -1117,7 +1116,13 @@ async fn session(
     let _ = tx.send(Event::Link(LinkState::Streaming));
 
     let counters = Arc::new(Counters::default());
-    let ticker = tokio::spawn(report_stats(counters.clone(), shared.clone(), tx.clone()));
+    // Stops with this function even when the future is dropped (stop pressed, heartbeat lost): a detached ticker
+    // would keep reporting "connected, 0 fps" long after the phone is gone.
+    let _ticker = AbortOnDrop(tokio::spawn(report_stats(
+        counters.clone(),
+        shared.clone(),
+        tx.clone(),
+    )));
     let result = pump_frames(
         &mut stream,
         &mut sink,
@@ -1128,7 +1133,6 @@ async fn session(
         &mut current,
     )
     .await;
-    ticker.abort();
 
     let frames = counters.frames.load(Ordering::Relaxed);
     match result {
@@ -1234,6 +1238,15 @@ async fn pump_frames(
             counters.frames.fetch_add(1, Ordering::Relaxed);
         }
         counters.bytes.fetch_add(h.len as u64, Ordering::Relaxed);
+    }
+}
+
+/// A spawned task that is aborted when this guard is dropped, including when the owning future is cancelled.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
