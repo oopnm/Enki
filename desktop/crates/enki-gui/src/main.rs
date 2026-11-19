@@ -10,7 +10,7 @@ use gtk::prelude::*;
 use gtk::Box as GtkBox;
 use gtk::{
     Application, ApplicationWindow, Button, CheckButton, DropDown, Entry, Label, Orientation,
-    ScrolledWindow, TextBuffer, TextView,
+    Picture, Scale, ScrolledWindow, TextBuffer, TextView,
 };
 use serde_json::{json, Value};
 use std::cell::{Cell, RefCell};
@@ -52,6 +52,10 @@ enum UiEvent {
     Problem(enki_receiver::Problem),
     /// A setting (or the phone profile) changed behind the window's back: redraw the controls.
     Refresh,
+    /// Battery and temperature reported by the phone.
+    Phone(enki_receiver::PhoneInfo),
+    /// One frame of the live preview (RGB24).
+    Preview(Vec<u8>),
     /// The phone refused a change made here (already rolled back in the settings).
     RolledBack {
         key: String,
@@ -66,6 +70,7 @@ enum Control {
     Choice(DropDown, Vec<String>),
     Toggle(CheckButton),
     Text(Entry),
+    Slider(Scale),
 }
 
 /// Message id of a setting label (`camera.facing` → `setting-camera-facing`) and of one choice.
@@ -100,6 +105,8 @@ struct App {
     refreshing: Cell<bool>,
     status_label: RefCell<Label>,
     phone_label: RefCell<Label>,
+    info_label: RefCell<Label>,
+    preview: RefCell<Picture>,
     start_btn: RefCell<Button>,
     fix_btn: RefCell<Button>,
     resolution: RefCell<DropDown>,
@@ -174,6 +181,8 @@ fn build_ui(app: &Application, rt: Handle) {
         refreshing: Cell::new(false),
         status_label: RefCell::new(Label::new(None)),
         phone_label: RefCell::new(Label::new(None)),
+        info_label: RefCell::new(Label::new(None)),
+        preview: RefCell::new(Picture::new()),
         start_btn: RefCell::new(Button::new()),
         fix_btn: RefCell::new(Button::new()),
         resolution: RefCell::new(DropDown::new(
@@ -251,6 +260,20 @@ impl App {
         let phone_label = Label::builder().xalign(0.0).build();
         main_box.append(&status_label);
         main_box.append(&phone_label);
+        let info_label = Label::builder().xalign(0.0).build();
+        main_box.append(&info_label);
+        *self.info_label.borrow_mut() = info_label;
+        // المعاينة الحية: تظهر أثناء البث فقط.
+        let preview = Picture::builder()
+            .can_shrink(false)
+            .halign(gtk::Align::Start)
+            .build();
+        preview.set_size_request(
+            enki_receiver::PREVIEW_W as i32,
+            enki_receiver::PREVIEW_H as i32,
+        );
+        main_box.append(&preview);
+        *self.preview.borrow_mut() = preview;
         *self.status_label.borrow_mut() = status_label;
         *self.phone_label.borrow_mut() = phone_label;
 
@@ -300,7 +323,14 @@ impl App {
             .build();
         settings_box.append(&audio);
         *self.audio.borrow_mut() = audio;
-        main_box.append(&settings_box);
+        // الإعدادات كثيرة: تُعرض داخل منطقة تمرير كي لا تطول النافذة.
+        main_box.append(
+            &ScrolledWindow::builder()
+                .hscrollbar_policy(gtk::PolicyType::Never)
+                .min_content_height(320)
+                .child(&settings_box)
+                .build(),
+        );
 
         // أزرار التحكم
         let action_box = GtkBox::new(Orientation::Horizontal, 10);
@@ -432,9 +462,68 @@ impl App {
                 entry.connect_changed(move |e| app.user_set(&k, json!(e.text().to_string())));
                 self.controls.borrow_mut().insert(key, Control::Text(entry));
             }
-            _ => return None, // أرقام: لا عنصر تحكم لها قبل المرحلة 5
+            Kind::Int { min, max, step } => {
+                let scale = Scale::with_range(
+                    Orientation::Horizontal,
+                    *min as f64,
+                    *max as f64,
+                    (*step).max(1) as f64,
+                );
+                self.slider_row(&row, &label, scale, key, 0);
+            }
+            Kind::Float { min, max } => {
+                let scale =
+                    Scale::with_range(Orientation::Horizontal, *min, *max, (max - min) / 100.0);
+                self.slider_row(&row, &label, scale, key, 2);
+            }
         }
         Some(row)
+    }
+
+    /// A slider for a number. The value is sent 250 ms after the last movement, so dragging does not flood the phone.
+    fn slider_row(
+        self: &Rc<Self>,
+        row: &GtkBox,
+        label: &str,
+        scale: Scale,
+        key: String,
+        digits: i32,
+    ) {
+        row.append(&row_label(label));
+        scale.set_hexpand(true);
+        scale.set_digits(digits);
+        scale.set_draw_value(true);
+        scale.set_value_pos(gtk::PositionType::Right);
+        row.append(&scale);
+        let app = self.clone();
+        let k = key.clone();
+        let pending: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
+        scale.connect_value_changed(move |sc| {
+            if app.refreshing.get() {
+                return;
+            }
+            if let Some(id) = pending.borrow_mut().take() {
+                id.remove();
+            }
+            let (app, k, sc, slot) = (app.clone(), k.clone(), sc.clone(), pending.clone());
+            let id =
+                glib::timeout_add_local_once(std::time::Duration::from_millis(250), move || {
+                    slot.borrow_mut().take();
+                    let v = sc.value();
+                    app.user_set(
+                        &k,
+                        if digits == 0 {
+                            json!(v.round() as i64)
+                        } else {
+                            json!((v * 100.0).round() / 100.0)
+                        },
+                    );
+                });
+            *pending.borrow_mut() = Some(id);
+        });
+        self.controls
+            .borrow_mut()
+            .insert(key, Control::Slider(scale));
     }
 
     /// Sets every control from the stored values (without counting that as a user change).
@@ -456,6 +545,13 @@ impl App {
                         }
                     }
                     Control::Toggle(c) => c.set_active(value.as_bool().unwrap_or(false)),
+                    Control::Slider(sc) => {
+                        if let Some(v) = value.as_f64() {
+                            if (sc.value() - v).abs() > 1e-9 {
+                                sc.set_value(v);
+                            }
+                        }
+                    }
                     Control::Text(e) => {
                         let text = value.as_str().unwrap_or("");
                         if e.text() != text {
@@ -588,6 +684,10 @@ impl App {
                     self.stop_slot.borrow_mut().take();
                     self.control_slot.borrow_mut().take();
                     *self.status.borrow_mut() = Status::Stopped;
+                    self.preview
+                        .borrow()
+                        .set_paintable(None::<&gtk::gdk::Paintable>);
+                    self.info_label.borrow().set_label("");
                 }
                 self.start_btn.borrow().set_sensitive(!running);
                 if running && matches!(*self.status.borrow(), Status::Stopped) {
@@ -596,6 +696,38 @@ impl App {
                 self.render_status();
             }
             UiEvent::Refresh => self.refresh_controls(),
+            UiEvent::Phone(info) => {
+                let mut parts: Vec<String> = Vec::new();
+                if let Some(b) = info.battery {
+                    parts.push(self.i18n.borrow().tr_args(
+                        "status-battery",
+                        &[("percent", b.to_string().as_str().into())],
+                    ));
+                }
+                if let Some(t) = info.temp_dc {
+                    parts.push(self.i18n.borrow().tr_args(
+                        "status-temperature",
+                        &[("degrees", format!("{:.1}", t as f64 / 10.0).as_str().into())],
+                    ));
+                }
+                if info.charging == Some(true) {
+                    parts.push(self.tr("status-charging"));
+                }
+                self.info_label.borrow().set_label(&parts.join(" · "));
+            }
+            UiEvent::Preview(rgb) => {
+                let (w, h) = (enki_receiver::PREVIEW_W, enki_receiver::PREVIEW_H);
+                if rgb.len() == w * h * 3 {
+                    let texture = gtk::gdk::MemoryTexture::new(
+                        w as i32,
+                        h as i32,
+                        gtk::gdk::MemoryFormat::R8g8b8,
+                        &glib::Bytes::from_owned(rgb),
+                        w * 3,
+                    );
+                    self.preview.borrow().set_paintable(Some(&texture));
+                }
+            }
             UiEvent::RolledBack { key, message } => {
                 self.refresh_controls();
                 let setting = self.tr(&setting_id(&key));
@@ -664,6 +796,7 @@ impl App {
                 enki_receiver::Facing::Back
             };
             cfg.settings = self.hub.clone();
+            cfg.preview = true;
             let text = self.i18n.borrow().tr_args(
                 "log-starting-enki",
                 &[
@@ -703,6 +836,8 @@ impl App {
                         }
                         Event::State(State::Stopped) => Some(UiEvent::Running(false)),
                         Event::State(_) | Event::Capabilities(_) => None,
+                        Event::Phone(info) => Some(UiEvent::Phone(info)),
+                        Event::Preview(rgb) => Some(UiEvent::Preview(rgb)),
                         Event::Problem(problem) => Some(UiEvent::Problem(problem)),
                         Event::Setting { .. } => Some(UiEvent::Refresh),
                         Event::SettingRolledBack { key, message, .. } => {

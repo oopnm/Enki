@@ -111,12 +111,78 @@ class LinkServer(
         synchronized(controls) { controls.toList() }.forEach { runCatching { it.send(message) } }
     }
 
+    /** Codec of the running encoder ("h264" or "hevc"), sent to a PC that connects while streaming. */
+    @Volatile private var lastCodec: String? = null
+
+    /** True while the phone is too hot and "lower quality when hot" is on. */
+    @Volatile private var phoneHot = false
+
+    private val phoneMonitor = PhoneMonitor(
+        context,
+        onBattery = { info -> broadcastBattery(info) },
+        onHot = { hot -> phoneHot = hot; synchronized(mediaLock) { activeMedia?.refreshLive() } },
+    )
+
+    private fun broadcastBattery(info: BatteryInfo) {
+        broadcastState(ControlMessages.stateInt("phone.battery", info.percent))
+        broadcastState(ControlMessages.stateInt("phone.temperature", info.tempDc))
+        broadcastState(ControlMessages.stateBool("phone.charging", info.charging))
+    }
+
     /** Owns the camera pipeline of one media connection and can swap it for the other camera while streaming. */
     private inner class MediaSession(private val queue: FrameQueue, private val onError: (String) -> Unit) {
-        private fun newStreamer() = CameraStreamer(
-            context, queue, facing, onError,
-            onBitrate = { kbps -> broadcastState(ControlMessages.stateInt("stream.bitrate", kbps)) },
-        )
+        /** The video settings of the running streamer, and the last ones that really produced a picture. */
+        @Volatile private var currentVideo: VideoConfig? = null
+        @Volatile private var lastGood: VideoConfig? = null
+
+        private fun newStreamer(): CameraStreamer {
+            val video = VideoConfig.read()
+            currentVideo = video
+            val target = targetBitrate(video)
+            return CameraStreamer(
+                context, queue, facing, { message -> onStreamError(message) },
+                onBitrate = { kbps -> broadcastState(ControlMessages.stateInt("stream.bitrate", kbps)) },
+                video = video,
+                onCodec = { codec ->
+                    lastCodec = codec
+                    broadcastState(ControlMessages.stateString("stream.codec", codec))
+                },
+                onStarted = { lastGood = video },
+                initialBitrate = target,
+            ).also { it.bitrateCeiling = ceilingFor(target) }
+        }
+
+        private fun ceilingFor(target: Int): Int =
+            if (phoneHot && EnkiSettings.getBool("phone.thermal_reduce")) maxOf(500_000, target / 2) else Int.MAX_VALUE
+
+        /**
+         * A new resolution, frame rate or codec that the phone cannot deliver goes back to the last working one,
+         * through the normal settings path, so the PC and the screen show the value that is really in use.
+         */
+        private fun onStreamError(message: String) {
+            val good = lastGood
+            if (good != null && good != currentVideo) {
+                Thread {
+                    EnkiSettings.setByUser("video.resolution", "${good.height}p")
+                    EnkiSettings.setByUser("video.fps", good.fps.toString())
+                    EnkiSettings.setByUser("video.codec", if (good.hevc) "hevc" else "h264")
+                }.start()
+            } else {
+                onError(message)
+            }
+        }
+
+        /** Applies the camera controls and the bit rate to the running stream without restarting it. */
+        fun refreshLive() {
+            synchronized(mediaLock) {
+                val s = streamer ?: return
+                val video = currentVideo ?: return
+                val target = targetBitrate(video)
+                s.bitrateTarget = target
+                s.bitrateCeiling = ceilingFor(target)
+                s.applyLens(LensControls.read())
+            }
+        }
 
         private var streamer: CameraStreamer? = null
         private var closed = false
@@ -140,6 +206,35 @@ class LinkServer(
                 closed = true
                 streamer?.stop()
                 streamer = null
+                lastCodec = null
+            }
+        }
+    }
+
+    private val restartPending = AtomicBoolean(false)
+
+    /**
+     * A setting that changes the stream itself: resolution, frame rate and codec restart the encoder (several changes
+     * made together restart it once); the camera controls and the bit rate are applied to the running stream.
+     */
+    private fun applyStreamSetting(key: String) {
+        when (key) {
+            "video.resolution", "video.fps", "video.codec" -> {
+                if (!restartPending.compareAndSet(false, true)) return
+                try {
+                    notifier.execute {
+                        Thread.sleep(150)
+                        restartPending.set(false)
+                        synchronized(mediaLock) { activeMedia?.switchCamera() }
+                    }
+                } catch (e: RejectedExecutionException) {
+                    restartPending.set(false)
+                }
+            }
+            "video.bitrate_mode", "video.bitrate_kbps", "phone.thermal_reduce" ->
+                synchronized(mediaLock) { activeMedia?.refreshLive() }
+            else -> if (key.startsWith("camera.") && key != "camera.facing") {
+                synchronized(mediaLock) { activeMedia?.refreshLive() }
             }
         }
     }
@@ -166,6 +261,7 @@ class LinkServer(
         synchronized(mediaLock) { facing = EnkiSettings.getString("camera.facing").ifEmpty { "back" } }
         EnkiSettings.userChangeListener = { entry, key, value -> onUserChange(entry, key, value) }
         deviceOrientation.enable()
+        phoneMonitor.enable()
         Thread({ acceptLoop(s) }, "enki-accept").start()
         status(WAITING)
     }
@@ -174,6 +270,7 @@ class LinkServer(
         if (!stopped.compareAndSet(false, true)) return
         EnkiSettings.userChangeListener = null
         deviceOrientation.disable()
+        phoneMonitor.disable()
         SessionToken.clear()
         notifier.shutdownNow()
         runCatching { server?.close() }
@@ -276,6 +373,12 @@ class LinkServer(
             control.send(runCatching { capabilitiesJson }.getOrElse { ControlMessages.capabilities(Capabilities(emptyList(), emptyList())) })
             // What this phone has set; the PC answers with only what it has newer or the phone lacks.
             control.send(ControlMessages.settingsSnapshot(false, EnkiSettings.snapshot()))
+            lastCodec?.let { control.send(ControlMessages.stateString("stream.codec", it)) }
+            phoneMonitor.latest?.let {
+                control.send(ControlMessages.stateInt("phone.battery", it.percent))
+                control.send(ControlMessages.stateInt("phone.temperature", it.tempDc))
+                control.send(ControlMessages.stateBool("phone.charging", it.charging))
+            }
             socket.soTimeout = CONTROL_TIMEOUT_MS
             while (true) {
                 val len = input.readInt()
@@ -320,6 +423,7 @@ class LinkServer(
         try {
             notifier.execute {
                 if (entry != null) broadcastState(ControlMessages.setting(entry))
+                applyStreamSetting(key)
                 if (key == "camera.facing" && value is String) {
                     setFacing(value)
                     broadcastRotation()
@@ -332,6 +436,7 @@ class LinkServer(
 
     /** A change from the PC that was accepted (or rolled back): make it real. Only the camera needs the phone. */
     private fun applyEffect(control: ControlOut, key: String, value: Any) {
+        applyStreamSetting(key)
         if (key != "camera.facing" || value !is String) return
         setFacing(value)
         // The rotation depends on the camera, so it goes out first; the PC waits for the facing confirmation.
@@ -360,7 +465,7 @@ class LinkServer(
         val array = message.optJSONArray("settings") ?: return
         val entries = (0 until array.length()).mapNotNull { i -> array.optJSONObject(i)?.let { parseEntry(it) } }
         val merge = EnkiSettings.mergeSnapshot(entries)
-        merge.changed.firstOrNull { it.first == "camera.facing" }?.let { applyEffect(control, it.first, it.second) }
+        merge.changed.forEach { applyEffect(control, it.first, it.second) }
     }
 
     private fun parseEntry(o: JSONObject): SettingEntry? = try {

@@ -70,6 +70,8 @@ object ControlMessages {
 
     fun stateInt(key: String, value: Int): String = """{"type":"state","key":${quote(key)},"value":$value}"""
 
+    fun stateBool(key: String, value: Boolean): String = """{"type":"state","key":${quote(key)},"value":$value}"""
+
     fun stateString(key: String, value: String): String =
         """{"type":"state","key":${quote(key)},"value":${quote(value)}}"""
 

@@ -8,6 +8,9 @@ import android.os.Build
 import android.os.Bundle
 import android.view.Gravity
 import android.view.View
+import android.view.WindowManager
+import android.widget.FrameLayout
+import android.widget.SeekBar
 import android.widget.AdapterView
 import android.widget.ArrayAdapter
 import android.widget.Button
@@ -31,6 +34,9 @@ class MainActivity : Activity() {
     private lateinit var statusView: TextView
     private lateinit var toggle: Button
     private lateinit var settingsBox: LinearLayout
+
+    /** Covers the whole screen in black while "black screen" is on and the phone is streaming. */
+    private lateinit var blackout: View
 
     /** True while the controls are being set from the stored values, so that does not count as a user change. */
     private var rendering = false
@@ -71,7 +77,27 @@ class MainActivity : Activity() {
             addView(settingsBox)
             addView(hint)
         }
-        setContentView(ScrollView(this).apply { addView(column) })
+        blackout = View(this).apply {
+            setBackgroundColor(0xFF000000.toInt())
+            isClickable = true // swallow touches so nothing behind it is pressed by accident
+            visibility = View.GONE
+            setOnLongClickListener {
+                EnkiSettings.setByUser("phone.black_screen", false) // a long press brings the screen back
+                true
+            }
+        }
+        setContentView(
+            FrameLayout(this).apply {
+                addView(ScrollView(this@MainActivity).apply { addView(column) })
+                addView(blackout, FrameLayout.LayoutParams(-1, -1))
+            },
+        )
+        // "Start streaming when the app opens": only if the camera permission is already granted.
+        if (EnkiSettings.getBool("phone.auto_start") && !EnkiState.running &&
+            checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
+        ) {
+            StreamService.start(this)
+        }
     }
 
     override fun onStart() {
@@ -91,6 +117,20 @@ class MainActivity : Activity() {
     private fun render() {
         statusView.text = EnkiState.status
         toggle.text = getString(if (EnkiState.running) R.string.stop else R.string.start)
+        applyScreenSettings()
+    }
+
+    /** Keep-screen-on and black-screen only matter while streaming; both are synced settings. */
+    private fun applyScreenSettings() {
+        val streaming = EnkiState.running
+        val keepOn = streaming && EnkiSettings.getBool("phone.keep_screen_on")
+        val black = streaming && EnkiSettings.getBool("phone.black_screen")
+        if (keepOn || black) window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        else window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        window.attributes = window.attributes.apply {
+            screenBrightness = if (black) 0.01f else WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE
+        }
+        blackout.visibility = if (black) View.VISIBLE else View.GONE
     }
 
     // ---- settings screen, built from the shared schema ----
@@ -107,6 +147,7 @@ class MainActivity : Activity() {
     private fun valueLabel(def: SettingDef, value: String) = stringByName("setting_${resName(def.key)}__$value") ?: value
 
     private fun renderSettings() {
+        applyScreenSettings()
         rendering = true
         settingsBox.removeAllViews()
         val pad = (12 * resources.displayMetrics.density).toInt()
@@ -164,9 +205,57 @@ class MainActivity : Activity() {
                     },
                 )
             }
-            else -> {} // numbers and text have no control on the phone yet (phase 5)
+            is SettingKind.Whole -> return sliderRow(def, label, kind.min.toDouble(), kind.max.toDouble(), kind.step.toDouble(), 0)
+            is SettingKind.Decimal -> return sliderRow(def, label, kind.min, kind.max, (kind.max - kind.min) / 100.0, 2)
+            else -> {} // text has no control on the phone
         }
         return row
+    }
+
+    /**
+     * A label with its value and a slider under it. The value shows while dragging; the change is sent when the
+     * finger lifts, so the PC and the camera get one change instead of a flood.
+     */
+    private fun sliderRow(def: SettingDef, label: TextView, min: Double, max: Double, step: Double, digits: Int): View {
+        val column = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        val value = TextView(this).apply { textSize = 14f }
+        val top = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            (label.parent as? LinearLayout)?.removeView(label)
+            addView(label)
+            addView(value)
+        }
+        fun show(v: Double) { value.text = if (digits == 0) v.toLong().toString() else "%.${digits}f".format(v) }
+        val steps = Math.round((max - min) / step).toInt()
+        val current = (EnkiSettings.get(def.key) as? Number)?.toDouble() ?: min
+        show(current)
+        val bar = SeekBar(this).apply {
+            this.max = steps
+            progress = Math.round((current - min) / step).toInt().coerceIn(0, steps)
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                private fun at(p: Int) = (min + p * step).coerceIn(min, max)
+
+                override fun onProgressChanged(b: SeekBar, p: Int, fromUser: Boolean) {
+                    if (fromUser) show(at(p))
+                }
+
+                override fun onStartTrackingTouch(b: SeekBar) {}
+
+                override fun onStopTrackingTouch(b: SeekBar) {
+                    if (rendering) return
+                    val v = at(b.progress)
+                    val sent: Any = if (digits == 0) Math.round(v) else Math.round(v * 100) / 100.0
+                    commit(def, sent) {
+                        val now = (EnkiSettings.get(def.key) as? Number)?.toDouble() ?: min
+                        b.progress = Math.round((now - min) / step).toInt().coerceIn(0, steps)
+                        show(now)
+                    }
+                }
+            })
+        }
+        column.addView(top)
+        column.addView(bar)
+        return column
     }
 
     /** A change made on the screen. A refusal shows its reason and puts the control back. */

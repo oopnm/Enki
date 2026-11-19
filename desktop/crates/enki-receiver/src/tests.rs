@@ -245,9 +245,8 @@ fn live(facing: Facing, auto_rotate: bool, phone_rotation: Option<u16>) -> Live 
     Live {
         facing,
         auto_rotate,
-        rotate: None,
-        mirror: None,
         phone_rotation,
+        ..Live::default()
     }
 }
 

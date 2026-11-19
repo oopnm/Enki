@@ -22,6 +22,9 @@ use tokio::net::TcpStream;
 use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot, Notify};
 
+mod look;
+pub use look::{Codec, Filters, Look, PREVIEW_H, PREVIEW_W};
+
 use enki_settings::{Applied, Hub, Reject, RejectCode, SettingsHandle};
 
 pub use enki_protocol::control::Capabilities;
@@ -66,7 +69,7 @@ pub enum Control {
     Set(String, Value),
 }
 
-/// Settings that can change while streaming. The decoder is restarted when they change the picture orientation.
+/// Settings that can change while streaming. The decoder is restarted when they change the picture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Live {
     facing: Facing,
@@ -77,6 +80,40 @@ struct Live {
     mirror: Option<bool>,
     /// Clockwise rotation the phone asked for (from its orientation sensor), if it reported one.
     phone_rotation: Option<u16>,
+    flip: bool,
+    filters: Filters,
+    fps: u32,
+    /// Output height: 480, 720 or 1080.
+    resolution: u32,
+    /// What the phone's encoder produces now (it announces it with `stream.codec`).
+    codec: Codec,
+}
+
+impl Default for Live {
+    fn default() -> Self {
+        Live {
+            facing: Facing::Back,
+            auto_rotate: false,
+            rotate: None,
+            mirror: None,
+            phone_rotation: None,
+            flip: false,
+            filters: Filters::default(),
+            fps: 30,
+            resolution: 720,
+            codec: Codec::H264,
+        }
+    }
+}
+
+/// What the phone reports about itself, for the window's status line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PhoneInfo {
+    /// Battery level in percent.
+    pub battery: Option<u8>,
+    /// Battery temperature in tenths of a degree Celsius.
+    pub temp_dc: Option<i32>,
+    pub charging: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -85,7 +122,10 @@ pub struct Config {
     pub device: String,
     pub port: u16,
     /// Frame rate the decoder assumes (the stream carries no reliable rate in the H.264 headers).
+    /// Unused since the frame rate became the synced setting `video.fps`; kept so callers still compile.
     pub fps: u32,
+    /// Also produce the small live preview (`Event::Preview`). The window turns this on; tests leave it off.
+    pub preview: bool,
     /// Which phone camera to use at the start (can be changed live with [`Control::SetFacing`]). When it differs
     /// from the stored `camera.facing` it counts as the user's choice now and replaces it.
     pub facing: Facing,
@@ -116,6 +156,7 @@ impl Config {
             device: device.into(),
             port: DEFAULT_PORT,
             fps: 30,
+            preview: false,
             facing: Facing::Back,
             rotate: None,
             mirror: None,
@@ -234,6 +275,10 @@ pub enum Event {
         code: String,
         message: String,
     },
+    /// The phone's battery and temperature (sent when they change).
+    Phone(PhoneInfo),
+    /// A frame of the live preview: `PREVIEW_W * PREVIEW_H * 3` bytes of RGB.
+    Preview(Vec<u8>),
     /// The session ended because of this; also logged.
     Problem(Problem),
 }
@@ -259,6 +304,8 @@ struct Shared {
     rtt_ms: AtomicU32,
     /// Bit rate the phone reported for its encoder, in kbit/s (0 = unknown).
     bitrate_kbps: AtomicU32,
+    /// Battery and temperature last reported by the phone.
+    phone: std::sync::Mutex<PhoneInfo>,
     /// Sequence number of the last ping and when it was sent.
     ping: std::sync::Mutex<(u64, Option<Instant>)>,
 }
@@ -274,6 +321,7 @@ impl Shared {
             last_seen_ms: AtomicU64::new(0),
             rtt_ms: AtomicU32::new(0),
             bitrate_kbps: AtomicU32::new(0),
+            phone: std::sync::Mutex::new(PhoneInfo::default()),
             ping: std::sync::Mutex::new((0, None)),
         }
     }
@@ -311,7 +359,11 @@ impl Shared {
         self.rtt_ms.store(0, Ordering::Relaxed);
         self.bitrate_kbps.store(0, Ordering::Relaxed);
         self.peer_settings.store(false, Ordering::Relaxed);
-        self.live.send_modify(|l| l.phone_rotation = None); // a rotation from an earlier connection is stale
+        self.live.send_modify(|l| {
+            l.phone_rotation = None; // a rotation from an earlier connection is stale
+            l.codec = Codec::H264;
+        });
+        *self.phone.lock().unwrap() = PhoneInfo::default();
         self.touch();
     }
 }
@@ -334,9 +386,7 @@ pub async fn run_with_commands(
         Live {
             facing: cfg.facing,
             auto_rotate: cfg.auto_rotate,
-            rotate: None,
-            mirror: None,
-            phone_rotation: None,
+            ..Live::default()
         },
         cfg.settings.clone(),
     ));
@@ -394,26 +444,55 @@ fn seed_settings(cfg: &Config) {
 
 /// Copies the settings that shape the picture into the live state the decoder watches.
 fn sync_live(shared: &Shared) {
-    let (facing, auto_rotate, rotate, mirror) = {
-        let hub = shared.hub.lock().unwrap();
-        let facing = if hub.get_string("camera.facing") == "front" {
-            Facing::Front
-        } else {
-            Facing::Back
-        };
-        let rotate = hub.get_string("video.rotate").parse::<u16>().ok();
-        let mirror = match hub.get_string("video.mirror").as_str() {
-            "on" => Some(true),
-            "off" => Some(false),
-            _ => None,
-        };
-        (facing, hub.get_bool("video.auto_rotate"), rotate, mirror)
+    let hub = shared.hub.lock().unwrap();
+    let facing = if hub.get_string("camera.facing") == "front" {
+        Facing::Front
+    } else {
+        Facing::Back
     };
+    let rotate = hub.get_string("video.rotate").parse::<u16>().ok();
+    let mirror = match hub.get_string("video.mirror").as_str() {
+        "on" => Some(true),
+        "off" => Some(false),
+        _ => None,
+    };
+    let hundredths = |key: &str, default: i32| {
+        hub.get(key)
+            .and_then(|v| v.as_f64())
+            .map(|v| (v * 100.0).round() as i32)
+            .unwrap_or(default)
+    };
+    let filters = Filters {
+        brightness: hundredths("filter.brightness", 0),
+        contrast: hundredths("filter.contrast", 100),
+        saturation: hundredths("filter.saturation", 100),
+        sharpness: hundredths("filter.sharpness", 0),
+        crop: hub
+            .get("filter.crop")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0)
+            .min(50) as u32,
+    };
+    let fps = hub.get_string("video.fps").parse::<u32>().unwrap_or(30);
+    let resolution = match hub.get_string("video.resolution").as_str() {
+        "480p" => 480,
+        "1080p" => 1080,
+        _ => 720,
+    };
+    let (auto_rotate, flip) = (
+        hub.get_bool("video.auto_rotate"),
+        hub.get_bool("video.flip"),
+    );
+    drop(hub);
     shared.live.send_modify(|l| {
         l.facing = facing;
         l.auto_rotate = auto_rotate;
         l.rotate = rotate;
         l.mirror = mirror;
+        l.flip = flip;
+        l.filters = filters;
+        l.fps = fps;
+        l.resolution = resolution;
     });
 }
 
@@ -502,6 +581,23 @@ fn handle_message(shared: &Shared, tx: &Tx, message: Message) -> Vec<Message> {
                         .live
                         .send_modify(|l| l.phone_rotation = Some(rotation));
                 }
+            }
+            "stream.codec" => {
+                if let Some(codec) = value.as_str().and_then(Codec::from_wire) {
+                    shared.live.send_modify(|l| l.codec = codec);
+                }
+            }
+            "phone.battery" | "phone.temperature" | "phone.charging" => {
+                let info = {
+                    let mut info = shared.phone.lock().unwrap();
+                    match key.as_str() {
+                        "phone.battery" => info.battery = value.as_u64().map(|v| v.min(100) as u8),
+                        "phone.temperature" => info.temp_dc = value.as_i64().map(|v| v as i32),
+                        _ => info.charging = value.as_bool(),
+                    }
+                    *info
+                };
+                let _ = tx.send(Event::Phone(info));
             }
             "stream.bitrate" => {
                 if let Some(kbps) = value.as_u64() {
@@ -1049,12 +1145,17 @@ struct Sink {
 }
 
 impl Sink {
-    async fn spawn(cfg: &Config, (rotate, mirror): (u16, bool), tx: &Tx) -> Result<Sink, Problem> {
-        let (program, args) = sink_command(cfg, rotate, mirror);
+    async fn spawn(cfg: &Config, look: &Look, tx: &Tx) -> Result<Sink, Problem> {
+        let (program, args) = sink_command(cfg, look);
+        let preview = look.preview && cfg.sink_override.is_none();
         let mut child = Command::new(&program)
             .args(&args)
             .stdin(Stdio::piped())
-            .stdout(Stdio::null())
+            .stdout(if preview {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
@@ -1078,6 +1179,17 @@ impl Sink {
                 let mut lines = BufReader::new(stderr).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
                     log(&tx, format!("⚠️ {line}\n"));
+                }
+            });
+        }
+        if let (true, Some(mut stdout)) = (preview, child.stdout.take()) {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let mut frame = vec![0u8; PREVIEW_W * PREVIEW_H * 3];
+                while stdout.read_exact(&mut frame).await.is_ok() {
+                    if tx.send(Event::Preview(frame.clone())).is_err() {
+                        break;
+                    }
                 }
             });
         }
@@ -1108,8 +1220,8 @@ async fn session(
     shared: &Arc<Shared>,
 ) -> Result<u64, Problem> {
     let mut live_rx = shared.live.subscribe();
-    let mut current = orientation(&live_rx.borrow_and_update());
-    let mut sink = Sink::spawn(cfg, current, tx).await?;
+    let mut current = look(&live_rx.borrow_and_update(), cfg.preview);
+    let mut sink = Sink::spawn(cfg, &current, tx).await?;
 
     log(tx, format!("✓ اتصل بالهاتف، البث إلى {}\n", cfg.device));
     let _ = tx.send(Event::State(State::Streaming));
@@ -1179,7 +1291,7 @@ async fn pump_frames(
     cfg: &Config,
     tx: &Tx,
     live_rx: &mut tokio::sync::watch::Receiver<Live>,
-    current: &mut (u16, bool),
+    current: &mut Look,
 ) -> Result<(), PumpError> {
     let mut header = [0u8; FRAME_HEADER_LEN];
     let mut payload = Vec::new();
@@ -1200,11 +1312,11 @@ async fn pump_frames(
         // The picture orientation depends on the camera and on how the phone is held. It can only change by
         // restarting the decoder, which only happens when the resulting orientation really differs.
         if live_rx.has_changed().unwrap_or(false) {
-            let wanted = orientation(&live_rx.borrow_and_update());
+            let wanted = look(&live_rx.borrow_and_update(), cfg.preview);
             if wanted != *current {
                 *current = wanted;
                 sink.stop().await;
-                *sink = Sink::spawn(cfg, wanted, tx)
+                *sink = Sink::spawn(cfg, &wanted, tx)
                     .await
                     .map_err(PumpError::Fatal)?;
                 wait_for_config = true;
@@ -1274,71 +1386,48 @@ async fn report_stats(counters: Arc<Counters>, shared: Arc<Shared>, tx: Tx) {
     }
 }
 
-fn sink_command(cfg: &Config, rotate: u16, mirror: bool) -> (String, Vec<String>) {
+fn sink_command(cfg: &Config, look: &Look) -> (String, Vec<String>) {
     match &cfg.sink_override {
         Some((program, args)) => (program.clone(), args.clone()),
-        None => (
-            cfg.ffmpeg.clone(),
-            ffmpeg_args(&cfg.device, cfg.fps, rotate, mirror),
-        ),
+        None => (cfg.ffmpeg.clone(), look::ffmpeg_args_for(&cfg.device, look)),
     }
 }
 
-/// ffmpeg arguments tuned for live use: no probing delay and no decoder-side buffering.
-/// `-framerate` matters: without it ffmpeg cannot timestamp the raw H.264 and drops almost every frame.
-/// The filter chain pins the output size, so it stays constant when the phone switches camera or the picture is rotated.
+/// The settings that shape the picture, as the decoder needs them.
+fn look(live: &Live, preview: bool) -> Look {
+    let (rotate, mirror) = orientation(live);
+    Look {
+        rotate,
+        mirror,
+        flip: live.flip,
+        filters: live.filters,
+        codec: live.codec,
+        fps: live.fps,
+        out_height: live.resolution,
+        preview,
+    }
+}
+
+/// Plain ffmpeg arguments for a rotation and mirror, everything else at its default (720p, 30 fps, no preview).
 pub fn ffmpeg_args(device: &str, fps: u32, rotate: u16, mirror: bool) -> Vec<String> {
-    [
-        "-hide_banner",
-        "-loglevel",
-        "warning",
-        "-fflags",
-        "nobuffer",
-        "-flags",
-        "low_delay",
-        "-probesize",
-        "200000",
-        "-analyzeduration",
-        "0",
-        "-framerate",
-        &fps.to_string(),
-        "-f",
-        "h264",
-        "-i",
-        "-",
-        "-vf",
-        &video_filter(rotate, mirror),
-        "-pix_fmt",
-        "yuv420p",
-        "-fps_mode",
-        "passthrough",
-        "-f",
-        "v4l2",
+    look::ffmpeg_args_for(
         device,
-    ]
-    .iter()
-    .map(|s| s.to_string())
-    .collect()
+        &Look {
+            rotate,
+            mirror,
+            fps,
+            ..Look::default()
+        },
+    )
 }
 
-/// Rotation, mirror, then a fit into a fixed 1280x720 frame with black bars. The size never changes, whatever the
-/// rotation or camera, because programs that already opened the V4L2 device expect the size they negotiated;
-/// a different frame size shows up as a garbled picture.
+#[cfg(test)]
 fn video_filter(rotate: u16, mirror: bool) -> String {
-    let mut chain: Vec<&str> = Vec::new();
-    match rotate % 360 {
-        90 => chain.push("transpose=1"),
-        180 => chain.extend(["hflip", "vflip"]),
-        270 => chain.push("transpose=2"),
-        _ => {}
-    }
-    if mirror {
-        chain.push("hflip");
-    }
-    chain.push("scale=1280:720:force_original_aspect_ratio=decrease:force_divisible_by=2");
-    chain.push("pad=1280:720:(ow-iw)/2:(oh-ih)/2");
-    chain.push("setsar=1");
-    chain.join(",")
+    look::filter_chain(&Look {
+        rotate,
+        mirror,
+        ..Look::default()
+    })
 }
 
 /// V4L2 devices on this system as `(path, name)`, ordered by number.
