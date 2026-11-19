@@ -132,3 +132,4 @@ setting-phone-auto-start = 打开应用时自动开始
 status-battery = 电量 { $percent }%
 status-temperature = 温度 { $degrees } °C
 status-charging = 充电中
+setting-video-fps--120 = 120 帧/秒(高速模式,720p)

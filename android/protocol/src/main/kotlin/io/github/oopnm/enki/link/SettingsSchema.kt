@@ -8,7 +8,7 @@ object SettingsSchema {
     val defs: List<SettingDef> = listOf(
         SettingDef("camera.facing", "video", SettingKind.Choice(listOf("back", "front")), "back", Scope.SYNCED, Apply.LIVE, true),
         SettingDef("video.resolution", "video", SettingKind.Choice(listOf("480p", "720p", "1080p")), "720p", Scope.SYNCED, Apply.RESTART, true),
-        SettingDef("video.fps", "video", SettingKind.Choice(listOf("15", "24", "30", "60")), "30", Scope.SYNCED, Apply.RESTART, true),
+        SettingDef("video.fps", "video", SettingKind.Choice(listOf("15", "24", "30", "60", "120")), "30", Scope.SYNCED, Apply.RESTART, true),
         SettingDef("video.codec", "video", SettingKind.Choice(listOf("h264", "hevc")), "h264", Scope.SYNCED, Apply.RESTART, true),
         SettingDef("video.bitrate_mode", "video", SettingKind.Choice(listOf("auto", "manual")), "auto", Scope.SYNCED, Apply.LIVE, true),
         SettingDef("video.bitrate_kbps", "video", SettingKind.Whole(500L, 20000L, 100L), 4000L, Scope.SYNCED, Apply.LIVE, true),

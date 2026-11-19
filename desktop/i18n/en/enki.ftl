@@ -135,3 +135,4 @@ setting-phone-auto-start = Start streaming when the app opens
 status-battery = Battery { $percent }%
 status-temperature = Temperature { $degrees } °C
 status-charging = Charging
+setting-video-fps--120 = 120 fps (high-speed mode, 720p)

@@ -96,4 +96,5 @@
     <string name="setting_phone_black_screen">黑屏模式(省电)</string>
     <string name="setting_phone_thermal_reduce">手机过热时自动降低画质</string>
     <string name="setting_phone_auto_start">打开应用时自动开始</string>
+    <string name="setting_video_fps__120">120 帧/秒(高速模式,720p)</string>
 </resources>

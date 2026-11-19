@@ -114,10 +114,8 @@ impl Look {
     }
 }
 
-/// The filter chain: orientation, flip, crop, colour, sharpness, then a fit into the fixed output frame with black
-/// bars. The frame size only changes when the user picks another resolution, because programs that already opened
-/// the V4L2 device expect the size they negotiated.
-pub fn filter_chain(look: &Look) -> String {
+/// The filters that change the picture itself: orientation, flip, crop, colour, sharpness.
+fn adjust_chain(look: &Look) -> Vec<String> {
     let mut chain: Vec<String> = Vec::new();
     match look.rotate % 360 {
         90 => chain.push("transpose=1".into()),
@@ -155,6 +153,14 @@ pub fn filter_chain(look: &Look) -> String {
             f.sharpness as f64 / 100.0
         ));
     }
+    chain
+}
+
+/// The filter chain: the adjustments, then a fit into the fixed output frame with black bars. The frame size only
+/// changes when the user picks another resolution, because programs that already opened the V4L2 device expect the
+/// size they negotiated.
+pub fn filter_chain(look: &Look) -> String {
+    let mut chain = adjust_chain(look);
     let (w, h) = look.out_size();
     chain.push(format!(
         "scale={w}:{h}:force_original_aspect_ratio=decrease:force_divisible_by=2"
@@ -164,9 +170,7 @@ pub fn filter_chain(look: &Look) -> String {
     chain.join(",")
 }
 
-/// ffmpeg arguments tuned for live use: no probing delay and no decoder-side buffering.
-/// `-framerate` matters: without it ffmpeg cannot timestamp the raw stream and drops almost every frame.
-pub fn ffmpeg_args_for(device: &str, look: &Look) -> Vec<String> {
+fn input_args(look: &Look) -> Vec<String> {
     let mut args: Vec<String> = [
         "-hide_banner",
         "-loglevel",
@@ -186,18 +190,15 @@ pub fn ffmpeg_args_for(device: &str, look: &Look) -> Vec<String> {
     .collect();
     args.push(look.fps.to_string());
     args.extend(["-f", look.codec.demuxer(), "-i", "-"].map(String::from));
-    let chain = filter_chain(look);
-    if look.preview {
-        args.push("-filter_complex".into());
-        args.push(format!(
-            "[0:v]{chain},split=2[o][p];[p]fps={PREVIEW_FPS},scale={PREVIEW_W}:{PREVIEW_H}:force_original_aspect_ratio=decrease,\
-             pad={PREVIEW_W}:{PREVIEW_H}:(ow-iw)/2:(oh-ih)/2,format=rgb24[pv]"
-        ));
-        args.extend(["-map", "[o]"].map(String::from));
-    } else {
-        args.push("-vf".into());
-        args.push(chain);
-    }
+    args
+}
+
+/// ffmpeg arguments tuned for live use: no probing delay and no decoder-side buffering.
+/// `-framerate` matters: without it ffmpeg cannot timestamp the raw stream and drops almost every frame.
+pub fn ffmpeg_args_for(device: &str, look: &Look) -> Vec<String> {
+    let mut args = input_args(look);
+    args.push("-vf".into());
+    args.push(filter_chain(look));
     args.extend(
         [
             "-pix_fmt",
@@ -210,9 +211,23 @@ pub fn ffmpeg_args_for(device: &str, look: &Look) -> Vec<String> {
         .map(String::from),
     );
     args.push(device.to_string());
-    if look.preview {
-        args.extend(["-map", "[pv]", "-f", "rawvideo", "pipe:1"].map(String::from));
-    }
+    args
+}
+
+/// The preview is made by a second, independent ffmpeg that decodes the same stream: if it ever stalls or dies, the
+/// camera picture is not affected. Output: [`PREVIEW_W`]x[`PREVIEW_H`] RGB24 frames on stdout.
+pub fn preview_args(look: &Look) -> Vec<String> {
+    let mut args = input_args(look);
+    let mut chain = adjust_chain(look);
+    chain.push(format!("fps={PREVIEW_FPS}"));
+    chain.push(format!(
+        "scale={PREVIEW_W}:{PREVIEW_H}:force_original_aspect_ratio=decrease"
+    ));
+    chain.push(format!("pad={PREVIEW_W}:{PREVIEW_H}:(ow-iw)/2:(oh-ih)/2"));
+    chain.push("format=rgb24".into());
+    args.push("-vf".into());
+    args.push(chain.join(","));
+    args.extend(["-f", "rawvideo", "pipe:1"].map(String::from));
     args
 }
 
@@ -322,18 +337,13 @@ mod tests {
     }
 
     #[test]
-    fn preview_adds_a_second_small_output_on_stdout() {
-        let args = ffmpeg_args_for(
-            "/dev/video10",
-            &Look {
-                preview: true,
-                ..Look::default()
-            },
-        );
-        let s = args.join(" ");
-        assert!(s.contains("split=2[o][p]"));
-        assert!(s.contains("-map [o] -pix_fmt yuv420p -fps_mode passthrough -f v4l2 /dev/video10 -map [pv] -f rawvideo pipe:1"));
-        assert!(!s.contains("-vf "));
+    fn preview_is_its_own_small_rgb_output() {
+        let args = preview_args(&Look::default()).join(" ");
+        assert!(args.contains("fps=10,scale=320:180"));
+        assert!(args.ends_with("format=rgb24 -f rawvideo pipe:1"));
+        assert!(!ffmpeg_args_for("/dev/video10", &Look::default())
+            .join(" ")
+            .contains("pipe:1"));
     }
 
     /// Runs the real ffmpeg (when installed) on a generated stream: the graph must be valid and the preview must be
@@ -406,6 +416,11 @@ mod tests {
             .stdin(std::fs::File::open(&src).unwrap())
             .output()
             .unwrap();
+        let preview = Command::new("ffmpeg")
+            .args(preview_args(&look))
+            .stdin(std::fs::File::open(&src).unwrap())
+            .output()
+            .unwrap();
         let _ = std::fs::remove_dir_all(&dir);
         assert!(
             run.status.success(),
@@ -413,10 +428,10 @@ mod tests {
             String::from_utf8_lossy(&run.stderr)
         );
         assert!(
-            !run.stdout.is_empty(),
+            preview.status.success() && !preview.stdout.is_empty(),
             "no preview; ffmpeg said: {}",
-            String::from_utf8_lossy(&run.stderr)
+            String::from_utf8_lossy(&preview.stderr)
         );
-        assert_eq!(run.stdout.len() % (PREVIEW_W * PREVIEW_H * 3), 0);
+        assert_eq!(preview.stdout.len() % (PREVIEW_W * PREVIEW_H * 3), 0);
     }
 }

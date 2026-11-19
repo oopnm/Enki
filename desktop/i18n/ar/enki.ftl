@@ -132,3 +132,4 @@ setting-phone-auto-start = بدء البث عند فتح التطبيق
 status-battery = البطارية { $percent }٪
 status-temperature = الحرارة { $degrees } °م
 status-charging = قيد الشحن
+setting-video-fps--120 = 120 إطار/ث (وضع عالي السرعة، 720p)
