@@ -97,8 +97,10 @@ class MainActivity : Activity() {
         }
         previewFrame = FrameLayout(this).apply {
             setBackgroundColor(0xFF000000.toInt())
-            layoutParams = LinearLayout.LayoutParams(-1, (180 * dp).toInt()).apply { topMargin = pad / 2; bottomMargin = pad / 2 }
+            layoutParams = LinearLayout.LayoutParams(-1, (300 * dp).toInt()).apply { topMargin = pad / 2; bottomMargin = pad / 2 }
+            // The texture keeps the camera's own landscape 16:9 shape; it is turned and shrunk in applyPreviewLook.
             addView(previewView, FrameLayout.LayoutParams((320 * dp).toInt(), (180 * dp).toInt(), Gravity.CENTER))
+            addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> applyPreviewLook() }
         }
         val column = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -135,7 +137,6 @@ class MainActivity : Activity() {
 
     override fun onStart() {
         super.onStart()
-        PreviewBridge.onLook = { runOnUiThread { applyPreviewLook() } }
         EnkiState.listener = { runOnUiThread { render() } }
         EnkiSettings.changeListeners.add(redraw)
         render()
@@ -143,7 +144,6 @@ class MainActivity : Activity() {
     }
 
     override fun onStop() {
-        PreviewBridge.onLook = null
         EnkiState.listener = null
         EnkiSettings.changeListeners.remove(redraw)
         super.onStop()
@@ -169,17 +169,40 @@ class MainActivity : Activity() {
         // The preview exists only while it is wanted and visible: a hidden view gives its texture back to the system.
         previewFrame.visibility =
             if (EnkiSettings.getBool("phone.show_preview") && !black) View.VISIBLE else View.GONE
+        applyPreviewLook()
     }
 
-    /** Turns and mirrors the preview so it is upright, like the picture the PC gets. */
+    /**
+     * Turns the preview so it is upright on this screen, like a camera app: the picture follows the screen, not the
+     * way the phone is held (that is what the PC picture does). The front camera is shown mirrored.
+     */
     private fun applyPreviewLook() {
-        val r = PreviewBridge.rotation
-        // A quarter turn makes the 16:9 picture taller than the frame: shrink it to fit.
-        val fit = if (r % 180 == 0) 1f else 9f / 16f
+        val front = EnkiSettings.getString("camera.facing") == "front"
+        val sensor = CameraStreamer.sensorOrientation(this, if (front) "front" else "back") ?: 90
+        @Suppress("DEPRECATION")
+        val display = when (windowManager.defaultDisplay.rotation) {
+            android.view.Surface.ROTATION_90 -> 90
+            android.view.Surface.ROTATION_180 -> 180
+            android.view.Surface.ROTATION_270 -> 270
+            else -> 0
+        }
+        val r = if (front) (sensor + display) % 360 else (sensor - display + 360) % 360
+        val quarter = r % 180 != 0
+        // The texture is laid out 320x180dp; a quarter turn swaps its footprint. Fit that inside the frame.
+        val bw = previewView.layoutParams.width.toFloat()
+        val bh = previewView.layoutParams.height.toFloat()
+        val fw = if (quarter) bh else bw
+        val fh = if (quarter) bw else bh
+        val cw = previewFrame.width.toFloat()
+        val ch = previewFrame.height.toFloat()
+        val fit = if (cw > 0 && ch > 0) minOf(cw / fw, ch / fh) else 1f
+        previewView.pivotX = bw / 2
+        previewView.pivotY = bh / 2
         previewView.rotation = r.toFloat()
+        // Scaling happens before the turn, so the mirror runs along the texture's own axis that ends up horizontal.
         var sx = fit
         var sy = fit
-        if (PreviewBridge.mirror) { if (r % 180 == 0) sx = -fit else sy = -fit }
+        if (front) { if (quarter) sy = -fit else sx = -fit }
         previewView.scaleX = sx
         previewView.scaleY = sy
     }

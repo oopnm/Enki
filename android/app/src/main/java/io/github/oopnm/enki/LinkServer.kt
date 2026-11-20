@@ -94,11 +94,6 @@ class LinkServer(
         val front = synchronized(mediaLock) { facing } == "front"
         val sensor = CameraStreamer.sensorOrientation(context, if (front) "front" else "back") ?: return null
         val value = imageRotation(sensor, front, deviceOrientation.bucket)
-        if (PreviewBridge.rotation != value || PreviewBridge.mirror != front) {
-            PreviewBridge.rotation = value
-            PreviewBridge.mirror = front
-            PreviewBridge.onLook?.invoke()
-        }
         return JSONObject().put("type", "state").put("key", "image.rotation").put("value", value)
     }
 
