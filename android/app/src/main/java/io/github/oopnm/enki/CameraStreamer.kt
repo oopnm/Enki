@@ -19,7 +19,6 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.graphics.Rect
-import android.graphics.SurfaceTexture
 import android.os.HandlerThread
 import android.util.Range
 import android.util.Size
