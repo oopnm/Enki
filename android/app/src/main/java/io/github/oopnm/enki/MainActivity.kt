@@ -98,8 +98,8 @@ class MainActivity : Activity() {
         previewFrame = FrameLayout(this).apply {
             setBackgroundColor(0xFF000000.toInt())
             layoutParams = LinearLayout.LayoutParams(-1, (300 * dp).toInt()).apply { topMargin = pad / 2; bottomMargin = pad / 2 }
-            // The texture keeps the camera's own landscape 16:9 shape; it is turned and shrunk in applyPreviewLook.
-            addView(previewView, FrameLayout.LayoutParams((320 * dp).toInt(), (180 * dp).toInt(), Gravity.CENTER))
+            // Portrait 9:16 like the picture the camera service delivers; turned and fitted in applyPreviewLook.
+            addView(previewView, FrameLayout.LayoutParams((169 * dp).toInt(), (300 * dp).toInt(), Gravity.CENTER))
             addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> applyPreviewLook() }
         }
         val column = LinearLayout(this).apply {
@@ -173,12 +173,12 @@ class MainActivity : Activity() {
     }
 
     /**
-     * Turns the preview so it is upright on this screen, like a camera app: the picture follows the screen, not the
-     * way the phone is held (that is what the PC picture does). The front camera is shown mirrored.
+     * Shows the preview upright on this screen, like a camera app. The camera service already hands the texture a
+     * picture that is upright for the phone's natural (held upright) position, so the view is portrait shaped and
+     * only needs a turn when the screen itself is turned. The front camera is shown mirrored.
      */
     private fun applyPreviewLook() {
         val front = EnkiSettings.getString("camera.facing") == "front"
-        val sensor = CameraStreamer.sensorOrientation(this, if (front) "front" else "back") ?: 90
         @Suppress("DEPRECATION")
         val display = when (windowManager.defaultDisplay.rotation) {
             android.view.Surface.ROTATION_90 -> 90
@@ -186,9 +186,7 @@ class MainActivity : Activity() {
             android.view.Surface.ROTATION_270 -> 270
             else -> 0
         }
-        val r = if (front) (sensor + display) % 360 else (sensor - display + 360) % 360
-        val quarter = r % 180 != 0
-        // The texture is laid out 320x180dp; a quarter turn swaps its footprint. Fit that inside the frame.
+        val quarter = display % 180 != 0
         val bw = previewView.layoutParams.width.toFloat()
         val bh = previewView.layoutParams.height.toFloat()
         val fw = if (quarter) bh else bw
@@ -198,7 +196,7 @@ class MainActivity : Activity() {
         val fit = if (cw > 0 && ch > 0) minOf(cw / fw, ch / fh) else 1f
         previewView.pivotX = bw / 2
         previewView.pivotY = bh / 2
-        previewView.rotation = r.toFloat()
+        previewView.rotation = display.toFloat()
         // Scaling happens before the turn, so the mirror runs along the texture's own axis that ends up horizontal.
         var sx = fit
         var sy = fit
