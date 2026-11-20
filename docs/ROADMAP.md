@@ -12,7 +12,7 @@ screens, then the look.
 | 2 | Release 0.2.0 (packaging dependencies, version bump) | done |
 | 3 | Enki-Link v2: best possible communication | done, tested (PR #3) |
 | 4 | Unified settings engine, i18n skeleton, design tokens | built, waiting for a test on the phone |
-| 5 | DroidCam-class camera settings and live preview | planned |
+| 5 | DroidCam-class camera settings and live preview | built, waiting for the phone test |
 | 6 | "Abzu" theme, wave animation, full translations | planned |
 | 7 | Microphone and audio | planned |
 | 8 | Wi-Fi, pairing and encryption | planned |

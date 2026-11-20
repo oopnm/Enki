@@ -2,6 +2,9 @@
   "schema_version": 1,
   "groups": [
     "video",
+    "camera",
+    "filters",
+    "phone",
     "app"
   ],
   "settings": [
@@ -14,6 +17,69 @@
         "front"
       ],
       "default": "back",
+      "scope": "synced",
+      "apply": "live"
+    },
+    {
+      "key": "video.resolution",
+      "group": "video",
+      "type": "enum",
+      "values": [
+        "480p",
+        "720p",
+        "1080p"
+      ],
+      "default": "720p",
+      "scope": "synced",
+      "apply": "restart"
+    },
+    {
+      "key": "video.fps",
+      "group": "video",
+      "type": "enum",
+      "values": [
+        "15",
+        "24",
+        "30",
+        "60",
+        "120"
+      ],
+      "default": "30",
+      "scope": "synced",
+      "apply": "restart"
+    },
+    {
+      "key": "video.codec",
+      "group": "video",
+      "type": "enum",
+      "values": [
+        "h264",
+        "hevc"
+      ],
+      "default": "h264",
+      "scope": "synced",
+      "apply": "restart"
+    },
+    {
+      "key": "video.bitrate_mode",
+      "group": "video",
+      "type": "enum",
+      "values": [
+        "auto",
+        "manual"
+      ],
+      "default": "auto",
+      "scope": "synced",
+      "apply": "live"
+    },
+    {
+      "key": "video.bitrate_kbps",
+      "group": "video",
+      "type": "int",
+      "min": 500,
+      "max": 20000,
+      "step": 100,
+      "default": 4000,
       "scope": "synced",
       "apply": "live"
     },
@@ -52,6 +118,247 @@
       "default": "auto",
       "scope": "synced",
       "apply": "live"
+    },
+    {
+      "key": "video.flip",
+      "group": "video",
+      "type": "bool",
+      "default": false,
+      "scope": "synced",
+      "apply": "live"
+    },
+    {
+      "key": "camera.zoom",
+      "group": "camera",
+      "type": "float",
+      "min": 1.0,
+      "max": 10.0,
+      "default": 1.0,
+      "scope": "synced",
+      "apply": "live"
+    },
+    {
+      "key": "camera.focus_mode",
+      "group": "camera",
+      "type": "enum",
+      "values": [
+        "continuous",
+        "once",
+        "manual"
+      ],
+      "default": "continuous",
+      "scope": "synced",
+      "apply": "live"
+    },
+    {
+      "key": "camera.focus_distance",
+      "group": "camera",
+      "type": "float",
+      "min": 0.0,
+      "max": 1.0,
+      "default": 0.0,
+      "scope": "synced",
+      "apply": "live"
+    },
+    {
+      "key": "camera.exposure_comp",
+      "group": "camera",
+      "type": "int",
+      "min": -12,
+      "max": 12,
+      "step": 1,
+      "default": 0,
+      "scope": "synced",
+      "apply": "live"
+    },
+    {
+      "key": "camera.iso",
+      "group": "camera",
+      "type": "enum",
+      "values": [
+        "auto",
+        "100",
+        "200",
+        "400",
+        "800",
+        "1600",
+        "3200"
+      ],
+      "default": "auto",
+      "scope": "synced",
+      "apply": "live"
+    },
+    {
+      "key": "camera.shutter",
+      "group": "camera",
+      "type": "enum",
+      "values": [
+        "auto",
+        "30",
+        "60",
+        "120",
+        "250",
+        "500"
+      ],
+      "default": "auto",
+      "scope": "synced",
+      "apply": "live"
+    },
+    {
+      "key": "camera.white_balance",
+      "group": "camera",
+      "type": "enum",
+      "values": [
+        "auto",
+        "incandescent",
+        "fluorescent",
+        "daylight",
+        "cloudy"
+      ],
+      "default": "auto",
+      "scope": "synced",
+      "apply": "live"
+    },
+    {
+      "key": "camera.torch",
+      "group": "camera",
+      "type": "bool",
+      "default": false,
+      "scope": "synced",
+      "apply": "live"
+    },
+    {
+      "key": "camera.stabilization",
+      "group": "camera",
+      "type": "bool",
+      "default": false,
+      "scope": "synced",
+      "apply": "live"
+    },
+    {
+      "key": "camera.noise_reduction",
+      "group": "camera",
+      "type": "enum",
+      "values": [
+        "auto",
+        "off",
+        "fast",
+        "quality"
+      ],
+      "default": "auto",
+      "scope": "synced",
+      "apply": "live"
+    },
+    {
+      "key": "camera.antiflicker",
+      "group": "camera",
+      "type": "enum",
+      "values": [
+        "auto",
+        "off",
+        "50",
+        "60"
+      ],
+      "default": "auto",
+      "scope": "synced",
+      "apply": "live"
+    },
+    {
+      "key": "filter.brightness",
+      "group": "filters",
+      "type": "float",
+      "min": -1.0,
+      "max": 1.0,
+      "default": 0.0,
+      "scope": "synced",
+      "apply": "live"
+    },
+    {
+      "key": "filter.contrast",
+      "group": "filters",
+      "type": "float",
+      "min": 0.0,
+      "max": 2.0,
+      "default": 1.0,
+      "scope": "synced",
+      "apply": "live"
+    },
+    {
+      "key": "filter.saturation",
+      "group": "filters",
+      "type": "float",
+      "min": 0.0,
+      "max": 3.0,
+      "default": 1.0,
+      "scope": "synced",
+      "apply": "live"
+    },
+    {
+      "key": "filter.sharpness",
+      "group": "filters",
+      "type": "float",
+      "min": 0.0,
+      "max": 2.0,
+      "default": 0.0,
+      "scope": "synced",
+      "apply": "live"
+    },
+    {
+      "key": "filter.crop",
+      "group": "filters",
+      "type": "int",
+      "min": 0,
+      "max": 50,
+      "step": 1,
+      "default": 0,
+      "scope": "synced",
+      "apply": "live"
+    },
+    {
+      "key": "phone.keep_screen_on",
+      "group": "phone",
+      "type": "bool",
+      "default": false,
+      "scope": "synced",
+      "apply": "live"
+    },
+    {
+      "key": "phone.black_screen",
+      "group": "phone",
+      "type": "bool",
+      "default": false,
+      "scope": "synced",
+      "apply": "live"
+    },
+    {
+      "key": "phone.thermal_reduce",
+      "group": "phone",
+      "type": "bool",
+      "default": true,
+      "scope": "synced",
+      "apply": "live"
+    },
+    {
+      "key": "phone.auto_start",
+      "group": "phone",
+      "type": "bool",
+      "default": false,
+      "scope": "local",
+      "apply": "passive",
+      "apps": [
+        "phone"
+      ]
+    },
+    {
+      "key": "phone.show_preview",
+      "group": "phone",
+      "type": "bool",
+      "default": true,
+      "scope": "local",
+      "apply": "passive",
+      "apps": [
+        "phone"
+      ]
     },
     {
       "key": "ui.language",

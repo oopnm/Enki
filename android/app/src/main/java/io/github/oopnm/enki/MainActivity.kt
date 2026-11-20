@@ -6,8 +6,13 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
+import android.graphics.SurfaceTexture
 import android.view.Gravity
+import android.view.TextureView
 import android.view.View
+import android.view.WindowManager
+import android.widget.FrameLayout
+import android.widget.SeekBar
 import android.widget.AdapterView
 import android.widget.ArrayAdapter
 import android.widget.Button
@@ -31,6 +36,13 @@ class MainActivity : Activity() {
     private lateinit var statusView: TextView
     private lateinit var toggle: Button
     private lateinit var settingsBox: LinearLayout
+
+    /** Covers the whole screen in black while "black screen" is on and the phone is streaming. */
+    private lateinit var blackout: View
+
+    /** The live camera picture on the phone's own screen (the setting "phone.show_preview"). */
+    private lateinit var previewFrame: FrameLayout
+    private lateinit var previewView: TextureView
 
     /** True while the controls are being set from the stored values, so that does not count as a user change. */
     private var rendering = false
@@ -62,16 +74,65 @@ class MainActivity : Activity() {
             text = getString(R.string.hint_connect, Link.DEFAULT_PORT) +
                 "\n\nEnki Link v${Link.VERSION} · Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})"
         }
+        val dp = resources.displayMetrics.density
+        previewView = TextureView(this).apply {
+            surfaceTextureListener = object : TextureView.SurfaceTextureListener {
+                override fun onSurfaceTextureAvailable(st: SurfaceTexture, w: Int, h: Int) {
+                    PreviewBridge.texture = st
+                    PreviewBridge.onTexture?.invoke(false)
+                    applyPreviewLook()
+                }
+
+                override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, w: Int, h: Int) {}
+
+                override fun onSurfaceTextureDestroyed(st: SurfaceTexture): Boolean {
+                    // The camera must let go of the texture before the system frees it.
+                    PreviewBridge.texture = null
+                    PreviewBridge.onTexture?.invoke(true)
+                    return true
+                }
+
+                override fun onSurfaceTextureUpdated(st: SurfaceTexture) {}
+            }
+        }
+        previewFrame = FrameLayout(this).apply {
+            setBackgroundColor(0xFF000000.toInt())
+            layoutParams = LinearLayout.LayoutParams(-1, (300 * dp).toInt()).apply { topMargin = pad / 2; bottomMargin = pad / 2 }
+            // Portrait 9:16 like the picture the camera service delivers; turned and fitted in applyPreviewLook.
+            addView(previewView, FrameLayout.LayoutParams((169 * dp).toInt(), (300 * dp).toInt(), Gravity.CENTER))
+            addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> applyPreviewLook() }
+        }
         val column = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(pad, pad, pad, pad)
             addView(title)
             addView(statusView)
             addView(toggle)
+            addView(previewFrame)
             addView(settingsBox)
             addView(hint)
         }
-        setContentView(ScrollView(this).apply { addView(column) })
+        blackout = View(this).apply {
+            setBackgroundColor(0xFF000000.toInt())
+            isClickable = true // swallow touches so nothing behind it is pressed by accident
+            visibility = View.GONE
+            setOnLongClickListener {
+                EnkiSettings.setByUser("phone.black_screen", false) // a long press brings the screen back
+                true
+            }
+        }
+        setContentView(
+            FrameLayout(this).apply {
+                addView(ScrollView(this@MainActivity).apply { addView(column) })
+                addView(blackout, FrameLayout.LayoutParams(-1, -1))
+            },
+        )
+        // "Start streaming when the app opens": only if the camera permission is already granted.
+        if (EnkiSettings.getBool("phone.auto_start") && !EnkiState.running &&
+            checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
+        ) {
+            StreamService.start(this)
+        }
     }
 
     override fun onStart() {
@@ -91,6 +152,54 @@ class MainActivity : Activity() {
     private fun render() {
         statusView.text = EnkiState.status
         toggle.text = getString(if (EnkiState.running) R.string.stop else R.string.start)
+        applyScreenSettings()
+    }
+
+    /** Keep-screen-on and black-screen only matter while streaming; both are synced settings. */
+    private fun applyScreenSettings() {
+        val streaming = EnkiState.running
+        val keepOn = streaming && EnkiSettings.getBool("phone.keep_screen_on")
+        val black = streaming && EnkiSettings.getBool("phone.black_screen")
+        if (keepOn || black) window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        else window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        window.attributes = window.attributes.apply {
+            screenBrightness = if (black) 0.01f else WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE
+        }
+        blackout.visibility = if (black) View.VISIBLE else View.GONE
+        // The preview exists only while it is wanted and visible: a hidden view gives its texture back to the system.
+        previewFrame.visibility =
+            if (EnkiSettings.getBool("phone.show_preview") && !black) View.VISIBLE else View.GONE
+        applyPreviewLook()
+    }
+
+    /**
+     * Shows the preview upright on this screen, like a camera app. The camera service already hands the texture a
+     * picture that is upright for the phone's natural (held upright) position, so the view is portrait shaped and
+     * only needs a turn when the screen itself is turned. The front camera is not mirrored,
+     * so the preview matches the picture the PC gets.
+     */
+    private fun applyPreviewLook() {
+        @Suppress("DEPRECATION")
+        val display = when (windowManager.defaultDisplay.rotation) {
+            android.view.Surface.ROTATION_90 -> 90
+            android.view.Surface.ROTATION_180 -> 180
+            android.view.Surface.ROTATION_270 -> 270
+            else -> 0
+        }
+        val quarter = display % 180 != 0
+        val bw = previewView.layoutParams.width.toFloat()
+        val bh = previewView.layoutParams.height.toFloat()
+        val fw = if (quarter) bh else bw
+        val fh = if (quarter) bw else bh
+        val cw = previewFrame.width.toFloat()
+        val ch = previewFrame.height.toFloat()
+        val fit = if (cw > 0 && ch > 0) minOf(cw / fw, ch / fh) else 1f
+        previewView.pivotX = bw / 2
+        previewView.pivotY = bh / 2
+        // Turning the screen one way needs the picture turned the other way (checked on the phone).
+        previewView.rotation = ((360 - display) % 360).toFloat()
+        previewView.scaleX = fit
+        previewView.scaleY = fit
     }
 
     // ---- settings screen, built from the shared schema ----
@@ -107,6 +216,7 @@ class MainActivity : Activity() {
     private fun valueLabel(def: SettingDef, value: String) = stringByName("setting_${resName(def.key)}__$value") ?: value
 
     private fun renderSettings() {
+        applyScreenSettings()
         rendering = true
         settingsBox.removeAllViews()
         val pad = (12 * resources.displayMetrics.density).toInt()
@@ -164,9 +274,57 @@ class MainActivity : Activity() {
                     },
                 )
             }
-            else -> {} // numbers and text have no control on the phone yet (phase 5)
+            is SettingKind.Whole -> return sliderRow(def, label, kind.min.toDouble(), kind.max.toDouble(), kind.step.toDouble(), 0)
+            is SettingKind.Decimal -> return sliderRow(def, label, kind.min, kind.max, (kind.max - kind.min) / 100.0, 2)
+            else -> {} // text has no control on the phone
         }
         return row
+    }
+
+    /**
+     * A label with its value and a slider under it. The value shows while dragging; the change is sent when the
+     * finger lifts, so the PC and the camera get one change instead of a flood.
+     */
+    private fun sliderRow(def: SettingDef, label: TextView, min: Double, max: Double, step: Double, digits: Int): View {
+        val column = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        val value = TextView(this).apply { textSize = 14f }
+        val top = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            (label.parent as? LinearLayout)?.removeView(label)
+            addView(label)
+            addView(value)
+        }
+        fun show(v: Double) { value.text = if (digits == 0) v.toLong().toString() else "%.${digits}f".format(v) }
+        val steps = Math.round((max - min) / step).toInt()
+        val current = (EnkiSettings.get(def.key) as? Number)?.toDouble() ?: min
+        show(current)
+        val bar = SeekBar(this).apply {
+            this.max = steps
+            progress = Math.round((current - min) / step).toInt().coerceIn(0, steps)
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                private fun at(p: Int) = (min + p * step).coerceIn(min, max)
+
+                override fun onProgressChanged(b: SeekBar, p: Int, fromUser: Boolean) {
+                    if (fromUser) show(at(p))
+                }
+
+                override fun onStartTrackingTouch(b: SeekBar) {}
+
+                override fun onStopTrackingTouch(b: SeekBar) {
+                    if (rendering) return
+                    val v = at(b.progress)
+                    val sent: Any = if (digits == 0) Math.round(v) else Math.round(v * 100) / 100.0
+                    commit(def, sent) {
+                        val now = (EnkiSettings.get(def.key) as? Number)?.toDouble() ?: min
+                        b.progress = Math.round((now - min) / step).toInt().coerceIn(0, steps)
+                        show(now)
+                    }
+                }
+            })
+        }
+        column.addView(top)
+        column.addView(bar)
+        return column
     }
 
     /** A change made on the screen. A refusal shows its reason and puts the control back. */

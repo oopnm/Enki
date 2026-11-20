@@ -129,6 +129,10 @@ streaming starts and after every change.
 | `camera.facing` | `"back"`, `"front"` | Chooses the camera. The phone remembers it and uses it for the next media connection; if a media stream is running it switches camera at once (a new config + key frame follows). The phone confirms with `{"type":"state","key":"camera.facing","value":"front"}` (after an `image.rotation` state), or answers `{"type":"error","code":"bad_value",...}`. |
 | `image.rotation` | `0`, `90`, `180`, `270` (phone → PC, `state` only) | Clockwise rotation that makes the picture upright, computed on the phone from the camera's sensor orientation and the phone's accelerometer (`OrientationEventListener`, independent of the screen-rotation lock; 15° hysteresis). Sent after every `camera.facing` set and whenever the phone is turned. The PC applies it when "auto rotate" is on. |
 | `stream.bitrate` | kbit/s (phone → PC, `state` only) | The encoder's current target bit rate, see above. |
+| `stream.codec` | `"h264"`, `"hevc"` (phone → PC, `state` only) | What the encoder produces. Sent when an encoder starts and to every PC that connects while streaming. The PC restarts ffmpeg with the matching raw demuxer when it changes. |
+| `phone.battery` | percent (phone → PC, `state` only) | Battery level. Sent when it changes and on connect. |
+| `phone.temperature` | tenths of °C (phone → PC, `state` only) | Battery temperature, e.g. `365` = 36.5 °C. |
+| `phone.charging` | bool (phone → PC, `state` only) | Whether the phone is charging. |
 
 The PC opens the control connection first, reads `hello` (and `capabilities`), sends `camera.facing`, waits up to 1 s
 for the `state` reply, and only then opens the media connection.
@@ -167,3 +171,13 @@ both the Rust and the Android tests run them.
 `version` changes only for incompatible wire changes (version 1 added the authentication exchange). Additive
 changes (new message types, new settings keys, new `kind` values behind a capability) keep the same version.
 The PC program and the phone app must be from the same protocol version; both report a clear message when they are not.
+
+## Stream settings (phase 5)
+
+`video.resolution`, `video.fps` and `video.codec` restart the phone's encoder (changes made within 150 ms restart it once).
+If the phone cannot deliver the new combination (for example no H.265 encoder), it puts the three settings back to the
+last combination that produced a picture, through the normal settings path, so both screens show the real value.
+`video.bitrate_mode`, `video.bitrate_kbps`, `phone.thermal_reduce` and every `camera.*` control (zoom, focus, exposure,
+ISO, shutter, white balance, torch, stabilisation, noise reduction, anti-flicker) are applied to the running stream
+without a restart; controls the camera does not report as supported are ignored. The `filter.*`, `video.flip` and
+`video.resolution` output size are applied by the PC's ffmpeg (the decoder restarts when they change).
