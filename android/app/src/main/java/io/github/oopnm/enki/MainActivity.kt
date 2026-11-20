@@ -196,7 +196,8 @@ class MainActivity : Activity() {
         val fit = if (cw > 0 && ch > 0) minOf(cw / fw, ch / fh) else 1f
         previewView.pivotX = bw / 2
         previewView.pivotY = bh / 2
-        previewView.rotation = display.toFloat()
+        // Turning the screen one way needs the picture turned the other way (checked on the phone).
+        previewView.rotation = ((360 - display) % 360).toFloat()
         previewView.scaleX = fit
         previewView.scaleY = fit
     }
