@@ -71,11 +71,6 @@ impl Default for Filters {
     }
 }
 
-/// Size of the live preview the window shows (RGB24, 10 frames a second).
-pub const PREVIEW_W: usize = 320;
-pub const PREVIEW_H: usize = 180;
-pub const PREVIEW_FPS: u32 = 10;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Look {
     /// Clockwise degrees (0, 90, 180, 270).
@@ -88,8 +83,6 @@ pub struct Look {
     pub fps: u32,
     /// Output height in pixels (480, 720 or 1080); the width is 16:9 of it.
     pub out_height: u32,
-    /// Also write the small preview to stdout.
-    pub preview: bool,
 }
 
 impl Default for Look {
@@ -102,7 +95,6 @@ impl Default for Look {
             codec: Codec::H264,
             fps: 30,
             out_height: 720,
-            preview: false,
         }
     }
 }
@@ -214,23 +206,6 @@ pub fn ffmpeg_args_for(device: &str, look: &Look) -> Vec<String> {
     args
 }
 
-/// The preview is made by a second, independent ffmpeg that decodes the same stream: if it ever stalls or dies, the
-/// camera picture is not affected. Output: [`PREVIEW_W`]x[`PREVIEW_H`] RGB24 frames on stdout.
-pub fn preview_args(look: &Look) -> Vec<String> {
-    let mut args = input_args(look);
-    let mut chain = adjust_chain(look);
-    chain.push(format!("fps={PREVIEW_FPS}"));
-    chain.push(format!(
-        "scale={PREVIEW_W}:{PREVIEW_H}:force_original_aspect_ratio=decrease"
-    ));
-    chain.push(format!("pad={PREVIEW_W}:{PREVIEW_H}:(ow-iw)/2:(oh-ih)/2"));
-    chain.push("format=rgb24".into());
-    args.push("-vf".into());
-    args.push(chain.join(","));
-    args.extend(["-f", "rawvideo", "pipe:1"].map(String::from));
-    args
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -336,20 +311,9 @@ mod tests {
         assert_eq!(Codec::from_wire("vp9"), None);
     }
 
+    /// Runs the real ffmpeg (when installed) on a generated stream: the graph must be valid.
     #[test]
-    fn preview_is_its_own_small_rgb_output() {
-        let args = preview_args(&Look::default()).join(" ");
-        assert!(args.contains("fps=10,scale=320:180"));
-        assert!(args.ends_with("format=rgb24 -f rawvideo pipe:1"));
-        assert!(!ffmpeg_args_for("/dev/video10", &Look::default())
-            .join(" ")
-            .contains("pipe:1"));
-    }
-
-    /// Runs the real ffmpeg (when installed) on a generated stream: the graph must be valid and the preview must be
-    /// whole frames of the documented size.
-    #[test]
-    fn ffmpeg_accepts_the_full_graph_and_the_preview_has_whole_frames() {
+    fn ffmpeg_accepts_the_full_graph() {
         use std::process::{Command, Stdio};
         let have = |p: &str| {
             Command::new(p)
@@ -404,7 +368,6 @@ mod tests {
                 crop: 20,
             },
             out_height: 480,
-            preview: true,
             ..Look::default()
         };
         let mut args = ffmpeg_args_for("OUT", &look);
@@ -416,22 +379,11 @@ mod tests {
             .stdin(std::fs::File::open(&src).unwrap())
             .output()
             .unwrap();
-        let preview = Command::new("ffmpeg")
-            .args(preview_args(&look))
-            .stdin(std::fs::File::open(&src).unwrap())
-            .output()
-            .unwrap();
         let _ = std::fs::remove_dir_all(&dir);
         assert!(
             run.status.success(),
             "{}",
             String::from_utf8_lossy(&run.stderr)
         );
-        assert!(
-            preview.status.success() && !preview.stdout.is_empty(),
-            "no preview; ffmpeg said: {}",
-            String::from_utf8_lossy(&preview.stderr)
-        );
-        assert_eq!(preview.stdout.len() % (PREVIEW_W * PREVIEW_H * 3), 0);
     }
 }

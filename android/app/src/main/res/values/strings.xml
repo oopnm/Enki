@@ -96,5 +96,6 @@
     <string name="setting_phone_black_screen">Black screen (saves battery)</string>
     <string name="setting_phone_thermal_reduce">Lower quality when the phone gets hot</string>
     <string name="setting_phone_auto_start">Start streaming when the app opens</string>
-    <string name="setting_video_fps__120">120 fps (high-speed mode, 720p)</string>
+    <string name="setting_video_fps__120">120 fps (high-speed mode, 720p, higher delay)</string>
+    <string name="setting_phone_show_preview">Show the camera preview on this phone</string>
 </resources>

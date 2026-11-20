@@ -96,5 +96,6 @@
     <string name="setting_phone_black_screen">شاشة سوداء (توفير البطارية)</string>
     <string name="setting_phone_thermal_reduce">خفض الجودة عند ارتفاع حرارة الهاتف</string>
     <string name="setting_phone_auto_start">بدء البث عند فتح التطبيق</string>
-    <string name="setting_video_fps__120">120 إطار/ث (وضع عالي السرعة، 720p)</string>
+    <string name="setting_video_fps__120">120 إطار/ث (وضع عالي السرعة، 720p، تأخير أعلى)</string>
+    <string name="setting_phone_show_preview">عرض معاينة الكاميرا على هذا الهاتف</string>
 </resources>

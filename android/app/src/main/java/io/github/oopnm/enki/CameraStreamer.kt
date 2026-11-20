@@ -19,6 +19,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.graphics.Rect
+import android.graphics.SurfaceTexture
 import android.os.HandlerThread
 import android.util.Range
 import android.util.Size
@@ -62,6 +63,11 @@ class CameraStreamer(
     @Volatile private var session: CameraCaptureSession? = null
     @Volatile private var encoder: MediaCodec? = null
     @Volatile private var inputSurface: Surface? = null
+
+    /** The preview on the phone's screen: the surface being offered, the one the running session really uses. */
+    @Volatile private var previewSurface: Surface? = null
+    @Volatile private var sessionPreview: Surface? = null
+    @Volatile private var previewSize: Size? = null
     @Volatile private var drainThread: Thread? = null
     @Volatile private var adapterThread: Thread? = null
     @Volatile private var started = false
@@ -110,6 +116,11 @@ class CameraStreamer(
             }
         }
         activeCharacteristics = characteristics
+        // The preview is a small 16:9 size next to the encoder (not in high-speed mode, which allows one surface).
+        previewSize = map.getOutputSizes(SurfaceTexture::class.java)
+            ?.filter { it.width * 9 == it.height * 16 && it.width in 640..1280 }
+            ?.minByOrNull { it.width }
+        if (!highSpeed) PreviewBridge.texture?.let { previewSurface = makePreviewSurface(it) }
         activeFps = fpsRange
         onFpsInfo("${fpsRange?.upper ?: 0}|" + (if (highSpeed) "high-speed mode " else "") + (if (highSpeedInfo.isNotEmpty()) "[high-speed: ${highSpeedInfo.trim()}] " else "") + (characteristics.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)?.joinToString(",") { "${it.lower}-${it.upper}" } ?: ""))
 
@@ -172,12 +183,56 @@ class CameraStreamer(
         thread?.takeIf { it !== Thread.currentThread() }?.join(1000)
         runCatching { encoder?.release() }
         runCatching { inputSurface?.release() }
+        runCatching { previewSurface?.release() }
+        previewSurface = null; sessionPreview = null
         cameraThread?.quitSafely()
         session = null; camera = null; encoder = null; inputSurface = null
     }
 
+    private fun makePreviewSurface(texture: SurfaceTexture): Surface? {
+        val size = previewSize ?: return null
+        return runCatching {
+            texture.setDefaultBufferSize(size.width, size.height)
+            Surface(texture)
+        }.getOrNull()
+    }
+
+    /**
+     * Puts the preview of the phone's screen on or off (null) while streaming: the capture session is rebuilt with
+     * the new surface list, which takes a moment but does not touch the encoder. [wait] returns only when the old
+     * surface is no longer used, for a texture the system is about to release.
+     */
+    fun setPreview(texture: SurfaceTexture?, wait: Boolean = false) {
+        if (highSpeed || stopped) return
+        val device = activeDevice
+        val handler = activeHandler
+        val old = previewSurface
+        previewSurface = texture?.let { makePreviewSurface(it) }
+        if (device == null || handler == null || session == null) {
+            runCatching { old?.release() }
+            return
+        }
+        val done = java.util.concurrent.CountDownLatch(1)
+        handler.post {
+            try {
+                if (!synchronized(lock) { stopped }) {
+                    runCatching { session?.stopRepeating() }
+                    runCatching { session?.close() }
+                    session = null
+                    createSession(device, handler)
+                }
+            } finally {
+                runCatching { old?.release() }
+                done.countDown()
+            }
+        }
+        if (wait) done.await(1, java.util.concurrent.TimeUnit.SECONDS)
+    }
+
     private fun createSession(device: CameraDevice, handler: Handler) {
         val surface = inputSurface ?: return fail("no encoder surface")
+        val extra = if (highSpeed) null else previewSurface
+        sessionPreview = extra
         try {
             val callback = object : CameraCaptureSession.StateCallback() {
                 override fun onConfigured(s: CameraCaptureSession) {
@@ -210,7 +265,7 @@ class CameraStreamer(
                 device.createConstrainedHighSpeedCaptureSession(listOf(surface), callback, handler)
             } else {
                 @Suppress("DEPRECATION") // the SessionConfiguration variant needs API 28; minSdk is 24
-                device.createCaptureSession(listOf(surface), callback, handler)
+                device.createCaptureSession(listOfNotNull(surface, extra), callback, handler)
             }
         } catch (e: Exception) {
             fail("cannot create camera session: ${e.message}")
@@ -243,6 +298,7 @@ class CameraStreamer(
         val chars = activeCharacteristics
         val builder = device.createCaptureRequest(CameraDevice.TEMPLATE_RECORD)
         builder.addTarget(surface)
+        sessionPreview?.let { builder.addTarget(it) }
         builder.set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
         activeFps?.let { builder.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, it) }
         if (chars == null) return builder.build()

@@ -10,7 +10,7 @@ use gtk::prelude::*;
 use gtk::Box as GtkBox;
 use gtk::{
     Application, ApplicationWindow, Button, CheckButton, DropDown, Entry, Label, Orientation,
-    Picture, Scale, ScrolledWindow, TextBuffer, TextView,
+    Scale, ScrolledWindow, TextBuffer, TextView,
 };
 use serde_json::{json, Value};
 use std::cell::{Cell, RefCell};
@@ -54,8 +54,8 @@ enum UiEvent {
     Refresh,
     /// Battery and temperature reported by the phone.
     Phone(enki_receiver::PhoneInfo),
-    /// One frame of the live preview (RGB24).
-    Preview(Vec<u8>),
+    /// The mpv preview window was closed (or never started).
+    PreviewClosed,
     /// The phone refused a change made here (already rolled back in the settings).
     RolledBack {
         key: String,
@@ -106,7 +106,8 @@ struct App {
     status_label: RefCell<Label>,
     phone_label: RefCell<Label>,
     info_label: RefCell<Label>,
-    preview: RefCell<Picture>,
+    /// True while the mpv preview window is open.
+    preview_open: Cell<bool>,
     start_btn: RefCell<Button>,
     fix_btn: RefCell<Button>,
     resolution: RefCell<DropDown>,
@@ -182,7 +183,7 @@ fn build_ui(app: &Application, rt: Handle) {
         status_label: RefCell::new(Label::new(None)),
         phone_label: RefCell::new(Label::new(None)),
         info_label: RefCell::new(Label::new(None)),
-        preview: RefCell::new(Picture::new()),
+        preview_open: Cell::new(false),
         start_btn: RefCell::new(Button::new()),
         fix_btn: RefCell::new(Button::new()),
         resolution: RefCell::new(DropDown::new(
@@ -263,17 +264,6 @@ impl App {
         let info_label = Label::builder().xalign(0.0).build();
         main_box.append(&info_label);
         *self.info_label.borrow_mut() = info_label;
-        // المعاينة الحية: تظهر أثناء البث فقط.
-        let preview = Picture::builder()
-            .can_shrink(false)
-            .halign(gtk::Align::Start)
-            .build();
-        preview.set_size_request(
-            enki_receiver::PREVIEW_W as i32,
-            enki_receiver::PREVIEW_H as i32,
-        );
-        main_box.append(&preview);
-        *self.preview.borrow_mut() = preview;
         *self.status_label.borrow_mut() = status_label;
         *self.phone_label.borrow_mut() = phone_label;
 
@@ -348,7 +338,8 @@ impl App {
                 fix_btn.set_visible(true);
             }
         }
-        for b in [&modprobe_btn, &start_btn, &stop_btn, &fix_btn] {
+        let preview_btn = Button::builder().label(self.tr("button-preview")).build();
+        for b in [&modprobe_btn, &start_btn, &stop_btn, &preview_btn, &fix_btn] {
             action_box.append(b);
         }
         main_box.append(&action_box);
@@ -383,6 +374,8 @@ impl App {
         {
             let app = self.clone();
             modprobe_btn.connect_clicked(move |_| app.load_module_from_settings());
+            let app = self.clone();
+            preview_btn.connect_clicked(move |_| app.open_preview());
         }
         {
             let app = self.clone();
@@ -684,9 +677,6 @@ impl App {
                     self.stop_slot.borrow_mut().take();
                     self.control_slot.borrow_mut().take();
                     *self.status.borrow_mut() = Status::Stopped;
-                    self.preview
-                        .borrow()
-                        .set_paintable(None::<&gtk::gdk::Paintable>);
                     self.info_label.borrow().set_label("");
                 }
                 self.start_btn.borrow().set_sensitive(!running);
@@ -715,21 +705,7 @@ impl App {
                 }
                 self.info_label.borrow().set_label(&parts.join(" · "));
             }
-            UiEvent::Preview(rgb) => {
-                let (w, h) = (enki_receiver::PREVIEW_W, enki_receiver::PREVIEW_H);
-                if rgb.len() != w * h * 3 {
-                    self.log(&format!("Preview: unexpected frame size {}\n", rgb.len()));
-                } else {
-                    let texture = gtk::gdk::MemoryTexture::new(
-                        w as i32,
-                        h as i32,
-                        gtk::gdk::MemoryFormat::R8g8b8,
-                        &glib::Bytes::from_owned(rgb),
-                        w * 3,
-                    );
-                    self.preview.borrow().set_paintable(Some(&texture));
-                }
-            }
+            UiEvent::PreviewClosed => self.preview_open.set(false),
             UiEvent::RolledBack { key, message } => {
                 self.refresh_controls();
                 let setting = self.tr(&setting_id(&key));
@@ -746,6 +722,52 @@ impl App {
         if let Some(error) = self.hub.lock().unwrap().take_save_error() {
             self.log(&format!("⚠️ {error}\n"));
         }
+    }
+
+    /// Shows what programs get from the virtual camera, in an mpv window reading the V4L2 device itself, so it
+    /// is exactly the final picture (rotation and filters included) and costs no extra decoding.
+    fn open_preview(self: &Rc<Self>) {
+        if self.preview_open.get() {
+            return;
+        }
+        self.preview_open.set(true);
+        let device = self.output_device();
+        let tx = self.tx.clone();
+        let missing = self.tr("log-preview-missing");
+        let failed = self.tr("log-preview-failed");
+        self.rt.spawn(async move {
+            let child = Command::new("mpv")
+                .args([
+                    "--profile=low-latency",
+                    "--untimed",
+                    "--no-cache",
+                    "--no-audio",
+                    "--force-window=immediate",
+                    "--title=Enki",
+                ])
+                .arg(format!("av://v4l2:{device}"))
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .kill_on_drop(true)
+                .spawn();
+            match child {
+                Ok(mut child) => {
+                    if let Ok(status) = child.wait().await {
+                        if !status.success() {
+                            let _ = tx.send(UiEvent::Log(format!("{failed}\n")));
+                        }
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    let _ = tx.send(UiEvent::Log(format!("{missing}\n")));
+                }
+                Err(e) => {
+                    let _ = tx.send(UiEvent::Log(format!("mpv: {e}\n")));
+                }
+            }
+            let _ = tx.send(UiEvent::PreviewClosed);
+        });
     }
 
     fn output_device(&self) -> String {
@@ -798,7 +820,6 @@ impl App {
                 enki_receiver::Facing::Back
             };
             cfg.settings = self.hub.clone();
-            cfg.preview = true;
             let text = self.i18n.borrow().tr_args(
                 "log-starting-enki",
                 &[
@@ -839,7 +860,6 @@ impl App {
                         Event::State(State::Stopped) => Some(UiEvent::Running(false)),
                         Event::State(_) | Event::Capabilities(_) => None,
                         Event::Phone(info) => Some(UiEvent::Phone(info)),
-                        Event::Preview(rgb) => Some(UiEvent::Preview(rgb)),
                         Event::Problem(problem) => Some(UiEvent::Problem(problem)),
                         Event::Setting { .. } => Some(UiEvent::Refresh),
                         Event::SettingRolledBack { key, message, .. } => {

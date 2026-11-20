@@ -12,7 +12,7 @@ Source0:        %{name}-%{version}.tar.gz
 BuildRequires:  cargo rust gcc gtk4-devel pkgconfig
 Requires:       gtk4 v4l-utils polkit android-tools
 # غير متوفرة في مستودعات Fedora الرسمية (RPM Fusion / COPR)
-Recommends:     ffmpeg scrcpy akmod-v4l2loopback
+Recommends:     ffmpeg scrcpy akmod-v4l2loopback mpv
 
 %description
 Enki turns an Android phone into a Linux webcam (via v4l2loopback), and

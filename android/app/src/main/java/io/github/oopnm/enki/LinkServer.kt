@@ -94,6 +94,11 @@ class LinkServer(
         val front = synchronized(mediaLock) { facing } == "front"
         val sensor = CameraStreamer.sensorOrientation(context, if (front) "front" else "back") ?: return null
         val value = imageRotation(sensor, front, deviceOrientation.bucket)
+        if (PreviewBridge.rotation != value || PreviewBridge.mirror != front) {
+            PreviewBridge.rotation = value
+            PreviewBridge.mirror = front
+            PreviewBridge.onLook?.invoke()
+        }
         return JSONObject().put("type", "state").put("key", "image.rotation").put("value", value)
     }
 
@@ -178,6 +183,12 @@ class LinkServer(
         }
 
         /** Applies the camera controls and the bit rate to the running stream without restarting it. */
+        /** Puts the phone-screen preview on or off while streaming (see [CameraStreamer.setPreview]). */
+        fun setPreview(texture: android.graphics.SurfaceTexture?, wait: Boolean) {
+            val s = synchronized(mediaLock) { streamer }
+            s?.setPreview(texture, wait)
+        }
+
         fun refreshLive() {
             synchronized(mediaLock) {
                 val s = streamer ?: return
@@ -268,6 +279,10 @@ class LinkServer(
         EnkiSettings.userChangeListener = { entry, key, value -> onUserChange(entry, key, value) }
         deviceOrientation.enable()
         phoneMonitor.enable()
+        PreviewBridge.onTexture = { wait ->
+            val media = synchronized(mediaLock) { activeMedia }
+            media?.setPreview(PreviewBridge.texture, wait)
+        }
         Thread({ acceptLoop(s) }, "enki-accept").start()
         status(WAITING)
     }
@@ -277,6 +292,7 @@ class LinkServer(
         EnkiSettings.userChangeListener = null
         deviceOrientation.disable()
         phoneMonitor.disable()
+        PreviewBridge.onTexture = null
         SessionToken.clear()
         notifier.shutdownNow()
         runCatching { server?.close() }

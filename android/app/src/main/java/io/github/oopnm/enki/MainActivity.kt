@@ -6,7 +6,9 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
+import android.graphics.SurfaceTexture
 import android.view.Gravity
+import android.view.TextureView
 import android.view.View
 import android.view.WindowManager
 import android.widget.FrameLayout
@@ -38,6 +40,10 @@ class MainActivity : Activity() {
     /** Covers the whole screen in black while "black screen" is on and the phone is streaming. */
     private lateinit var blackout: View
 
+    /** The live camera picture on the phone's own screen (the setting "phone.show_preview"). */
+    private lateinit var previewFrame: FrameLayout
+    private lateinit var previewView: TextureView
+
     /** True while the controls are being set from the stored values, so that does not count as a user change. */
     private var rendering = false
     private val redraw: () -> Unit = { runOnUiThread { renderSettings() } }
@@ -68,12 +74,39 @@ class MainActivity : Activity() {
             text = getString(R.string.hint_connect, Link.DEFAULT_PORT) +
                 "\n\nEnki Link v${Link.VERSION} · Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})"
         }
+        val dp = resources.displayMetrics.density
+        previewView = TextureView(this).apply {
+            surfaceTextureListener = object : TextureView.SurfaceTextureListener {
+                override fun onSurfaceTextureAvailable(st: SurfaceTexture, w: Int, h: Int) {
+                    PreviewBridge.texture = st
+                    PreviewBridge.onTexture?.invoke(false)
+                    applyPreviewLook()
+                }
+
+                override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, w: Int, h: Int) {}
+
+                override fun onSurfaceTextureDestroyed(st: SurfaceTexture): Boolean {
+                    // The camera must let go of the texture before the system frees it.
+                    PreviewBridge.texture = null
+                    PreviewBridge.onTexture?.invoke(true)
+                    return true
+                }
+
+                override fun onSurfaceTextureUpdated(st: SurfaceTexture) {}
+            }
+        }
+        previewFrame = FrameLayout(this).apply {
+            setBackgroundColor(0xFF000000.toInt())
+            layoutParams = LinearLayout.LayoutParams(-1, (180 * dp).toInt()).apply { topMargin = pad / 2; bottomMargin = pad / 2 }
+            addView(previewView, FrameLayout.LayoutParams((320 * dp).toInt(), (180 * dp).toInt(), Gravity.CENTER))
+        }
         val column = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(pad, pad, pad, pad)
             addView(title)
             addView(statusView)
             addView(toggle)
+            addView(previewFrame)
             addView(settingsBox)
             addView(hint)
         }
@@ -102,6 +135,7 @@ class MainActivity : Activity() {
 
     override fun onStart() {
         super.onStart()
+        PreviewBridge.onLook = { runOnUiThread { applyPreviewLook() } }
         EnkiState.listener = { runOnUiThread { render() } }
         EnkiSettings.changeListeners.add(redraw)
         render()
@@ -109,6 +143,7 @@ class MainActivity : Activity() {
     }
 
     override fun onStop() {
+        PreviewBridge.onLook = null
         EnkiState.listener = null
         EnkiSettings.changeListeners.remove(redraw)
         super.onStop()
@@ -131,6 +166,22 @@ class MainActivity : Activity() {
             screenBrightness = if (black) 0.01f else WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE
         }
         blackout.visibility = if (black) View.VISIBLE else View.GONE
+        // The preview exists only while it is wanted and visible: a hidden view gives its texture back to the system.
+        previewFrame.visibility =
+            if (EnkiSettings.getBool("phone.show_preview") && !black) View.VISIBLE else View.GONE
+    }
+
+    /** Turns and mirrors the preview so it is upright, like the picture the PC gets. */
+    private fun applyPreviewLook() {
+        val r = PreviewBridge.rotation
+        // A quarter turn makes the 16:9 picture taller than the frame: shrink it to fit.
+        val fit = if (r % 180 == 0) 1f else 9f / 16f
+        previewView.rotation = r.toFloat()
+        var sx = fit
+        var sy = fit
+        if (PreviewBridge.mirror) { if (r % 180 == 0) sx = -fit else sy = -fit }
+        previewView.scaleX = sx
+        previewView.scaleY = sy
     }
 
     // ---- settings screen, built from the shared schema ----

@@ -350,6 +350,17 @@
       ]
     },
     {
+      "key": "phone.show_preview",
+      "group": "phone",
+      "type": "bool",
+      "default": true,
+      "scope": "local",
+      "apply": "passive",
+      "apps": [
+        "phone"
+      ]
+    },
+    {
       "key": "ui.language",
       "group": "app",
       "type": "enum",

@@ -23,7 +23,7 @@ use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot, Notify};
 
 mod look;
-pub use look::{Codec, Filters, Look, PREVIEW_H, PREVIEW_W};
+pub use look::{Codec, Filters, Look};
 
 use enki_settings::{Applied, Hub, Reject, RejectCode, SettingsHandle};
 
@@ -124,8 +124,6 @@ pub struct Config {
     /// Frame rate the decoder assumes (the stream carries no reliable rate in the H.264 headers).
     /// Unused since the frame rate became the synced setting `video.fps`; kept so callers still compile.
     pub fps: u32,
-    /// Also produce the small live preview (`Event::Preview`). The window turns this on; tests leave it off.
-    pub preview: bool,
     /// Which phone camera to use at the start (can be changed live with [`Control::SetFacing`]). When it differs
     /// from the stored `camera.facing` it counts as the user's choice now and replaces it.
     pub facing: Facing,
@@ -156,7 +154,6 @@ impl Config {
             device: device.into(),
             port: DEFAULT_PORT,
             fps: 30,
-            preview: false,
             facing: Facing::Back,
             rotate: None,
             mirror: None,
@@ -277,8 +274,6 @@ pub enum Event {
     },
     /// The phone's battery and temperature (sent when they change).
     Phone(PhoneInfo),
-    /// A frame of the live preview: `PREVIEW_W * PREVIEW_H * 3` bytes of RGB.
-    Preview(Vec<u8>),
     /// The session ended because of this; also logged.
     Problem(Problem),
 }
@@ -1159,14 +1154,11 @@ fn orientation(live: &Live) -> (u16, bool) {
 struct Sink {
     child: tokio::process::Child,
     stdin: Option<tokio::process::ChildStdin>,
-    /// The second ffmpeg that makes the live preview; dropped (and killed) if it stalls or dies.
-    preview: Option<(tokio::process::Child, tokio::process::ChildStdin)>,
 }
 
 impl Sink {
     async fn spawn(cfg: &Config, look: &Look, tx: &Tx) -> Result<Sink, Problem> {
         let (program, args) = sink_command(cfg, look);
-        let preview = look.preview && cfg.sink_override.is_none();
         let mut child = Command::new(&program)
             .args(&args)
             .stdin(Stdio::piped())
@@ -1197,95 +1189,20 @@ impl Sink {
                 }
             });
         }
-        let preview = if preview {
-            Self::spawn_preview(cfg, look, tx)
-        } else {
-            None
-        };
         Ok(Sink {
             child,
             stdin: Some(stdin),
-            preview,
         })
     }
 
-    /// Starts the preview decoder and the task that turns its output into `Event::Preview`. A failure to start is
-    /// logged and only costs the preview.
-    fn spawn_preview(
-        cfg: &Config,
-        look: &Look,
-        tx: &Tx,
-    ) -> Option<(tokio::process::Child, tokio::process::ChildStdin)> {
-        let mut child = match Command::new(&cfg.ffmpeg)
-            .args(look::preview_args(look))
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-        {
-            Ok(child) => child,
-            Err(e) => {
-                log(tx, format!("Preview: cannot start ffmpeg: {e}\n"));
-                return None;
-            }
-        };
-        let stdin = child.stdin.take()?;
-        if let Some(stderr) = child.stderr.take() {
-            let tx = tx.clone();
-            tokio::spawn(async move {
-                let mut lines = BufReader::new(stderr).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    log(&tx, format!("Preview: {line}\n"));
-                }
-            });
-        }
-        let mut stdout = child.stdout.take()?;
-        let tx = tx.clone();
-        tokio::spawn(async move {
-            let mut frame = vec![0u8; PREVIEW_W * PREVIEW_H * 3];
-            let mut count = 0u64;
-            while stdout.read_exact(&mut frame).await.is_ok() {
-                count += 1;
-                if count == 1 {
-                    log(&tx, "Preview: first frame.\n".to_string());
-                }
-                if tx.send(Event::Preview(frame.clone())).is_err() {
-                    break;
-                }
-            }
-            log(&tx, format!("Preview: ended after {count} frames.\n"));
-        });
-        Some((child, stdin))
-    }
-
-    /// Writes one piece of the phone's stream to the decoder (and to the preview decoder, which never holds the
-    /// camera picture up: after 100 ms without progress it is dropped).
-    async fn feed(&mut self, payload: &[u8], tx: &Tx) -> Result<(), ()> {
+    /// Writes one piece of the phone's stream to the decoder.
+    async fn feed(&mut self, payload: &[u8]) -> Result<(), ()> {
         let stdin = self.stdin.as_mut().ok_or(())?;
-        stdin.write_all(payload).await.map_err(|_| ())?;
-        if let Some((_, pstdin)) = self.preview.as_mut() {
-            let ok = matches!(
-                tokio::time::timeout(Duration::from_millis(100), pstdin.write_all(payload)).await,
-                Ok(Ok(()))
-            );
-            if !ok {
-                self.preview = None;
-                log(
-                    tx,
-                    "Preview: stopped (the preview decoder could not keep up).\n".to_string(),
-                );
-            }
-        }
-        Ok(())
+        stdin.write_all(payload).await.map_err(|_| ())
     }
 
     async fn stop(&mut self) {
         self.stdin = None;
-        if let Some((mut child, stdin)) = self.preview.take() {
-            drop(stdin);
-            let _ = child.kill().await;
-        }
         if tokio::time::timeout(Duration::from_secs(2), self.child.wait())
             .await
             .is_err()
@@ -1304,7 +1221,7 @@ async fn session(
     shared: &Arc<Shared>,
 ) -> Result<u64, Problem> {
     let mut live_rx = shared.live.subscribe();
-    let mut current = look(&live_rx.borrow_and_update(), cfg.preview);
+    let mut current = look(&live_rx.borrow_and_update());
     let mut sink = Sink::spawn(cfg, &current, tx).await?;
 
     log(tx, format!("✓ اتصل بالهاتف، البث إلى {}\n", cfg.device));
@@ -1396,7 +1313,7 @@ async fn pump_frames(
         // The picture orientation depends on the camera and on how the phone is held. It can only change by
         // restarting the decoder, which only happens when the resulting orientation really differs.
         if live_rx.has_changed().unwrap_or(false) {
-            let mut wanted = look(&live_rx.borrow_and_update(), cfg.preview);
+            let mut wanted = look(&live_rx.borrow_and_update());
             wanted.codec = current.codec; // the codec comes from the stream itself, see below
             if wanted != *current {
                 *current = wanted;
@@ -1440,7 +1357,7 @@ async fn pump_frames(
         if h.flags & FLAG_DISCONTINUITY != 0 {
             counters.gaps.fetch_add(1, Ordering::Relaxed);
         }
-        sink.feed(&payload, tx)
+        sink.feed(&payload)
             .await
             .map_err(|_| PumpError::SinkClosed)?;
         if h.kind != Kind::VideoConfig {
@@ -1491,7 +1408,7 @@ fn sink_command(cfg: &Config, look: &Look) -> (String, Vec<String>) {
 }
 
 /// The settings that shape the picture, as the decoder needs them.
-fn look(live: &Live, preview: bool) -> Look {
+fn look(live: &Live) -> Look {
     let (rotate, mirror) = orientation(live);
     Look {
         rotate,
@@ -1501,11 +1418,10 @@ fn look(live: &Live, preview: bool) -> Look {
         codec: live.codec,
         fps: live.fps,
         out_height: live.resolution,
-        preview,
     }
 }
 
-/// Plain ffmpeg arguments for a rotation and mirror, everything else at its default (720p, 30 fps, no preview).
+/// Plain ffmpeg arguments for a rotation and mirror, everything else at its default (720p, 30 fps).
 pub fn ffmpeg_args(device: &str, fps: u32, rotate: u16, mirror: bool) -> Vec<String> {
     look::ffmpeg_args_for(
         device,
