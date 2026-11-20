@@ -175,10 +175,10 @@ class MainActivity : Activity() {
     /**
      * Shows the preview upright on this screen, like a camera app. The camera service already hands the texture a
      * picture that is upright for the phone's natural (held upright) position, so the view is portrait shaped and
-     * only needs a turn when the screen itself is turned. The front camera is shown mirrored.
+     * only needs a turn when the screen itself is turned. The front camera is not mirrored,
+     * so the preview matches the picture the PC gets.
      */
     private fun applyPreviewLook() {
-        val front = EnkiSettings.getString("camera.facing") == "front"
         @Suppress("DEPRECATION")
         val display = when (windowManager.defaultDisplay.rotation) {
             android.view.Surface.ROTATION_90 -> 90
@@ -197,12 +197,8 @@ class MainActivity : Activity() {
         previewView.pivotX = bw / 2
         previewView.pivotY = bh / 2
         previewView.rotation = display.toFloat()
-        // Scaling happens before the turn, so the mirror runs along the texture's own axis that ends up horizontal.
-        var sx = fit
-        var sy = fit
-        if (front) { if (quarter) sy = -fit else sx = -fit }
-        previewView.scaleX = sx
-        previewView.scaleY = sy
+        previewView.scaleX = fit
+        previewView.scaleY = fit
     }
 
     // ---- settings screen, built from the shared schema ----
