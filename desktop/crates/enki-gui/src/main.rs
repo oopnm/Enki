@@ -284,8 +284,8 @@ impl App {
         }
         // Header: the seal and the name, then the two rivers (computer and phone).
         let header = GtkBox::new(Orientation::Horizontal, 12);
-        if let Ok(texture) = gtk::gdk::Texture::from_bytes(&glib::Bytes::from_static(LOGO_PNG)) {
-            let logo = gtk::Image::from_paintable(Some(&texture));
+        if let Ok(pixbuf) = gtk::gdk_pixbuf::Pixbuf::from_read(std::io::Cursor::new(LOGO_PNG)) {
+            let logo = gtk::Image::from_pixbuf(Some(&pixbuf));
             logo.set_pixel_size(44);
             header.append(&logo);
         }
