@@ -9,6 +9,6 @@ Homepage: https://github.com/oopnm/Enki
 Package: enki
 Architecture: any
 Depends: ${shlibs:Depends}, ${misc:Depends}, ffmpeg, adb, scrcpy, v4l2loopback-dkms, v4l-utils, pkexec | policykit-1
-Recommends: mpv
+Recommends: mpv, fonts-noto-cjk
 Description: Use your phone as a webcam, microphone and screen source
  Enki turns an Android phone into a Linux webcam via v4l2loopback and streams the phone screen using scrcpy.
