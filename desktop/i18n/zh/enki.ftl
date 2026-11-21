@@ -137,3 +137,16 @@ button-preview = 预览 (mpv)
 log-preview-missing = 预览需要 mpv。请先安装(例如:sudo pacman -S mpv),然后再点预览。
 log-preview-failed = mpv 无法显示相机画面。串流是否在运行?
 setting-phone-show-preview = 在此手机上显示相机预览
+
+# Phase 6
+setting-ui-language--tr = Türkçe
+setting-ui-language--fa = فارسی
+setting-ui-language--ckb = کوردیی ناوەندی
+setting-ui-language--es = Español
+setting-ui-language--fr = Français
+setting-ui-language--ru = Русский
+setting-ui-language--de = Deutsch
+setting-ui-language--pt = Português
+setting-ui-language--ja = 日本語
+setting-ui-language--hi = हिन्दी
+setting-ui-reduce-motion = 减少动画（静止的水面，不显示流动的波浪）

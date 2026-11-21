@@ -140,3 +140,16 @@ button-preview = Preview (mpv)
 log-preview-missing = The preview needs mpv. Install it (for example: sudo pacman -S mpv) and press Preview again.
 log-preview-failed = mpv could not show the camera. Is the stream running?
 setting-phone-show-preview = Show the camera preview on this phone
+
+# Phase 6
+setting-ui-language--tr = Türkçe
+setting-ui-language--fa = فارسی
+setting-ui-language--ckb = کوردیی ناوەندی
+setting-ui-language--es = Español
+setting-ui-language--fr = Français
+setting-ui-language--ru = Русский
+setting-ui-language--de = Deutsch
+setting-ui-language--pt = Português
+setting-ui-language--ja = 日本語
+setting-ui-language--hi = हिन्दी
+setting-ui-reduce-motion = Reduce motion (still water, no moving waves)

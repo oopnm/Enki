@@ -98,4 +98,15 @@
     <string name="setting_phone_auto_start">بدء البث عند فتح التطبيق</string>
     <string name="setting_video_fps__120">120 إطار/ث (وضع عالي السرعة، 720p، تأخير أعلى)</string>
     <string name="setting_phone_show_preview">عرض معاينة الكاميرا على هذا الهاتف</string>
+    <string name="setting_ui_language__tr">Türkçe</string>
+    <string name="setting_ui_language__fa">فارسی</string>
+    <string name="setting_ui_language__ckb">کوردیی ناوەندی</string>
+    <string name="setting_ui_language__es">Español</string>
+    <string name="setting_ui_language__fr">Français</string>
+    <string name="setting_ui_language__ru">Русский</string>
+    <string name="setting_ui_language__de">Deutsch</string>
+    <string name="setting_ui_language__pt">Português</string>
+    <string name="setting_ui_language__ja">日本語</string>
+    <string name="setting_ui_language__hi">हिन्दी</string>
+    <string name="setting_ui_reduce_motion">تقليل الحركة (ماء ساكن بلا أمواج متحركة)</string>
 </resources>

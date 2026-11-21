@@ -3,6 +3,10 @@
 //! from the Fluent files in `desktop/i18n`; changing the language rebuilds the window in the new language, with
 //! right-to-left layout for Arabic.
 
+mod abzu;
+mod tokens;
+
+use abzu::{Motion, Visual};
 use enki_i18n::I18n;
 use enki_receiver::enki_settings::{Hub, Kind, Scope, SettingsHandle, Store};
 use gtk::glib;
@@ -25,6 +29,10 @@ use tokio::sync::{mpsc, oneshot};
 const APP_ID: &str = "io.github.oopnm.Enki";
 /// Named colors shared with the phone app (generated from protocol/tokens.json).
 const TOKENS_CSS: &str = include_str!("tokens.css");
+/// The Abzu look: deep-water gradient, glowing cards, aqua accents.
+const THEME_CSS: &str = include_str!("theme.css");
+/// The logo (a cylinder seal), shown in the window header.
+const LOGO_PNG: &[u8] = include_bytes!("logo.png");
 
 /// What the status line says. Rendered with the current language each time, so a language change updates it.
 #[derive(Debug, Clone, PartialEq)]
@@ -118,6 +126,8 @@ struct App {
     control_slot: RefCell<Option<mpsc::UnboundedSender<enki_receiver::Control>>>,
     /// نوع المشكلة التي يعالجها زر الإصلاح الظاهر حالياً.
     fix_slot: RefCell<Option<enki_receiver::ProblemCode>>,
+    /// Drives the waves and the two rivers.
+    motion: Rc<Motion>,
 }
 
 fn main() -> glib::ExitCode {
@@ -138,7 +148,7 @@ fn main() -> glib::ExitCode {
 fn build_ui(app: &Application, rt: Handle) {
     if let Some(display) = gtk::gdk::Display::default() {
         let provider = gtk::CssProvider::new();
-        provider.load_from_data(TOKENS_CSS);
+        provider.load_from_data(&format!("{TOKENS_CSS}\n{THEME_CSS}"));
         gtk::style_context_add_provider_for_display(
             &display,
             &provider,
@@ -146,6 +156,9 @@ fn build_ui(app: &Application, rt: Handle) {
         );
     }
 
+    if let Some(settings) = gtk::Settings::default() {
+        settings.set_gtk_application_prefer_dark_theme(true);
+    }
     let (hub, warning) = Hub::open(Store::new(Store::default_dir()));
     let hub = hub.handle();
     // اكتشاف تلقائي: إن وُجد جهاز v4l2loopback باسم Enki نستخدمه بدل الكتابة اليدوية (إن لم يختر المستخدم جهازاً)
@@ -165,8 +178,9 @@ fn build_ui(app: &Application, rt: Handle) {
         .application(app)
         .title("Enki")
         .default_width(680)
-        .default_height(720)
+        .default_height(760)
         .build();
+    window.add_css_class("enki");
     // tokio::sync::mpsc لا يحتاج runtime لانتظار الاستقبال، فيمكن انتظاره مباشرة داخل حلقة GLib الرئيسية.
     let (tx, mut rx) = mpsc::unbounded_channel::<UiEvent>();
 
@@ -194,6 +208,7 @@ fn build_ui(app: &Application, rt: Handle) {
         stop_slot: RefCell::new(None),
         control_slot: RefCell::new(None),
         fix_slot: RefCell::new(None),
+        motion: Motion::new(),
     });
     if let Some(w) = warning {
         let message = app_state
@@ -203,6 +218,14 @@ fn build_ui(app: &Application, rt: Handle) {
         append_log(&app_state.log_buffer, &format!("⚠️ {message}\n"));
     }
     app_state.rebuild();
+    app_state.apply_motion_settings();
+    {
+        // The water rests while the window is not in front (also when it is minimised).
+        let motion = app_state.motion.clone();
+        app_state
+            .window
+            .connect_is_active_notify(move |w| motion.set_active(w.is_active()));
+    }
 
     // --- قناة الأحداث: Tokio -> GTK ---
     {
@@ -219,6 +242,15 @@ fn build_ui(app: &Application, rt: Handle) {
 impl App {
     fn tr(&self, id: &str) -> String {
         self.i18n.borrow().tr(id)
+    }
+
+    /// "Reduce motion" is on when the setting says so or when the desktop turned animations off.
+    fn apply_motion_settings(&self) {
+        let setting = self.hub.lock().unwrap().get_bool("ui.reduce_motion");
+        let system_off = gtk::Settings::default()
+            .map(|s| !s.is_gtk_enable_animations())
+            .unwrap_or(false);
+        self.motion.set_reduce(setting || system_off);
     }
 
     fn log(&self, text: &str) {
@@ -239,7 +271,9 @@ impl App {
         });
         self.controls.borrow_mut().clear();
 
+        let root = GtkBox::new(Orientation::Vertical, 0);
         let main_box = GtkBox::new(Orientation::Vertical, 12);
+        main_box.set_vexpand(true);
         for set in [
             GtkBox::set_margin_start,
             GtkBox::set_margin_end,
@@ -248,27 +282,39 @@ impl App {
         ] {
             set(&main_box, 16);
         }
-        main_box.append(
-            &Label::builder()
-                .label(format!("<b>{}</b>", self.tr("app-title")))
-                .use_markup(true)
-                .xalign(0.0)
-                .build(),
-        );
+        // Header: the seal and the name, then the two rivers (computer and phone).
+        let header = GtkBox::new(Orientation::Horizontal, 12);
+        if let Ok(texture) = gtk::gdk::Texture::from_bytes(&glib::Bytes::from_static(LOGO_PNG)) {
+            let logo = gtk::Image::from_paintable(Some(&texture));
+            logo.set_pixel_size(44);
+            header.append(&logo);
+        }
+        let title = Label::builder()
+            .label(self.tr("app-title"))
+            .xalign(0.0)
+            .build();
+        title.add_css_class("enki-title");
+        header.append(&title);
+        main_box.append(&header);
+        main_box.append(&self.motion.river_area(64));
 
         // مؤشر حالة البث واسم الهاتف
         let status_label = Label::builder().xalign(0.0).use_markup(true).build();
         let phone_label = Label::builder().xalign(0.0).build();
+        status_label.add_css_class("enki-status");
+        status_label.set_halign(gtk::Align::Start);
+        phone_label.add_css_class("enki-dim");
+        let info_label = Label::builder().xalign(0.0).build();
+        info_label.add_css_class("enki-dim");
         main_box.append(&status_label);
         main_box.append(&phone_label);
-        let info_label = Label::builder().xalign(0.0).build();
         main_box.append(&info_label);
         *self.info_label.borrow_mut() = info_label;
         *self.status_label.borrow_mut() = status_label;
         *self.phone_label.borrow_mut() = phone_label;
 
         // الإعدادات: تُبنى من المخطط المشترك، مجموعة بعد مجموعة.
-        let settings_box = GtkBox::new(Orientation::Vertical, 8);
+        let settings_box = GtkBox::new(Orientation::Vertical, 12);
         for group in &schema.groups {
             let defs: Vec<_> = schema
                 .settings
@@ -278,21 +324,22 @@ impl App {
             if defs.is_empty() {
                 continue;
             }
-            settings_box.append(
-                &Label::builder()
-                    .label(format!("<b>{}</b>", self.tr(&format!("group-{group}"))))
-                    .use_markup(true)
-                    .xalign(0.0)
-                    .build(),
-            );
+            // Each group is a card: a heading, a line of cuneiform-style marks, then the controls.
+            let card = GtkBox::new(Orientation::Vertical, 8);
+            card.add_css_class("enki-card");
+            card.append(&section_heading(&self.tr(&format!("group-{group}")), group));
             for def in defs {
                 if let Some(row) = self.control_row(def) {
-                    settings_box.append(&row);
+                    card.append(&row);
                 }
             }
+            settings_box.append(&card);
         }
 
         // خيارات scrcpy فقط (ليست جزءاً من المخطط بعد)
+        let scrcpy_card = GtkBox::new(Orientation::Vertical, 8);
+        scrcpy_card.add_css_class("enki-card");
+        scrcpy_card.append(&section_heading("scrcpy", "scrcpy"));
         let res_box = GtkBox::new(Orientation::Horizontal, 10);
         res_box.append(&row_label(&self.tr("label-resolution")));
         let resolution = DropDown::new(
@@ -305,19 +352,21 @@ impl App {
         );
         resolution.set_selected(self.resolution.borrow().selected().min(2));
         res_box.append(&resolution);
-        settings_box.append(&res_box);
+        scrcpy_card.append(&res_box);
         *self.resolution.borrow_mut() = resolution;
         let audio = CheckButton::builder()
             .label(self.tr("check-audio"))
             .active(self.audio.borrow().is_active())
             .build();
-        settings_box.append(&audio);
+        scrcpy_card.append(&audio);
+        settings_box.append(&scrcpy_card);
         *self.audio.borrow_mut() = audio;
         // الإعدادات كثيرة: تُعرض داخل منطقة تمرير كي لا تطول النافذة.
         main_box.append(
             &ScrolledWindow::builder()
                 .hscrollbar_policy(gtk::PolicyType::Never)
-                .min_content_height(320)
+                .min_content_height(300)
+                .vexpand(true)
                 .child(&settings_box)
                 .build(),
         );
@@ -329,9 +378,11 @@ impl App {
             .label(self.tr("button-start"))
             .sensitive(self.stop_slot.borrow().is_none())
             .build();
+        start_btn.add_css_class("enki-primary");
         let stop_btn = Button::builder().label(self.tr("button-stop")).build();
         // يظهر فقط بعد مشكلة لها إصلاح (انظر fix_message).
         let fix_btn = Button::builder().visible(false).build();
+        fix_btn.add_css_class("enki-fix");
         if let Some(code) = *self.fix_slot.borrow() {
             if let Some(id) = fix_message(code) {
                 fix_btn.set_label(&self.tr(id));
@@ -347,28 +398,32 @@ impl App {
         *self.fix_btn.borrow_mut() = fix_btn.clone();
 
         // السجلات
-        main_box.append(
-            &Label::builder()
-                .label(format!("<b>{}</b>", self.tr("log-title")))
-                .use_markup(true)
-                .xalign(0.0)
-                .build(),
-        );
+        let log_card = GtkBox::new(Orientation::Vertical, 6);
+        log_card.add_css_class("enki-card");
+        log_card.set_vexpand(true);
+        log_card.append(&section_heading(&self.tr("log-title"), "log"));
         let text_view = TextView::builder()
             .buffer(&self.log_buffer)
             .editable(false)
             .monospace(true)
             .wrap_mode(gtk::WrapMode::WordChar)
             .build();
-        main_box.append(
+        text_view.add_css_class("enki-log");
+        text_view.set_left_margin(6);
+        text_view.set_top_margin(4);
+        log_card.append(
             &ScrolledWindow::builder()
                 .hscrollbar_policy(gtk::PolicyType::Automatic)
                 .vscrollbar_policy(gtk::PolicyType::Automatic)
+                .min_content_height(110)
                 .child(&text_view)
                 .vexpand(true)
                 .build(),
         );
-        self.window.set_child(Some(&main_box));
+        main_box.append(&log_card);
+        root.append(&main_box);
+        root.append(&self.motion.wave_area(76));
+        self.window.set_child(Some(&root));
 
         // --- ربط الأزرار ---
         {
@@ -594,6 +649,9 @@ impl App {
         if let Some(error) = self.hub.lock().unwrap().take_save_error() {
             self.log(&format!("⚠️ {error}\n"));
         }
+        if key == "ui.reduce_motion" {
+            self.apply_motion_settings();
+        }
         if key == "ui.language" {
             let lang = self.hub.lock().unwrap().get_string("ui.language");
             *self.i18n.borrow_mut() = I18n::new(&lang);
@@ -648,6 +706,22 @@ impl App {
         } else {
             ""
         };
+        let (class, visual) = match &*self.status.borrow() {
+            Status::Stopped => ("idle", Visual::Idle),
+            Status::Preparing
+            | Status::WaitingApp
+            | Status::OpeningCamera
+            | Status::Reconnecting => ("busy", Visual::Linking),
+            Status::Connected | Status::Streaming { .. } => ("live", Visual::Live),
+        };
+        {
+            let label = self.status_label.borrow();
+            for c in ["idle", "busy", "live"] {
+                label.remove_css_class(c);
+            }
+            label.add_css_class(class);
+        }
+        self.motion.set_visual(visual);
         self.status_label.borrow().set_markup(&format!(
             "<b>{}: {dot}{}</b>",
             i18n.tr("status-label"),
@@ -1038,6 +1112,16 @@ fn parse_video_nr(device: &str) -> Option<u32> {
     device.trim().strip_prefix("/dev/video")?.parse().ok()
 }
 
+/// A group heading with a line of cuneiform-style marks under it.
+fn section_heading(text: &str, seed: &str) -> GtkBox {
+    let b = GtkBox::new(Orientation::Vertical, 2);
+    let label = Label::builder().label(text).xalign(0.0).build();
+    label.add_css_class("enki-heading");
+    b.append(&label);
+    b.append(&Motion::divider_area(seed));
+    b
+}
+
 fn row_label(text: &str) -> Label {
     Label::builder()
         .label(text)
@@ -1070,7 +1154,7 @@ mod tests {
     #[test]
     fn every_desktop_setting_and_choice_has_a_translation() {
         let schema = enki_receiver::enki_settings::Schema::builtin();
-        for lang in ["en", "ar", "zh"] {
+        for (lang, _, _) in enki_i18n::LANGUAGES.iter() {
             let i18n = I18n::new(lang);
             for def in schema.settings.iter().filter(|d| d.on_desktop()) {
                 assert_ne!(

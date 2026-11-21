@@ -16,4 +16,5 @@ jobs:
       - uses: actions/checkout@v4
       - run: python3 tools/gen_settings.py --check
       - run: python3 tools/gen_tokens.py --check
+      - run: python3 tools/gen_translations.py --check
       - run: python3 tools/check_i18n.py
