@@ -13,9 +13,9 @@ screens, then the look.
 | 3 | Enki-Link v2: best possible communication | done, tested (PR #3) |
 | 4 | Unified settings engine, i18n skeleton, design tokens | done, tested (PR #4) |
 | 5 | DroidCam-class camera settings and live preview | done, tested (PR #5) |
-| 6 | "Abzu" theme, wave animation, full translations | built, waiting for the phone and desktop test |
-| 7 | Microphone and audio | planned |
-| 8 | Wi-Fi, pairing and encryption | planned |
+| 6 | "Abzu" theme, wave animation, full translations | done, tested (PR #6) |
+| 7 | Wi-Fi, pairing and encryption (moved before audio, 2026-11-23) | planned |
+| 8 | Microphone and audio | planned |
 | 9 | Polish and 1.0 | planned |
 
 Phases 7 and 8 can swap places.
@@ -148,20 +148,20 @@ Done when: both apps look and read the same, Arabic RTL has no broken widget,
 and idle drawing stays under the CPU target (check: `top -p $(pgrep -x enki)` with the window focused and idle,
 expected under 1%).
 
-## Phase 7: Audio
-
-- Phone microphone over an audio channel with timestamps shared with video.
-- Shows up on the computer as a real microphone through a virtual PipeWire /
-  PulseAudio source.
-- Synced settings: mute, gain, noise suppression, echo cancellation, source.
-
-## Phase 8: Wi-Fi and pairing
+## Phase 7: Wi-Fi and pairing
 
 - mDNS discovery and pairing with a QR code carrying the address, the
   certificate fingerprint and a one-time token.
 - Mutual TLS 1.3 with pinned certificates, so nobody on the network can see the
   camera.
 - USB, Wi-Fi and hotspot all use the same protocol from phase 3.
+
+## Phase 8: Audio
+
+- Phone microphone over an audio channel with timestamps shared with video.
+- Shows up on the computer as a real microphone through a virtual PipeWire /
+  PulseAudio source.
+- Synced settings: mute, gain, noise suppression, echo cancellation, source.
 
 ## Phase 9: Polish and 1.0
 
