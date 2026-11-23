@@ -11,9 +11,9 @@ screens, then the look.
 | 1 | Phone camera (Camera2 → H.264 → TCP), desktop receiver, auto rotate | done (PR #1) |
 | 2 | Release 0.2.0 (packaging dependencies, version bump) | done |
 | 3 | Enki-Link v2: best possible communication | done, tested (PR #3) |
-| 4 | Unified settings engine, i18n skeleton, design tokens | built, waiting for a test on the phone |
-| 5 | DroidCam-class camera settings and live preview | built, waiting for the phone test |
-| 6 | "Abzu" theme, wave animation, full translations | planned |
+| 4 | Unified settings engine, i18n skeleton, design tokens | done, tested (PR #4) |
+| 5 | DroidCam-class camera settings and live preview | done, tested (PR #5) |
+| 6 | "Abzu" theme, wave animation, full translations | built, waiting for the phone and desktop test |
 | 7 | Microphone and audio | planned |
 | 8 | Wi-Fi, pairing and encryption | planned |
 | 9 | Polish and 1.0 | planned |
@@ -130,8 +130,23 @@ Kurdish, Spanish, French, Russian, German, Portuguese, Japanese, Hindi. First
 translations are machine-assisted and marked "needs review". CJK fonts are not
 bundled; they are an optional dependency of the packages.
 
+What was built (all in one branch):
+
+- Shared tokens (`protocol/tokens.json`) now also generate `tokens.rs`, the colors as Cairo floats.
+- Desktop: `theme.css` (gradient window, glowing cards, aqua buttons, sliders, drop-downs, log), `abzu.rs` (waves,
+  the two rivers, cuneiform-style dividers, one timer capped at 30 fps and 15 fps when calm, stopped when the window
+  is not focused or motion is reduced), the seal logo in the header.
+- Android: `Theme.Enki`, the same cards, `WaveView`, `RiverView`, `CuneiformView` and one clock (`AbzuMotion`) that
+  stops in black-screen mode, when the screen is not in front, and with "reduce motion".
+- New local setting `ui.reduce_motion` (also follows the desktop's / phone's own "no animations").
+- Logo: a cylinder seal with an original goat-fish, `packaging/icons/enki.svg`; PNGs for the desktop, AppImage and
+  the Android launcher come from it.
+- 13 languages (see `docs/LANGUAGES.md`); the ten new ones come from `tools/translations/*.ftl` through
+  `tools/gen_translations.py`; CI checks that every language has every text and that generated files are current.
+
 Done when: both apps look and read the same, Arabic RTL has no broken widget,
-and idle drawing stays under the CPU target.
+and idle drawing stays under the CPU target (check: `top -p $(pgrep -x enki)` with the window focused and idle,
+expected under 1%).
 
 ## Phase 7: Audio
 

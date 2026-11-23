@@ -37,7 +37,8 @@ object SettingsSchema {
         SettingDef("phone.thermal_reduce", "phone", SettingKind.Bool, true, Scope.SYNCED, Apply.LIVE, true),
         SettingDef("phone.auto_start", "phone", SettingKind.Bool, false, Scope.LOCAL, Apply.PASSIVE, true),
         SettingDef("phone.show_preview", "phone", SettingKind.Bool, true, Scope.LOCAL, Apply.PASSIVE, true),
-        SettingDef("ui.language", "app", SettingKind.Choice(listOf("system", "en", "ar", "zh")), "system", Scope.LOCAL, Apply.PASSIVE, true),
+        SettingDef("ui.language", "app", SettingKind.Choice(listOf("system", "en", "ar", "zh", "tr", "fa", "ckb", "es", "fr", "ru", "de", "pt", "ja", "hi")), "system", Scope.LOCAL, Apply.PASSIVE, true),
+        SettingDef("ui.reduce_motion", "app", SettingKind.Bool, false, Scope.LOCAL, Apply.PASSIVE, true),
         SettingDef("source.mode", "app", SettingKind.Choice(listOf("enki_camera", "scrcpy_camera", "screen_window", "screen_v4l2")), "enki_camera", Scope.LOCAL, Apply.PASSIVE, false),
         SettingDef("output.device", "app", SettingKind.Text(64), "/dev/video10", Scope.LOCAL, Apply.PASSIVE, false),
     )

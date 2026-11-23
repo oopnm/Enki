@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """CI check: the languages and the apps agree.
 
-  * Android values/, values-ar/ and values-zh/ define the same string names with the same placeholders.
-  * The desktop Fluent files en/, ar/ and zh/ define the same message ids with the same $variables.
+  * Android values/ and values-<lang>/ define the same string names with the same placeholders.
+  * The desktop Fluent files of every language define the same message ids with the same $variables.
   * Every setting in protocol/settings.json has a label (and a label for each choice) in every language of each
     app that shows it, and each group has a heading. A setting without a control in an app fails the build.
 """
@@ -13,7 +13,7 @@ import sys
 import xml.etree.ElementTree as ET
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-LANGS = ["en", "ar", "zh"]
+LANGS = ["en", "ar", "zh", "tr", "fa", "ckb", "es", "fr", "ru", "de", "pt", "ja", "hi"]
 errors = []
 
 

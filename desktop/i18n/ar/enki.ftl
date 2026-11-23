@@ -137,3 +137,16 @@ button-preview = معاينة (mpv)
 log-preview-missing = المعاينة تحتاج mpv. ثبّته (مثلاً: sudo pacman -S mpv) ثم اضغط معاينة مرة أخرى.
 log-preview-failed = تعذّر على mpv عرض الكاميرا. هل البث يعمل؟
 setting-phone-show-preview = عرض معاينة الكاميرا على هذا الهاتف
+
+# Phase 6
+setting-ui-language--tr = Türkçe
+setting-ui-language--fa = فارسی
+setting-ui-language--ckb = کوردیی ناوەندی
+setting-ui-language--es = Español
+setting-ui-language--fr = Français
+setting-ui-language--ru = Русский
+setting-ui-language--de = Deutsch
+setting-ui-language--pt = Português
+setting-ui-language--ja = 日本語
+setting-ui-language--hi = हिन्दी
+setting-ui-reduce-motion = تقليل الحركة (ماء ساكن بلا أمواج متحركة)

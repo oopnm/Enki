@@ -7,6 +7,10 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
 import android.graphics.SurfaceTexture
+import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
+import android.provider.Settings
+import android.widget.ImageView
 import android.view.Gravity
 import android.view.TextureView
 import android.view.View
@@ -34,6 +38,7 @@ import io.github.oopnm.enki.link.SettingsSchema
  */
 class MainActivity : Activity() {
     private lateinit var statusView: TextView
+    private lateinit var river: RiverView
     private lateinit var toggle: Button
     private lateinit var settingsBox: LinearLayout
 
@@ -54,27 +59,41 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        val pad = (24 * resources.displayMetrics.density).toInt()
+        val dp = resources.displayMetrics.density
+        val pad = (24 * dp).toInt()
+        // Header: the seal and the name.
         val title = TextView(this).apply {
             text = getString(R.string.app_name)
-            textSize = 28f
-            gravity = Gravity.CENTER
+            textSize = 30f
+            typeface = Typeface.DEFAULT_BOLD
+            letterSpacing = 0.14f
+            setTextColor(getColor(R.color.enki_foam))
+            setShadowLayer(18f, 0f, 0f, withAlpha(getColor(R.color.enki_aqua), 0.5f))
         }
-        statusView = TextView(this).apply {
-            textSize = 16f
+        val header = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
-            setPadding(0, pad / 2, 0, pad / 2)
+            addView(ImageView(this@MainActivity).apply { setImageResource(R.mipmap.ic_launcher) }, LinearLayout.LayoutParams((48 * dp).toInt(), (48 * dp).toInt()))
+            addView(title, LinearLayout.LayoutParams(-2, -2).apply { marginStart = (12 * dp).toInt() })
+        }
+        river = RiverView(this).apply { layoutParams = LinearLayout.LayoutParams(-1, (64 * dp).toInt()) }
+        statusView = TextView(this).apply {
+            textSize = 15f
+            gravity = Gravity.CENTER
+            setTextColor(getColor(R.color.enki_foam))
+            setPadding((16 * dp).toInt(), (6 * dp).toInt(), (16 * dp).toInt(), (6 * dp).toInt())
+            layoutParams = LinearLayout.LayoutParams(-2, -2).apply { gravity = Gravity.CENTER_HORIZONTAL; bottomMargin = pad / 2 }
         }
         toggle = Button(this).apply { setOnClickListener { onToggle() } }
         settingsBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         val hint = TextView(this).apply {
             textSize = 14f
             gravity = Gravity.CENTER
+            setTextColor(withAlpha(getColor(R.color.enki_foam), 0.65f))
             setPadding(0, pad, 0, 0)
             text = getString(R.string.hint_connect, Link.DEFAULT_PORT) +
                 "\n\nEnki Link v${Link.VERSION} · Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})"
         }
-        val dp = resources.displayMetrics.density
         previewView = TextureView(this).apply {
             surfaceTextureListener = object : TextureView.SurfaceTextureListener {
                 override fun onSurfaceTextureAvailable(st: SurfaceTexture, w: Int, h: Int) {
@@ -104,8 +123,9 @@ class MainActivity : Activity() {
         }
         val column = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(pad, pad, pad, pad)
-            addView(title)
+            setPadding(pad, pad, pad, pad + (76 * dp).toInt()) // the waves cover the bottom of the screen
+            addView(header)
+            addView(river)
             addView(statusView)
             addView(toggle)
             addView(previewFrame)
@@ -124,6 +144,7 @@ class MainActivity : Activity() {
         setContentView(
             FrameLayout(this).apply {
                 addView(ScrollView(this@MainActivity).apply { addView(column) })
+                addView(WaveView(this@MainActivity), FrameLayout.LayoutParams(-1, (76 * dp).toInt(), Gravity.BOTTOM))
                 addView(blackout, FrameLayout.LayoutParams(-1, -1))
             },
         )
@@ -139,11 +160,19 @@ class MainActivity : Activity() {
         super.onStart()
         EnkiState.listener = { runOnUiThread { render() } }
         EnkiSettings.changeListeners.add(redraw)
+        AbzuMotion.setForeground(hasWindowFocus())
         render()
         renderSettings()
     }
 
+    /** The water rests while another window is in front. */
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        AbzuMotion.setForeground(hasFocus)
+    }
+
     override fun onStop() {
+        AbzuMotion.setForeground(false)
         EnkiState.listener = null
         EnkiSettings.changeListeners.remove(redraw)
         super.onStop()
@@ -152,6 +181,18 @@ class MainActivity : Activity() {
     private fun render() {
         statusView.text = EnkiState.status
         toggle.text = getString(if (EnkiState.running) R.string.stop else R.string.start)
+        val visual = when {
+            !EnkiState.running -> AbzuVisual.IDLE
+            EnkiState.status == LinkServer.STREAMING -> AbzuVisual.LIVE
+            else -> AbzuVisual.LINKING
+        }
+        AbzuMotion.setVisual(visual)
+        val edge = when (visual) {
+            AbzuVisual.LIVE -> R.color.enki_aqua
+            else -> R.color.enki_lapis
+        }
+        statusView.background = rounded(withAlpha(getColor(R.color.enki_abyss), 0.6f), getColor(edge), 20f)
+        styleButton(toggle, primary = !EnkiState.running)
         applyScreenSettings()
     }
 
@@ -166,6 +207,13 @@ class MainActivity : Activity() {
             screenBrightness = if (black) 0.01f else WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE
         }
         blackout.visibility = if (black) View.VISIBLE else View.GONE
+        // Nothing is visible in black-screen mode, so the water stops. "Reduce motion" is the setting, or the
+        // phone's own "remove animations" (animator scale 0).
+        AbzuMotion.setPaused(black)
+        AbzuMotion.setReduce(
+            EnkiSettings.getBool("ui.reduce_motion") ||
+                Settings.Global.getFloat(contentResolver, Settings.Global.ANIMATOR_DURATION_SCALE, 1f) == 0f,
+        )
         // The preview exists only while it is wanted and visible: a hidden view gives its texture back to the system.
         previewFrame.visibility =
             if (EnkiSettings.getBool("phone.show_preview") && !black) View.VISIBLE else View.GONE
@@ -209,6 +257,32 @@ class MainActivity : Activity() {
         return if (id != 0) getString(id) else null
     }
 
+    private fun withAlpha(color: Int, alpha: Float) = (color and 0x00FFFFFF) or ((alpha * 255).toInt() shl 24)
+
+    private fun rounded(fill: Int, stroke: Int, radiusDp: Float) = GradientDrawable().apply {
+        setColor(fill)
+        cornerRadius = radiusDp * resources.displayMetrics.density
+        setStroke((1 * resources.displayMetrics.density).toInt().coerceAtLeast(1), stroke)
+    }
+
+    /** The main button: aqua when it starts something, an outline when it stops. */
+    private fun styleButton(button: Button, primary: Boolean) {
+        val radius = 12f * resources.displayMetrics.density
+        if (primary) {
+            button.background = GradientDrawable(
+                GradientDrawable.Orientation.TOP_BOTTOM,
+                intArrayOf(getColor(R.color.enki_aqua), getColor(R.color.enki_lapis)),
+            ).apply { cornerRadius = radius }
+            button.setTextColor(getColor(R.color.enki_abyss))
+        } else {
+            button.background = rounded(withAlpha(getColor(R.color.enki_lapis), 0.35f), getColor(R.color.enki_lapis), 12f)
+            button.setTextColor(getColor(R.color.enki_foam))
+        }
+        button.typeface = Typeface.DEFAULT_BOLD
+        button.isAllCaps = false
+        button.stateListAnimator = null
+    }
+
     private fun resName(key: String) = key.replace('.', '_')
 
     private fun labelOf(def: SettingDef) = stringByName("setting_${resName(def.key)}") ?: def.key
@@ -219,16 +293,27 @@ class MainActivity : Activity() {
         applyScreenSettings()
         rendering = true
         settingsBox.removeAllViews()
-        val pad = (12 * resources.displayMetrics.density).toInt()
+        val dp = resources.displayMetrics.density
         for (group in SettingsSchema.defs.filter { it.onPhone }.groupBy { it.group }) {
-            settingsBox.addView(
+            // Each group is a card: a heading, a line of cuneiform-style marks, then the controls.
+            val card = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                background = rounded(withAlpha(getColor(R.color.enki_water), 0.55f), withAlpha(getColor(R.color.enki_lapis), 0.55f), 12f)
+                setPadding((14 * dp).toInt(), (10 * dp).toInt(), (14 * dp).toInt(), (10 * dp).toInt())
+                layoutParams = LinearLayout.LayoutParams(-1, -2).apply { topMargin = (12 * dp).toInt() }
+            }
+            card.addView(
                 TextView(this).apply {
                     text = stringByName("group_${group.key}") ?: group.key
-                    textSize = 18f
-                    setPadding(0, pad * 2, 0, pad / 2)
+                    textSize = 13f
+                    typeface = Typeface.DEFAULT_BOLD
+                    letterSpacing = 0.08f
+                    setTextColor(getColor(R.color.enki_aqua))
                 },
             )
-            for (def in group.value) settingsBox.addView(controlFor(def))
+            card.addView(CuneiformView(this, group.key))
+            for (def in group.value) card.addView(controlFor(def))
+            settingsBox.addView(card)
         }
         rendering = false
     }

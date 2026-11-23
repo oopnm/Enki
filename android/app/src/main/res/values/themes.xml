@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Abzu: the fresh-water deep. Colors come from tokens.xml (generated from protocol/tokens.json). -->
+    <style name="Theme.Enki" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@drawable/enki_background</item>
+        <item name="android:colorBackground">@color/enki_deep</item>
+        <item name="android:colorBackgroundFloating">@color/enki_water</item>
+        <item name="android:textColorPrimary">@color/enki_foam</item>
+        <item name="android:textColorSecondary">#99BFEFFF</item>
+        <item name="android:colorAccent">@color/enki_aqua</item>
+        <item name="android:colorControlActivated">@color/enki_aqua</item>
+        <item name="android:colorControlNormal">@color/enki_lapis</item>
+        <item name="android:statusBarColor">@color/enki_abyss</item>
+        <item name="android:navigationBarColor">@color/enki_abyss</item>
+    </style>
+</resources>

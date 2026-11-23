@@ -368,9 +368,27 @@
         "system",
         "en",
         "ar",
-        "zh"
+        "zh",
+        "tr",
+        "fa",
+        "ckb",
+        "es",
+        "fr",
+        "ru",
+        "de",
+        "pt",
+        "ja",
+        "hi"
       ],
       "default": "system",
+      "scope": "local",
+      "apply": "passive"
+    },
+    {
+      "key": "ui.reduce_motion",
+      "group": "app",
+      "type": "bool",
+      "default": false,
       "scope": "local",
       "apply": "passive"
     },

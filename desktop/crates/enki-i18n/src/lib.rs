@@ -12,14 +12,24 @@ pub const LANGUAGES: &[(&str, &str, &str)] = &[
     ("en", "English", include_str!("../../../i18n/en/enki.ftl")),
     ("ar", "العربية", include_str!("../../../i18n/ar/enki.ftl")),
     ("zh", "中文", include_str!("../../../i18n/zh/enki.ftl")),
+    ("tr", "Türkçe", include_str!("../../../i18n/tr/enki.ftl")),
+    ("fa", "فارسی", include_str!("../../../i18n/fa/enki.ftl")),
+    ("ckb", "کوردیی ناوەندی", include_str!("../../../i18n/ckb/enki.ftl")),
+    ("es", "Español", include_str!("../../../i18n/es/enki.ftl")),
+    ("fr", "Français", include_str!("../../../i18n/fr/enki.ftl")),
+    ("ru", "Русский", include_str!("../../../i18n/ru/enki.ftl")),
+    ("de", "Deutsch", include_str!("../../../i18n/de/enki.ftl")),
+    ("pt", "Português", include_str!("../../../i18n/pt/enki.ftl")),
+    ("ja", "日本語", include_str!("../../../i18n/ja/enki.ftl")),
+    ("hi", "हिन्दी", include_str!("../../../i18n/hi/enki.ftl")),
 ];
 
 /// Languages written right to left.
 pub fn is_rtl(lang: &str) -> bool {
-    matches!(lang, "ar" | "he" | "fa" | "ur")
+    matches!(lang, "ar" | "he" | "fa" | "ur" | "ckb")
 }
 
-/// `en`, `ar` or `zh` from a locale string such as `ar_IQ.UTF-8`; `en` for anything else.
+/// One of the codes in `LANGUAGES` from a locale string such as `ar_IQ.UTF-8`; `en` for anything else.
 pub fn match_language(locale: &str) -> &'static str {
     let primary = locale
         .split(['_', '-', '.', '@'])
@@ -63,7 +73,7 @@ pub struct I18n {
 }
 
 impl I18n {
-    /// `lang` is `en`, `ar`, `zh` or `system`; anything else is English.
+    /// `lang` is a code in `LANGUAGES` or `system`; anything else is English.
     pub fn new(lang: &str) -> I18n {
         let code = if lang == "system" {
             system_language()
@@ -189,7 +199,15 @@ mod tests {
         assert!(I18n::new("ar").rtl() && !I18n::new("en").rtl() && !I18n::new("zh").rtl());
         assert_eq!(match_language("ar_IQ.UTF-8"), "ar");
         assert_eq!(match_language("zh-CN"), "zh");
-        assert_eq!(match_language("de_DE.UTF-8"), "en");
+        assert_eq!(match_language("de_DE.UTF-8"), "de");
+        assert_eq!(match_language("ckb_IQ.UTF-8"), "ckb");
+        assert_eq!(match_language("it_IT.UTF-8"), "en");
+        for rtl in ["ar", "fa", "ckb"] {
+            assert!(I18n::new(rtl).rtl(), "{rtl} is right to left");
+        }
+        for ltr in ["tr", "es", "fr", "ru", "de", "pt", "ja", "hi"] {
+            assert!(!I18n::new(ltr).rtl(), "{ltr} is left to right");
+        }
         assert_eq!(match_language(""), "en");
     }
 }
