@@ -1448,8 +1448,10 @@ async fn pump_frames(
 ) -> Result<(), PumpError> {
     let mut header = [0u8; FRAME_HEADER_LEN];
     let mut payload = Vec::new();
-    // After a restart the new decoder must start at a config frame (the phone sends one before every key frame).
-    let mut wait_for_config = false;
+    // A decoder must start at a config frame (the phone sends one before every key frame), also the first one:
+    // a connection that begins in the middle of a group of pictures (common over Wi-Fi) would otherwise feed
+    // it frames it cannot decode, and ffmpeg gives up when too many of them fail.
+    let mut wait_for_config = true;
     loop {
         stream
             .read_exact(&mut header)
