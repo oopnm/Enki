@@ -133,6 +133,28 @@ pub enum Message {
         #[serde(default)]
         message: String,
     },
+    /// PC → phone, on a Wi-Fi connection that proved a pairing key, or on the adb connection: "make me a paired
+    /// computer". `device` is the PC's settings device id and `name` its host name, shown on the phone.
+    Pair {
+        #[serde(default)]
+        name: String,
+        #[serde(default)]
+        device: String,
+    },
+    /// Phone → PC, the answer to `pair`: the secret that from now on proves this PC to the phone on Wi-Fi, the
+    /// SHA-256 of the phone's certificate (both hex), and where to find the phone.
+    Paired {
+        secret: String,
+        fingerprint: String,
+        #[serde(default)]
+        name: String,
+        #[serde(default)]
+        device_id: String,
+        #[serde(default)]
+        port: u16,
+        #[serde(default)]
+        hosts: Vec<String>,
+    },
     /// Any type this version does not know.
     #[serde(other)]
     Unknown,
@@ -386,6 +408,28 @@ mod tests {
             as_value(&Message::Capabilities(sample_caps())),
             from_vector("capabilities")
         );
+    }
+
+    #[test]
+    fn pairing_messages_match_the_shared_vectors() {
+        let as_value = |m: &Message| serde_json::from_str::<Value>(&m.to_json()).unwrap();
+        let from_vector = |n: &str| serde_json::from_str::<Value>(&vector(n)).unwrap();
+        let pair = Message::Pair {
+            name: "my-laptop".into(),
+            device: PC_ID.into(),
+        };
+        assert_eq!(Message::from_json(&vector("pair")).unwrap(), pair);
+        assert_eq!(as_value(&pair), from_vector("pair"));
+        let paired = Message::Paired {
+            secret: (0..32u8).map(|b| format!("{b:02x}")).collect(),
+            fingerprint: (100..132u8).map(|b| format!("{b:02x}")).collect(),
+            name: "Pixel 6".into(),
+            device_id: PHONE_ID.into(),
+            port: 28201,
+            hosts: vec!["192.168.1.20".into(), "10.0.0.5".into()],
+        };
+        assert_eq!(Message::from_json(&vector("paired")).unwrap(), paired);
+        assert_eq!(as_value(&paired), from_vector("paired"));
     }
 
     #[test]

@@ -109,4 +109,16 @@
     <string name="setting_ui_language__ja">日本語</string>
     <string name="setting_ui_language__hi">हिन्दी</string>
     <string name="setting_ui_reduce_motion">動きを減らす（静かな水面、動く波なし）</string>
+    <string name="wifi_forget">削除</string>
+    <string name="setting_wifi_enabled">Wi-Fi 接続を許可</string>
+    <string name="wifi_help">オンにすると、同じネットワーク上のペアリング済みパソコンがケーブルなしで接続できます。接続は暗号化されます。</string>
+    <string name="wifi_pair_title">パソコンをペアリング</string>
+    <string name="wifi_pair_hint">パソコンに表示されたコード</string>
+    <string name="wifi_pair_button">ペアリング</string>
+    <string name="wifi_pair_bad">コードは英数字 10 文字です</string>
+    <string name="wifi_waiting">パソコンでペアリングを開始してください（3 分間）…</string>
+    <string name="wifi_paired_computers">ペアリング済みのパソコン</string>
+    <string name="wifi_no_computers">ペアリング済みのパソコンはまだありません</string>
+    <string name="wifi_addresses">このスマートフォンのアドレス：</string>
+    <string name="wifi_paired_ok">パソコンとペアリングしました</string>
 </resources>

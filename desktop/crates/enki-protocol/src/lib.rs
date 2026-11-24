@@ -6,6 +6,7 @@
 //! All integers are big-endian. See `docs/protocol.md`.
 
 pub mod control;
+pub mod pairing;
 
 use hmac::{Hmac, Mac};
 use sha2::Sha256;

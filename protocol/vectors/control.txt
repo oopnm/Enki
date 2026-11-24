@@ -15,3 +15,5 @@ settings_snapshot_reply|{"type":"settings_snapshot","schema":1,"reply":true,"set
 setting|{"type":"setting","key":"video.rotate","value":"90","hlc":[1700000001000,0],"device":"fedcba9876543210fedcba9876543210"}
 setting_ack|{"type":"setting_ack","key":"video.rotate","hlc":[1700000001000,0],"device":"fedcba9876543210fedcba9876543210"}
 setting_reject|{"type":"setting_reject","key":"camera.facing","hlc":[1700000002000,1],"device":"fedcba9876543210fedcba9876543210","code":"unsupported","message":"this phone has no front camera"}
+pair|{"type":"pair","name":"my-laptop","device":"fedcba9876543210fedcba9876543210"}
+paired|{"type":"paired","secret":"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f","fingerprint":"6465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f80818283","name":"Pixel 6","device_id":"0123456789abcdef0123456789abcdef","port":28201,"hosts":["192.168.1.20","10.0.0.5"]}

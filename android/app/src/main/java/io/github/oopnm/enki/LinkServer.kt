@@ -1,6 +1,8 @@
 package io.github.oopnm.enki
 
 import android.content.Context
+import android.net.nsd.NsdManager
+import android.net.nsd.NsdServiceInfo
 import android.os.Build
 import android.util.Log
 import io.github.oopnm.enki.link.Applied
@@ -23,6 +25,9 @@ import io.github.oopnm.enki.link.decodePreamble
 import io.github.oopnm.enki.link.encodeControlMessage
 import io.github.oopnm.enki.link.encodePreamble
 import io.github.oopnm.enki.link.imageRotation
+import javax.net.ssl.KeyManagerFactory
+import javax.net.ssl.SSLContext
+import javax.net.ssl.SSLSocket
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
 import java.io.DataInputStream
@@ -59,6 +64,11 @@ class LinkServer(
     private val mediaBusy = AtomicBoolean(false)
     private val clients: MutableSet<Socket> = Collections.synchronizedSet(HashSet())
     private var server: ServerSocket? = null
+
+    /** The Wi-Fi listener (TLS) and its mDNS announcement; null while "Allow Wi-Fi connections" is off. Guarded by [wifiLock]. */
+    private var wifiServer: ServerSocket? = null
+    private var nsdListener: NsdManager.RegistrationListener? = null
+    private val wifiLock = Any()
 
     /** Which camera the next (or running) media session uses: "back" or "front". Guarded by [mediaLock]. */
     private var facing = EnkiSettings.getString("camera.facing").ifEmpty { "back" }
@@ -279,6 +289,7 @@ class LinkServer(
             media?.setPreview(PreviewBridge.texture, wait)
         }
         Thread({ acceptLoop(s) }, "enki-accept").start()
+        if (EnkiSettings.getBool("wifi.enabled")) startWifi()
         status(WAITING)
     }
 
@@ -290,8 +301,147 @@ class LinkServer(
         PreviewBridge.onTexture = null
         SessionToken.clear()
         notifier.shutdownNow()
+        stopWifi()
         runCatching { server?.close() }
         synchronized(clients) { clients.toList() }.forEach { runCatching { it.close() } }
+    }
+
+    // ---- Wi-Fi: TLS listener, mDNS announcement, pairing
+
+    /** Opens the Wi-Fi listener (TLS with the phone's own certificate) and announces it on the network. Idempotent. */
+    private fun startWifi() {
+        synchronized(wifiLock) {
+            if (wifiServer != null || stopped.get()) return
+            try {
+                val identity = WifiState.identity()
+                val keys = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm())
+                    .apply { init(identity.keyStore(), io.github.oopnm.enki.link.PhoneIdentity.PASSWORD) }
+                val context = SSLContext.getInstance("TLS").apply { init(keys.keyManagers, null, null) }
+                val s = context.serverSocketFactory.createServerSocket()
+                s.reuseAddress = true
+                s.bind(InetSocketAddress(Link.WIFI_PORT))
+                wifiServer = s
+                Thread({ wifiAcceptLoop(s, identity.fingerprint) }, "enki-wifi-accept").start()
+                announce()
+                Log.i(TAG, "Wi-Fi listener on port ${Link.WIFI_PORT}")
+            } catch (e: Exception) {
+                Log.w(TAG, "Cannot open the Wi-Fi listener: ${e.message}")
+                status("Wi-Fi: ${e.message}")
+            }
+        }
+    }
+
+    private fun stopWifi() {
+        synchronized(wifiLock) {
+            val listener = nsdListener
+            if (listener != null) {
+                runCatching { (context.getSystemService(Context.NSD_SERVICE) as NsdManager).unregisterService(listener) }
+                nsdListener = null
+            }
+            runCatching { wifiServer?.close() }
+            wifiServer = null
+        }
+    }
+
+    /** Announces `_enki._tcp` with the app's device id, so a paired PC finds the phone even when its address changed. */
+    private fun announce() {
+        val info = NsdServiceInfo().apply {
+            serviceName = "Enki-" + EnkiSettings.deviceId.take(6)
+            serviceType = "_enki._tcp."
+            port = Link.WIFI_PORT
+            setAttribute("id", EnkiSettings.deviceId)
+        }
+        val listener = object : NsdManager.RegistrationListener {
+            override fun onServiceRegistered(serviceInfo: NsdServiceInfo) {}
+            override fun onRegistrationFailed(serviceInfo: NsdServiceInfo, errorCode: Int) {
+                Log.w(TAG, "mDNS registration failed: $errorCode")
+            }
+            override fun onServiceUnregistered(serviceInfo: NsdServiceInfo) {}
+            override fun onUnregistrationFailed(serviceInfo: NsdServiceInfo, errorCode: Int) {}
+        }
+        nsdListener = listener
+        runCatching {
+            (context.getSystemService(Context.NSD_SERVICE) as NsdManager).registerService(info, NsdManager.PROTOCOL_DNS_SD, listener)
+        }.onFailure { nsdListener = null; Log.w(TAG, "mDNS: ${it.message}") }
+    }
+
+    private fun wifiAcceptLoop(s: ServerSocket, fingerprint: ByteArray) {
+        while (!stopped.get()) {
+            val socket = try { s.accept() } catch (e: IOException) { break }
+            clients.add(socket)
+            Thread({ handleWifi(socket as SSLSocket, fingerprint) }, "enki-wifi-client").start()
+        }
+    }
+
+    /**
+     * A connection over Wi-Fi. Same steps as [handle], but inside TLS, and the challenge is answered with a paired
+     * secret or with the pairing key of the code typed on this screen, bound to our certificate's fingerprint.
+     * A paired computer gets the whole protocol; a computer that only knows the code may do one thing: pair.
+     */
+    private fun handleWifi(socket: SSLSocket, fingerprint: ByteArray) {
+        try {
+            socket.tcpNoDelay = true
+            socket.soTimeout = HANDSHAKE_TIMEOUT_MS
+            socket.startHandshake()
+            val input = DataInputStream(BufferedInputStream(socket.getInputStream()))
+            val preamble = ByteArray(Link.PREAMBLE_LEN).also { input.readFully(it) }
+            val channel = decodePreamble(preamble)
+            val out = BufferedOutputStream(socket.getOutputStream(), 64 * 1024)
+            out.write(encodePreamble(channel))
+            out.flush()
+            val verdict = Auth.serverHandshakeTls(input, out, channel, fingerprint, { WifiState.secrets() }, { WifiState.offer() })
+            when (verdict) {
+                Auth.TlsVerdict.PAIRED -> {
+                    socket.soTimeout = 0
+                    when (channel) {
+                        Channel.MEDIA -> serveMedia(socket, out)
+                        Channel.CONTROL -> serveControl(socket, input, out, wifi = true)
+                    }
+                }
+                Auth.TlsVerdict.OFFER -> if (channel == Channel.CONTROL) serveOffer(input, out)
+                Auth.TlsVerdict.BAD_TOKEN -> {
+                    Log.w(TAG, "Refused a Wi-Fi connection: wrong answer")
+                    WifiState.offerFailed() // a wrong guess at the pairing code counts
+                }
+                Auth.TlsVerdict.NOT_PROVISIONED -> Log.w(TAG, "Refused a Wi-Fi connection: not paired")
+            }
+        } catch (e: ProtocolException) {
+            Log.w(TAG, "Refused a Wi-Fi connection: ${e.message}")
+        } catch (e: IOException) {
+            // The peer went away, the handshake timed out, or it did not speak TLS.
+        } finally {
+            clients.remove(socket)
+            runCatching { socket.close() }
+        }
+    }
+
+    /** The one thing a computer that proved the pairing code may do: ask to pair. The code is spent by it. */
+    private fun serveOffer(input: DataInputStream, out: OutputStream) {
+        val len = input.readInt()
+        if (len < 0 || len > Link.MAX_CONTROL) throw ProtocolException("bad control message length $len")
+        val body = ByteArray(len).also { input.readFully(it) }
+        val message = try { JSONObject(String(body, Charsets.UTF_8)) } catch (e: JSONException) { return }
+        if (message.optString("type") != "pair") return
+        WifiState.closeOffer()
+        out.write(encodeControlMessage(pairReply(message)))
+        out.flush()
+    }
+
+    /** Pairs the computer that sent [message] (`pair`): remembers its secret and answers with `paired`. */
+    private fun pairReply(message: JSONObject): String {
+        val id = message.optString("device").ifEmpty { Auth.toHex(io.github.oopnm.enki.link.Pairing.newSecret()).take(32) }
+        val name = message.optString("name").ifEmpty { id.take(8) }
+        val computer = WifiState.pair(id, name)
+        // From now on a computer may connect over Wi-Fi, so the listener must be on.
+        if (!EnkiSettings.getBool("wifi.enabled")) EnkiSettings.setByUser("wifi.enabled", true)
+        return ControlMessages.paired(
+            Auth.toHex(computer.secret),
+            Auth.toHex(WifiState.identity().fingerprint),
+            Build.MODEL ?: "Android",
+            EnkiSettings.deviceId,
+            Link.WIFI_PORT,
+            WifiState.hosts(),
+        )
     }
 
     private fun acceptLoop(s: ServerSocket) {
@@ -321,7 +471,7 @@ class LinkServer(
             socket.soTimeout = 0
             when (channel) {
                 Channel.MEDIA -> serveMedia(socket, out)
-                Channel.CONTROL -> serveControl(socket, input, out)
+                Channel.CONTROL -> serveControl(socket, input, out, wifi = false)
             }
         } catch (e: UnsupportedVersionException) {
             // Answer with our own version first, so an older PC program can tell the user the versions differ.
@@ -378,7 +528,7 @@ class LinkServer(
      * program froze: TCP alone may not notice for minutes, so the camera is stopped by closing the media
      * connection, which saves the battery and lets the PC reconnect cleanly.
      */
-    private fun serveControl(socket: Socket, input: DataInputStream, out: OutputStream) {
+    private fun serveControl(socket: Socket, input: DataInputStream, out: OutputStream, wifi: Boolean) {
         val control = ControlOut(out)
         controls.add(control)
         try {
@@ -397,7 +547,7 @@ class LinkServer(
                 control.send(ControlMessages.stateInt("phone.temperature", it.tempDc))
                 control.send(ControlMessages.stateBool("phone.charging", it.charging))
             }
-            socket.soTimeout = CONTROL_TIMEOUT_MS
+            socket.soTimeout = if (wifi) WIFI_CONTROL_TIMEOUT_MS else CONTROL_TIMEOUT_MS
             while (true) {
                 val len = input.readInt()
                 if (len < 0 || len > Link.MAX_CONTROL) throw ProtocolException("bad control message length $len")
@@ -405,6 +555,8 @@ class LinkServer(
                 val message = try { JSONObject(String(body, Charsets.UTF_8)) } catch (e: JSONException) { continue }
                 when (message.optString("type")) {
                     "ping" -> control.send(ControlMessages.pong(message.optLong("seq")))
+                    // Only over the cable: adb is what lets the PC ask to be paired without a code.
+                    "pair" -> if (!wifi) control.send(pairReply(message))
                     "setting" -> parseEntry(message)?.let { handleSetting(control, it) }
                     "settings_snapshot" -> handleSnapshot(control, message)
                     "setting_ack" -> parseStamp(message)?.let { (hlc, device) ->
@@ -429,7 +581,7 @@ class LinkServer(
                 }
             }
         } catch (e: SocketTimeoutException) {
-            Log.w(TAG, "No message from the PC for ${CONTROL_TIMEOUT_MS / 1000} s: stopping the camera")
+            Log.w(TAG, "No message from the PC for ${socket.soTimeout / 1000} s: stopping the camera")
             runCatching { mediaSocket?.close() }
         } finally {
             controls.remove(control)
@@ -442,6 +594,7 @@ class LinkServer(
             notifier.execute {
                 if (entry != null) broadcastState(ControlMessages.setting(entry))
                 applyStreamSetting(key)
+                if (key == "wifi.enabled") if (value == true) startWifi() else stopWifi()
                 if (key == "camera.facing" && value is String) {
                     setFacing(value)
                     broadcastRotation()
@@ -511,6 +664,8 @@ class LinkServer(
         private const val HANDSHAKE_TIMEOUT_MS = 5_000
         /** The PC pings every second; this is generous enough for a slow moment and short enough to save the battery. */
         private const val CONTROL_TIMEOUT_MS = 5_000
+        /** Wi-Fi stalls longer than a cable does; the PC waits 6 s for the phone and the phone 8 s for the PC. */
+        private const val WIFI_CONTROL_TIMEOUT_MS = 8_000
         private const val TAG = "EnkiLink"
     }
 }

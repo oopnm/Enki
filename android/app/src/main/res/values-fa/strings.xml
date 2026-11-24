@@ -109,4 +109,16 @@
     <string name="setting_ui_language__ja">日本語</string>
     <string name="setting_ui_language__hi">हिन्दी</string>
     <string name="setting_ui_reduce_motion">کاهش حرکت (آب ساکن، بدون موج متحرک)</string>
+    <string name="wifi_forget">فراموش کن</string>
+    <string name="setting_wifi_enabled">اجازه اتصال Wi-Fi</string>
+    <string name="wifi_help">وقتی روشن باشد، رایانهٔ جفت‌شده در همان شبکه بدون کابل وصل می‌شود. اتصال رمزگذاری شده است.</string>
+    <string name="wifi_pair_title">جفت‌سازی رایانه</string>
+    <string name="wifi_pair_hint">کدی که روی رایانه نمایش داده می‌شود</string>
+    <string name="wifi_pair_button">جفت‌سازی</string>
+    <string name="wifi_pair_bad">کد ۱۰ حرف و رقم دارد</string>
+    <string name="wifi_waiting">اکنون جفت‌سازی را در رایانه شروع کنید (۳ دقیقه)…</string>
+    <string name="wifi_paired_computers">رایانه‌های جفت‌شده</string>
+    <string name="wifi_no_computers">هنوز رایانه‌ای جفت نشده است</string>
+    <string name="wifi_addresses">نشانی این گوشی:</string>
+    <string name="wifi_paired_ok">با یک رایانه جفت شد</string>
 </resources>

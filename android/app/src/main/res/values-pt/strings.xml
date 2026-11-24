@@ -109,4 +109,16 @@
     <string name="setting_ui_language__ja">日本語</string>
     <string name="setting_ui_language__hi">हिन्दी</string>
     <string name="setting_ui_reduce_motion">Reduzir movimento (água parada, sem ondas em movimento)</string>
+    <string name="wifi_forget">Esquecer</string>
+    <string name="setting_wifi_enabled">Permitir conexões Wi-Fi</string>
+    <string name="wifi_help">Ativado, um computador emparelhado na mesma rede pode conectar sem cabo. A conexão é criptografada.</string>
+    <string name="wifi_pair_title">Emparelhar um computador</string>
+    <string name="wifi_pair_hint">Código mostrado no computador</string>
+    <string name="wifi_pair_button">Emparelhar</string>
+    <string name="wifi_pair_bad">O código tem 10 letras e dígitos</string>
+    <string name="wifi_waiting">Agora inicie o emparelhamento no computador (3 minutos)…</string>
+    <string name="wifi_paired_computers">Computadores emparelhados</string>
+    <string name="wifi_no_computers">Nenhum computador emparelhado ainda</string>
+    <string name="wifi_addresses">Endereço deste telefone:</string>
+    <string name="wifi_paired_ok">Emparelhado com um computador</string>
 </resources>

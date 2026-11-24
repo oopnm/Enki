@@ -35,11 +35,15 @@ jobs:
           name: arch-package
           path: '*.pkg.tar.zst'
 
-  # 2. Fedora RPM
+  # 2. Fedora RPM (one package per Fedora release; the file name carries .fc44 / .fc45)
   build-fedora:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        fedora: [44, 45]
     container:
-      image: fedora:latest
+      image: fedora:${{ matrix.fedora }}
     steps:
       - name: Install Dependencies
         run: dnf install -y git rpm-build cargo rust gcc gtk4-devel pkgconf-pkg-config tar gzip
@@ -55,7 +59,7 @@ jobs:
       - name: Upload Fedora Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: fedora-package
+          name: fedora-${{ matrix.fedora }}-package
           path: '*.rpm'
 
   # 3. Debian / Ubuntu DEB

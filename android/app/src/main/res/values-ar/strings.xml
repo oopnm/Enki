@@ -109,4 +109,16 @@
     <string name="setting_ui_language__ja">日本語</string>
     <string name="setting_ui_language__hi">हिन्दी</string>
     <string name="setting_ui_reduce_motion">تقليل الحركة (ماء ساكن بلا أمواج متحركة)</string>
+    <string name="wifi_forget">نسيان</string>
+    <string name="setting_wifi_enabled">السماح باتصالات Wi-Fi</string>
+    <string name="wifi_help">عند التفعيل يستطيع حاسوب مقترن على نفس الشبكة الاتصال بلا كابل. الاتصال مشفّر.</string>
+    <string name="wifi_pair_title">اقتران حاسوب</string>
+    <string name="wifi_pair_hint">الرمز الظاهر على الحاسوب</string>
+    <string name="wifi_pair_button">اقتران</string>
+    <string name="wifi_pair_bad">الرمز مكوّن من 10 أحرف وأرقام</string>
+    <string name="wifi_waiting">ابدأ الاقتران الآن على الحاسوب (3 دقائق)…</string>
+    <string name="wifi_paired_computers">الحواسيب المقترنة</string>
+    <string name="wifi_no_computers">لا يوجد حاسوب مقترن بعد</string>
+    <string name="wifi_addresses">عنوان هذا الهاتف:</string>
+    <string name="wifi_paired_ok">تم الاقتران بحاسوب</string>
 </resources>

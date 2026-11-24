@@ -6,9 +6,10 @@
 use enki_protocol::control::{
     Capabilities, Message, SettingEntry, Value, FEATURE_SETTINGS, MAX_CONTROL,
 };
+use enki_protocol::pairing::{auth_mac_tls, pairing_key, FINGERPRINT_LEN};
 use enki_protocol::{
-    auth_mac, AuthStatus, Channel, FrameHeader, Kind, Preamble, FLAG_DISCONTINUITY, MAC_LEN,
-    NONCE_LEN, TOKEN_LEN, VERSION,
+    auth_mac, to_hex, AuthStatus, Channel, FrameHeader, Kind, Preamble, FLAG_DISCONTINUITY,
+    MAC_LEN, NONCE_LEN, TOKEN_LEN, VERSION,
 };
 use enki_settings::{Applied, Engine, HlcClock, Reject, Schema};
 use std::process::Stdio;
@@ -16,7 +17,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 use tokio::process::Command;
 use tokio::sync::{broadcast, mpsc};
 
@@ -72,6 +73,93 @@ impl PhoneSettings {
     }
 }
 
+/// The phone's Wi-Fi side: a self-signed certificate, the secrets of the computers it paired with, and the key
+/// of a pairing code typed on it. One value is shared by every connection, like the real app's stored state.
+#[derive(Clone)]
+pub struct TlsPhone {
+    acceptor: tokio_rustls::TlsAcceptor,
+    pub fingerprint: [u8; FINGERPRINT_LEN],
+    pub device_id: String,
+    /// Secrets of paired computers (they authenticate on the control and media channels).
+    pub paired: Arc<Mutex<Vec<[u8; 32]>>>,
+    /// The key made from the pairing code, valid for one pairing.
+    pub offer: Arc<Mutex<Option<[u8; 32]>>>,
+    /// The names PCs gave when pairing.
+    pub pc_names: Arc<Mutex<Vec<String>>>,
+    /// Wrong answers seen while an offer was open; the real phone drops the offer after five.
+    pub failures: Arc<std::sync::atomic::AtomicU32>,
+}
+
+impl TlsPhone {
+    pub fn new(device_id: &str) -> Self {
+        let certified = rcgen::generate_simple_self_signed(vec!["enki.local".to_string()])
+            .expect("a self-signed certificate");
+        let cert = certified.cert.der().clone();
+        let key = rustls::pki_types::PrivateKeyDer::Pkcs8(
+            rustls::pki_types::PrivatePkcs8KeyDer::from(certified.signing_key.serialize_der()),
+        );
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let config = rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .expect("protocol versions")
+            .with_no_client_auth()
+            .with_single_cert(vec![cert.clone()], key)
+            .expect("a valid certificate and key");
+        use sha2::{Digest, Sha256};
+        TlsPhone {
+            acceptor: tokio_rustls::TlsAcceptor::from(Arc::new(config)),
+            fingerprint: Sha256::digest(cert.as_ref()).into(),
+            device_id: device_id.into(),
+            paired: Arc::default(),
+            offer: Arc::default(),
+            pc_names: Arc::default(),
+            failures: Arc::default(),
+        }
+    }
+
+    /// The user typed this code on the phone's "Pair a computer" screen.
+    pub fn offer_code(&self, code: &str) {
+        *self.offer.lock().unwrap() = pairing_key(code);
+        self.failures.store(0, Ordering::Relaxed);
+    }
+
+    /// Makes a secret for a computer that asked to pair.
+    fn pair_reply(&self, pc_name: &str) -> Message {
+        let secret = random32();
+        self.paired.lock().unwrap().push(secret);
+        self.pc_names.lock().unwrap().push(pc_name.to_string());
+        Message::Paired {
+            secret: to_hex(&secret),
+            fingerprint: to_hex(&self.fingerprint),
+            name: "Fake phone".into(),
+            device_id: self.device_id.clone(),
+            port: 28201,
+            hosts: vec!["127.0.0.1".into()],
+        }
+    }
+}
+
+fn random32() -> [u8; 32] {
+    use std::io::Read;
+    let mut out = [0u8; 32];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut out))
+        .expect("/dev/urandom");
+    out
+}
+
+/// What a connection proved at the challenge, which decides what it may do.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Level {
+    /// The adb session token (plain loopback), or a paired secret over TLS: the whole protocol.
+    Full,
+    /// Over TLS with the pairing key: only `pair`.
+    Offer,
+}
+
+trait Stream: AsyncRead + AsyncWrite + Unpin + Send + 'static {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Stream for T {}
+
 #[derive(Clone)]
 pub struct Behavior {
     /// After the canned frames keep sending deltas until the receiver hangs up (otherwise close at once).
@@ -91,6 +179,10 @@ pub struct Behavior {
     pub media: MediaSource,
     /// `Some` = the phone speaks settings sync (announced in `hello.features`).
     pub settings: Option<PhoneSettings>,
+    /// The phone's Wi-Fi state. With [`Behavior::tls_listener`] the listener speaks TLS and authenticates with the
+    /// paired secrets and the pairing key; without it the plain listener still answers `pair` (the USB flow).
+    pub tls: Option<TlsPhone>,
+    pub tls_listener: bool,
 }
 
 impl Behavior {
@@ -106,6 +198,8 @@ impl Behavior {
             answer_pings: Arc::new(AtomicBool::new(true)),
             media: MediaSource::Canned,
             settings: None,
+            tls: None,
+            tls_listener: false,
         }
     }
 }
@@ -137,7 +231,22 @@ pub async fn serve(listener: TcpListener, behavior: Behavior, received: Received
         let Ok((stream, _)) = listener.accept().await else {
             return;
         };
-        tokio::spawn(handle(stream, behavior.clone(), received.clone()));
+        let b = behavior.clone();
+        let received = received.clone();
+        match (&b.tls, b.tls_listener) {
+            (Some(tls), true) => {
+                let tls = tls.clone();
+                tokio::spawn(async move {
+                    if let Ok(conn) = tls.acceptor.accept(stream).await {
+                        let fp = tls.fingerprint;
+                        handle(conn, b, received, Some(fp)).await;
+                    }
+                });
+            }
+            _ => {
+                tokio::spawn(handle(stream, b, received, None));
+            }
+        }
     }
 }
 
@@ -154,7 +263,12 @@ pub async fn spawn(behavior: Behavior) -> (u16, Received) {
 
 static NONCES: AtomicU64 = AtomicU64::new(1);
 
-async fn handle(mut s: TcpStream, b: Behavior, received: Received) {
+async fn handle<S: Stream>(
+    mut s: S,
+    b: Behavior,
+    received: Received,
+    fp: Option<[u8; FINGERPRINT_LEN]>,
+) {
     let mut pre = [0u8; 8];
     if s.read_exact(&mut pre).await.is_err() {
         return;
@@ -175,14 +289,48 @@ async fn handle(mut s: TcpStream, b: Behavior, received: Received) {
     if s.read_exact(&mut answer).await.is_err() {
         return;
     }
-    let status = match (b.token)() {
-        None => AuthStatus::NotProvisioned,
-        Some(_) if b.accept_any_token => AuthStatus::Ok,
-        Some(t) if auth_mac(&t, channel, &nonce) == answer => AuthStatus::Ok,
-        Some(_) => AuthStatus::BadToken,
+    let mut level = Level::Full;
+    let status = match (&fp, &b.tls) {
+        (Some(fp), Some(tls)) => {
+            let paired = tls.paired.lock().unwrap().clone();
+            let offer = *tls.offer.lock().unwrap();
+            if paired
+                .iter()
+                .any(|k| auth_mac_tls(k, channel, fp, &nonce) == answer)
+            {
+                AuthStatus::Ok
+            } else if let Some(k) = offer.filter(|k| auth_mac_tls(k, channel, fp, &nonce) == answer)
+            {
+                let _ = k;
+                level = Level::Offer;
+                AuthStatus::Ok
+            } else if offer.is_none() {
+                AuthStatus::NotProvisioned
+            } else {
+                // Like the real phone: five wrong answers close the offer.
+                if tls.failures.fetch_add(1, Ordering::Relaxed) + 1 >= 5 {
+                    *tls.offer.lock().unwrap() = None;
+                }
+                AuthStatus::BadToken
+            }
+        }
+        _ => match (b.token)() {
+            None => AuthStatus::NotProvisioned,
+            Some(_) if b.accept_any_token => AuthStatus::Ok,
+            Some(t) if auth_mac(&t, channel, &nonce) == answer => AuthStatus::Ok,
+            Some(_) => AuthStatus::BadToken,
+        },
     };
     let _ = s.write_all(&[status as u8]).await;
+    let _ = s.flush().await;
     if status != AuthStatus::Ok {
+        return;
+    }
+    if level == Level::Offer {
+        // Only a control connection may pair, and the offer is spent by it.
+        if channel == Channel::Control {
+            offer_control(s, &b, received).await;
+        }
         return;
     }
     match channel {
@@ -209,8 +357,8 @@ async fn read_json<R: AsyncRead + Unpin>(s: &mut R) -> Option<String> {
 
 /// Like the real app: `hello`, then `capabilities` (and, with settings sync, the settings snapshot); a `set` is
 /// answered with the current picture rotation first and then the setting's confirmation; a `ping` with a `pong`.
-async fn control(s: TcpStream, b: Behavior, received: Received) {
-    let (mut rd, mut wr) = s.into_split();
+async fn control<S: Stream>(s: S, b: Behavior, received: Received) {
+    let (mut rd, mut wr) = tokio::io::split(s);
     let hello = Message::Hello {
         version: VERSION as u32,
         app: "enki-fakephone".into(),
@@ -274,6 +422,15 @@ async fn control(s: TcpStream, b: Behavior, received: Received) {
                     return;
                 }
             }
+            Ok(Message::Pair { name, .. }) => {
+                received.lock().unwrap().push(text);
+                if let Some(tls) = &b.tls {
+                    let reply = tls.pair_reply(&name);
+                    if !send(&mut wr, &reply).await {
+                        return;
+                    }
+                }
+            }
             Ok(Message::Set { key, value }) => {
                 received.lock().unwrap().push(text);
                 if let Some(rotation) = b.rotation {
@@ -303,6 +460,19 @@ async fn control(s: TcpStream, b: Behavior, received: Received) {
             }
             _ => received.lock().unwrap().push(text),
         }
+    }
+}
+
+/// A connection that proved only the pairing key: waits for `pair`, answers it once, spends the offer.
+async fn offer_control<S: Stream>(mut s: S, b: &Behavior, received: Received) {
+    let Some(tls) = &b.tls else { return };
+    let text = tokio::time::timeout(Duration::from_secs(5), read_json(&mut s)).await;
+    let Ok(Some(text)) = text else { return };
+    received.lock().unwrap().push(text.clone());
+    if let Ok(Message::Pair { name, .. }) = Message::from_json(&text) {
+        *tls.offer.lock().unwrap() = None;
+        let reply = tls.pair_reply(&name);
+        let _ = send(&mut s, &reply).await;
     }
 }
 
@@ -439,8 +609,8 @@ async fn settings_message<W: AsyncWrite + Unpin>(
     }
 }
 
-async fn write_frame(
-    s: &mut TcpStream,
+async fn write_frame<S: AsyncWrite + Unpin>(
+    s: &mut S,
     stream: u8,
     kind: Kind,
     flags: u8,
@@ -457,7 +627,7 @@ async fn write_frame(
     s.write_all(&h.encode()).await.is_ok() && s.write_all(payload).await.is_ok()
 }
 
-async fn media(mut s: TcpStream, b: Behavior) {
+async fn media<S: Stream>(mut s: S, b: Behavior) {
     match &b.media {
         MediaSource::Canned => {
             let _ = write_frame(&mut s, 0, Kind::VideoConfig, 0, 0, &[0, 0, 1, 0x67]).await;

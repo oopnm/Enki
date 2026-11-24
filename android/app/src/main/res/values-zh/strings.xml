@@ -109,4 +109,16 @@
     <string name="setting_ui_language__ja">日本語</string>
     <string name="setting_ui_language__hi">हिन्दी</string>
     <string name="setting_ui_reduce_motion">减少动画（静止的水面，不显示流动的波浪）</string>
+    <string name="wifi_forget">忘记</string>
+    <string name="setting_wifi_enabled">允许 Wi-Fi 连接</string>
+    <string name="wifi_help">开启后，同一网络上已配对的电脑无需数据线即可连接。连接是加密的。</string>
+    <string name="wifi_pair_title">配对电脑</string>
+    <string name="wifi_pair_hint">电脑上显示的代码</string>
+    <string name="wifi_pair_button">配对</string>
+    <string name="wifi_pair_bad">代码为 10 位字母和数字</string>
+    <string name="wifi_waiting">现在在电脑上开始配对（3 分钟）…</string>
+    <string name="wifi_paired_computers">已配对的电脑</string>
+    <string name="wifi_no_computers">尚未配对任何电脑</string>
+    <string name="wifi_addresses">本手机的地址：</string>
+    <string name="wifi_paired_ok">已与电脑配对</string>
 </resources>

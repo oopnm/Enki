@@ -9,5 +9,9 @@ description = "A stand-in for the Enki phone app: speaks Enki Link v1 so the des
 [dependencies]
 enki-protocol = { path = "../enki-protocol" }
 enki-settings = { path = "../enki-settings" }
+rcgen = "0.14.10"
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 serde_json = "1"
+sha2 = "0.10"
 tokio = { version = "1", features = ["rt-multi-thread", "process", "io-util", "sync", "net", "time", "macros"] }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12"] }

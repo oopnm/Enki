@@ -109,4 +109,16 @@
     <string name="setting_ui_language__ja">日本語</string>
     <string name="setting_ui_language__hi">हिन्दी</string>
     <string name="setting_ui_reduce_motion">Reduce motion (still water, no moving waves)</string>
+    <string name="wifi_forget">Forget</string>
+    <string name="setting_wifi_enabled">Allow Wi-Fi connections</string>
+    <string name="wifi_help">When on, a paired computer on the same network can connect without a cable. The connection is encrypted.</string>
+    <string name="wifi_pair_title">Pair a computer</string>
+    <string name="wifi_pair_hint">Code shown on the computer</string>
+    <string name="wifi_pair_button">Pair</string>
+    <string name="wifi_pair_bad">The code has 10 letters and digits</string>
+    <string name="wifi_waiting">Now start pairing on the computer (3 minutes)…</string>
+    <string name="wifi_paired_computers">Paired computers</string>
+    <string name="wifi_no_computers">No computer is paired yet</string>
+    <string name="wifi_addresses">This phone\'s address:</string>
+    <string name="wifi_paired_ok">Paired with a computer</string>
 </resources>
