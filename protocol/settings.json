@@ -5,6 +5,7 @@
     "camera",
     "filters",
     "phone",
+    "link",
     "app"
   ],
   "settings": [
@@ -419,6 +420,33 @@
       "apply": "passive",
       "apps": [
         "desktop"
+      ]
+    },
+    {
+      "key": "link.transport",
+      "group": "link",
+      "type": "enum",
+      "values": [
+        "auto",
+        "usb",
+        "wifi"
+      ],
+      "default": "auto",
+      "scope": "local",
+      "apply": "passive",
+      "apps": [
+        "desktop"
+      ]
+    },
+    {
+      "key": "wifi.enabled",
+      "group": "phone",
+      "type": "bool",
+      "default": false,
+      "scope": "local",
+      "apply": "passive",
+      "apps": [
+        "phone"
       ]
     }
   ]

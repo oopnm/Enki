@@ -42,7 +42,7 @@ SAME = {
     "setting-video-resolution--480p", "setting-video-resolution--720p", "setting-video-resolution--1080p",
     *(f"setting-video-fps--{v}" for v in (15, 24, 30, 60)),
 }
-ANDROID_ONLY = ["start", "stop", "camera-permission-needed", "hint-connect"]
+ANDROID_ONLY = ["start", "stop", "camera-permission-needed", "hint-connect", "setting-wifi-enabled", "wifi-help", "wifi-pair-title", "wifi-pair-hint", "wifi-pair-button", "wifi-pair-bad", "wifi-waiting", "wifi-paired-computers", "wifi-no-computers", "wifi-addresses", "wifi-paired-ok"]
 CODE = "{ $port }"
 
 

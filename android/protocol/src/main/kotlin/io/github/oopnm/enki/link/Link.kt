@@ -12,6 +12,9 @@ object Link {
     const val MAX_CONTROL = 1024 * 1024
     /** TCP port the phone listens on (reach it from the PC with `adb forward`). */
     const val DEFAULT_PORT = 28200
+
+    /** The Wi-Fi listener (TLS); the USB one above is on the phone's loopback only. */
+    const val WIFI_PORT = 28201
     val MAGIC = byteArrayOf('E'.code.toByte(), 'N'.code.toByte(), 'K'.code.toByte(), 'I'.code.toByte())
 }
 

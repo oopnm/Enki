@@ -11,6 +11,7 @@ object LocaleHelper {
 
     fun wrap(base: Context): Context {
         EnkiSettings.init(base)
+        WifiState.init(base)
         val tag = EnkiSettings.getString("ui.language")
         if (tag.isEmpty() || tag == "system") return base
         val locale = Locale.forLanguageTag(tag)

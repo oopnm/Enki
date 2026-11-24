@@ -109,4 +109,16 @@
     <string name="setting_ui_language__ja">日本語</string>
     <string name="setting_ui_language__hi">हिन्दी</string>
     <string name="setting_ui_reduce_motion">جوڵە کەم بکەرەوە (ئاوی ئارام، بێ شەپۆلی جوڵاو)</string>
+    <string name="wifi_forget">لەبیرکردن</string>
+    <string name="setting_wifi_enabled">ڕێگەدان بە پەیوەندی Wi-Fi</string>
+    <string name="wifi_help">کاتێک چالاکە، کۆمپیوتەرێکی جووتکراو لەسەر هەمان تۆڕ بەبێ کەیبڵ دەتوانێت پەیوەندی بکات. پەیوەندییەکە شفرەکراوە.</string>
+    <string name="wifi_pair_title">جووتکردنی کۆمپیوتەر</string>
+    <string name="wifi_pair_hint">ئەو کۆدەی لەسەر کۆمپیوتەر پیشان دەدرێت</string>
+    <string name="wifi_pair_button">جووتکردن</string>
+    <string name="wifi_pair_bad">کۆدەکە ١٠ پیت و ژمارەیە</string>
+    <string name="wifi_waiting">ئێستا جووتکردن لەسەر کۆمپیوتەر دەستپێبکە (٣ خولەک)…</string>
+    <string name="wifi_paired_computers">کۆمپیوتەرە جووتکراوەکان</string>
+    <string name="wifi_no_computers">هێشتا هیچ کۆمپیوتەرێک جووت نەکراوە</string>
+    <string name="wifi_addresses">ناونیشانی ئەم مۆبایلە:</string>
+    <string name="wifi_paired_ok">لەگەڵ کۆمپیوتەرێک جووت بوو</string>
 </resources>

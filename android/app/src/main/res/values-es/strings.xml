@@ -109,4 +109,16 @@
     <string name="setting_ui_language__ja">日本語</string>
     <string name="setting_ui_language__hi">हिन्दी</string>
     <string name="setting_ui_reduce_motion">Reducir el movimiento (agua quieta, sin olas en movimiento)</string>
+    <string name="wifi_forget">Olvidar</string>
+    <string name="setting_wifi_enabled">Permitir conexiones Wi-Fi</string>
+    <string name="wifi_help">Si está activado, un ordenador vinculado de la misma red puede conectarse sin cable. La conexión está cifrada.</string>
+    <string name="wifi_pair_title">Vincular un ordenador</string>
+    <string name="wifi_pair_hint">Código que muestra el ordenador</string>
+    <string name="wifi_pair_button">Vincular</string>
+    <string name="wifi_pair_bad">El código tiene 10 letras y dígitos</string>
+    <string name="wifi_waiting">Ahora inicia la vinculación en el ordenador (3 minutos)…</string>
+    <string name="wifi_paired_computers">Ordenadores vinculados</string>
+    <string name="wifi_no_computers">Aún no hay ordenadores vinculados</string>
+    <string name="wifi_addresses">Dirección de este teléfono:</string>
+    <string name="wifi_paired_ok">Vinculado con un ordenador</string>
 </resources>

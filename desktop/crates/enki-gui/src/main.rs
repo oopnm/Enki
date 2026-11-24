@@ -58,6 +58,15 @@ enum UiEvent {
     Status(Status),
     /// مشكلة أنهت الجلسة: يظهر زر الإصلاح المناسب لها إن وُجد.
     Problem(enki_receiver::Problem),
+    /// Pairing finished (a phone to remember, or the reason it failed).
+    Paired(Result<enki_receiver::PairedPhone, String>),
+    /// Close the pairing window (pairing ended).
+    CloseDialog,
+    /// The address a Wi-Fi session reached the phone at, remembered for next time.
+    WifiHost {
+        id: String,
+        host: String,
+    },
     /// A setting (or the phone profile) changed behind the window's back: redraw the controls.
     Refresh,
     /// Battery and temperature reported by the phone.
@@ -96,7 +105,8 @@ fn fix_message(code: enki_receiver::ProblemCode) -> Option<&'static str> {
     match code {
         OutputDevice => Some("fix-load-module"),
         NoDevice | ProvisionFailed | AuthRejected | Other => Some("fix-retry"),
-        AdbMissing | FfmpegMissing | VersionMismatch => None,
+        AdbMissing | FfmpegMissing | VersionMismatch | NotPaired | CertificateChanged
+        | NoPairedPhone => None,
     }
 }
 
@@ -126,6 +136,11 @@ struct App {
     control_slot: RefCell<Option<mpsc::UnboundedSender<enki_receiver::Control>>>,
     /// نوع المشكلة التي يعالجها زر الإصلاح الظاهر حالياً.
     fix_slot: RefCell<Option<enki_receiver::ProblemCode>>,
+    /// The list of paired phones with its buttons (rebuilt after every change).
+    wifi_box: RefCell<GtkBox>,
+    /// The running pairing attempt, so closing the code window stops it.
+    pair_task: RefCell<Option<tokio::task::JoinHandle<()>>>,
+    pair_dialog: RefCell<Option<gtk::Window>>,
     /// Drives the waves and the two rivers.
     motion: Rc<Motion>,
 }
@@ -208,6 +223,9 @@ fn build_ui(app: &Application, rt: Handle) {
         stop_slot: RefCell::new(None),
         control_slot: RefCell::new(None),
         fix_slot: RefCell::new(None),
+        wifi_box: RefCell::new(GtkBox::new(Orientation::Vertical, 6)),
+        pair_task: RefCell::new(None),
+        pair_dialog: RefCell::new(None),
         motion: Motion::new(),
     });
     if let Some(w) = warning {
@@ -332,6 +350,12 @@ impl App {
                 if let Some(row) = self.control_row(def) {
                     card.append(&row);
                 }
+            }
+            if group == "link" {
+                let wifi = GtkBox::new(Orientation::Vertical, 6);
+                *self.wifi_box.borrow_mut() = wifi.clone();
+                card.append(&wifi);
+                self.refresh_wifi();
             }
             settings_box.append(&card);
         }
@@ -760,6 +784,26 @@ impl App {
                 self.render_status();
             }
             UiEvent::Refresh => self.refresh_controls(),
+            UiEvent::Paired(result) => match result {
+                Ok(phone) => {
+                    let name = phone.name.clone();
+                    match enki_receiver::PhoneBook::default_book().upsert(phone) {
+                        Ok(()) => self.log(&format!("✓ {} {name}\n", self.tr("log-paired"))),
+                        Err(e) => self.log(&format!("❌ phones.toml: {e}\n")),
+                    }
+                    self.refresh_wifi();
+                }
+                Err(reason) => self.log(&format!("❌ {} {reason}\n", self.tr("log-pair-failed"))),
+            },
+            UiEvent::CloseDialog => {
+                let dialog = self.pair_dialog.borrow_mut().take();
+                if let Some(d) = dialog {
+                    d.close();
+                }
+            }
+            UiEvent::WifiHost { id, host } => {
+                let _ = enki_receiver::PhoneBook::default_book().set_last_host(&id, &host);
+            }
             UiEvent::Phone(info) => {
                 let mut parts: Vec<String> = Vec::new();
                 if let Some(b) = info.battery {
@@ -844,6 +888,179 @@ impl App {
         });
     }
 
+    /// This computer's name, shown on the phone when pairing.
+    fn pc_name() -> String {
+        std::fs::read_to_string("/etc/hostname")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .or_else(|| std::env::var("HOSTNAME").ok())
+            .unwrap_or_else(|| "computer".into())
+    }
+
+    /// Rebuilds the paired-phones list and the two pairing buttons.
+    fn refresh_wifi(self: &Rc<Self>) {
+        let wifi = self.wifi_box.borrow().clone();
+        while let Some(child) = wifi.first_child() {
+            wifi.remove(&child);
+        }
+        wifi.append(&row_label(&self.tr("wifi-phones")));
+        let phones = enki_receiver::PhoneBook::default_book().load();
+        if phones.is_empty() {
+            let none = Label::new(Some(self.tr("wifi-no-phones").as_str()));
+            none.set_xalign(0.0);
+            none.add_css_class("enki-dim");
+            wifi.append(&none);
+        }
+        for phone in phones {
+            let row = GtkBox::new(Orientation::Horizontal, 10);
+            let name = Label::new(Some(phone.name.as_str()));
+            name.set_xalign(0.0);
+            name.set_hexpand(true);
+            row.append(&name);
+            let forget = Button::with_label(&self.tr("wifi-forget"));
+            let app = self.clone();
+            let id = phone.id.clone();
+            forget.connect_clicked(move |_| {
+                let _ = enki_receiver::PhoneBook::default_book().remove(&id);
+                app.refresh_wifi();
+            });
+            row.append(&forget);
+            wifi.append(&row);
+        }
+        let buttons = GtkBox::new(Orientation::Horizontal, 10);
+        let usb = Button::with_label(&self.tr("wifi-pair-usb"));
+        let code = Button::with_label(&self.tr("wifi-pair-code"));
+        let app = self.clone();
+        usb.connect_clicked(move |_| app.pair_over_usb());
+        let app = self.clone();
+        code.connect_clicked(move |_| app.open_pair_dialog());
+        buttons.append(&usb);
+        buttons.append(&code);
+        wifi.append(&buttons);
+    }
+
+    fn pc_id(&self) -> String {
+        self.hub.lock().unwrap().device_id().to_string()
+    }
+
+    fn pair_over_usb(self: &Rc<Self>) {
+        let (name, id, tx) = (Self::pc_name(), self.pc_id(), self.tx.clone());
+        self.rt.spawn(async move {
+            let port = enki_receiver::DEFAULT_PORT;
+            let result = enki_receiver::pair_over_adb("adb", port, &name, &id)
+                .await
+                .map_err(|e| e.to_string());
+            let _ = tx.send(UiEvent::Paired(result));
+        });
+    }
+
+    /// Shows a one-time code and waits for the phone that has it typed in.
+    fn open_pair_dialog(self: &Rc<Self>) {
+        let mut random = [0u8; enki_receiver::pairing::CODE_LEN];
+        let filled = std::fs::File::open("/dev/urandom")
+            .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut random));
+        if filled.is_err() {
+            self.log("❌ /dev/urandom\n");
+            return;
+        }
+        let code = enki_receiver::pairing::code_from_random(&random);
+        let dialog = gtk::Window::builder()
+            .transient_for(&self.window)
+            .modal(true)
+            .title(self.tr("wifi-dialog-title"))
+            .default_width(440)
+            .build();
+        dialog.add_css_class("enki");
+        let body = GtkBox::new(Orientation::Vertical, 12);
+        body.set_margin_top(18);
+        body.set_margin_bottom(18);
+        body.set_margin_start(18);
+        body.set_margin_end(18);
+        let help = Label::new(Some(self.tr("wifi-dialog-help").as_str()));
+        help.set_wrap(true);
+        help.set_xalign(0.0);
+        let big = Label::new(None);
+        big.set_markup(&format!(
+            "<span size=\"xx-large\" weight=\"bold\">{code}</span>"
+        ));
+        big.set_selectable(true);
+        let waiting = Label::new(Some(self.tr("wifi-dialog-waiting").as_str()));
+        waiting.add_css_class("enki-dim");
+        let address = Entry::builder()
+            .placeholder_text(self.tr("wifi-dialog-address"))
+            .build();
+        let cancel = Button::with_label(&self.tr("wifi-cancel"));
+        for w in [
+            help.upcast_ref::<gtk::Widget>(),
+            big.upcast_ref(),
+            waiting.upcast_ref(),
+            address.upcast_ref(),
+            cancel.upcast_ref(),
+        ] {
+            body.append(w);
+        }
+        dialog.set_child(Some(&body));
+
+        let start = {
+            let app = self.clone();
+            let code = code.clone();
+            move |manual: Option<std::net::SocketAddr>| {
+                if let Some(old) = app.pair_task.borrow_mut().take() {
+                    old.abort();
+                }
+                let (name, id, tx) = (App::pc_name(), app.pc_id(), app.tx.clone());
+                let code = code.clone();
+                let handle = app.rt.spawn(async move {
+                    let result = enki_receiver::pair_with_code(
+                        &code,
+                        &name,
+                        &id,
+                        manual,
+                        enki_receiver::PAIR_WINDOW,
+                    )
+                    .await
+                    .map_err(|e| e.to_string());
+                    let _ = tx.send(UiEvent::Paired(result));
+                    let _ = tx.send(UiEvent::CloseDialog);
+                });
+                *app.pair_task.borrow_mut() = Some(handle);
+            }
+        };
+        start(None);
+        {
+            let start = start.clone();
+            address.connect_activate(move |e| {
+                let text = e.text().to_string();
+                let text = text.trim();
+                let with_port = if text.contains(':') {
+                    text.to_string()
+                } else {
+                    format!("{text}:{}", enki_receiver::WIFI_PORT)
+                };
+                if let Ok(addr) = with_port.parse() {
+                    start(Some(addr));
+                }
+            });
+        }
+        {
+            let dialog = dialog.clone();
+            cancel.connect_clicked(move |_| dialog.close());
+        }
+        {
+            let app = self.clone();
+            dialog.connect_close_request(move |_| {
+                if let Some(task) = app.pair_task.borrow_mut().take() {
+                    task.abort();
+                }
+                *app.pair_dialog.borrow_mut() = None;
+                glib::Propagation::Proceed
+            });
+        }
+        *self.pair_dialog.borrow_mut() = Some(dialog.clone());
+        dialog.present();
+    }
+
     fn output_device(&self) -> String {
         self.hub.lock().unwrap().get_string("output.device")
     }
@@ -894,6 +1111,11 @@ impl App {
                 enki_receiver::Facing::Back
             };
             cfg.settings = self.hub.clone();
+            cfg.transport = enki_receiver::Transport::from_setting(
+                &self.hub.lock().unwrap().get_string("link.transport"),
+            );
+            // The phone used over Wi-Fi is the one paired last.
+            cfg.wifi = enki_receiver::PhoneBook::default_book().load().pop();
             let text = self.i18n.borrow().tr_args(
                 "log-starting-enki",
                 &[
@@ -935,6 +1157,7 @@ impl App {
                         Event::State(_) | Event::Capabilities(_) => None,
                         Event::Phone(info) => Some(UiEvent::Phone(info)),
                         Event::Problem(problem) => Some(UiEvent::Problem(problem)),
+                        Event::WifiConnected { id, host } => Some(UiEvent::WifiHost { id, host }),
                         Event::Setting { .. } => Some(UiEvent::Refresh),
                         Event::SettingRolledBack { key, message, .. } => {
                             Some(UiEvent::RolledBack { key, message })

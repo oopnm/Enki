@@ -9,25 +9,30 @@
 
 use enki_protocol::control::{Message, SettingEntry, Value, FEATURE_SETTINGS};
 use enki_protocol::{
-    auth_mac, to_hex, AuthStatus, Channel, FrameHeader, Kind, Preamble, FLAG_DISCONTINUITY,
-    FRAME_HEADER_LEN, MAC_LEN, NONCE_LEN, PREAMBLE_LEN, TOKEN_LEN,
+    to_hex, AuthStatus, Channel, FrameHeader, Kind, FLAG_DISCONTINUITY, FRAME_HEADER_LEN, TOKEN_LEN,
 };
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::tcp::OwnedWriteHalf;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, WriteHalf};
 use tokio::net::TcpStream;
 use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot, Notify};
 
 mod look;
+mod wifi;
 pub use look::{Codec, Filters, Look};
+pub use wifi::{
+    candidates, discover, fingerprint, pair_over_adb, pair_with_code, Conn, Duplex, Found,
+    PairError, PairedPhone, PhoneBook, PAIR_WINDOW, SERVICE_TYPE, WIFI_PORT,
+};
+use wifi::{handshake, tls_connect, AuthKey};
 
 use enki_settings::{Applied, Hub, Reject, RejectCode, SettingsHandle};
 
 pub use enki_protocol::control::Capabilities;
+pub use enki_protocol::pairing;
 pub use enki_settings;
 
 pub const DEFAULT_PORT: u16 = 28200;
@@ -40,6 +45,8 @@ const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(2);
 /// How often the PC pings the phone, and how long without any message from the phone counts as a lost link.
 const PING_INTERVAL: Duration = Duration::from_secs(1);
 const LINK_TIMEOUT: Duration = Duration::from_secs(3);
+/// Wi-Fi hiccups longer than a USB cable's: the phone waits 8 s for a ping there, so the PC waits 6.
+const WIFI_LINK_TIMEOUT: Duration = Duration::from_secs(6);
 /// The phone app's content provider that accepts the session token, and only from adb (shell uid).
 const PROVISION_URI: &str = "content://io.github.oopnm.enki.provision";
 
@@ -116,6 +123,29 @@ pub struct PhoneInfo {
     pub charging: Option<bool>,
 }
 
+/// How the session reaches the phone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Transport {
+    /// The USB cable, through `adb forward`.
+    #[default]
+    Usb,
+    /// The paired phone in [`Config::wifi`], over the network.
+    Wifi,
+    /// The USB cable if a phone is plugged in, otherwise the paired phone over the network.
+    Auto,
+}
+
+impl Transport {
+    /// Reads the `link.transport` setting value; anything unknown means [`Transport::Auto`].
+    pub fn from_setting(value: &str) -> Transport {
+        match value {
+            "usb" => Transport::Usb,
+            "wifi" => Transport::Wifi,
+            _ => Transport::Auto,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     /// Target V4L2 device, e.g. `/dev/video10`.
@@ -142,6 +172,11 @@ pub struct Config {
     pub token: [u8; TOKEN_LEN],
     pub adb: String,
     pub ffmpeg: String,
+    pub transport: Transport,
+    /// The paired phone to use over Wi-Fi.
+    pub wifi: Option<PairedPhone>,
+    /// Connect to exactly this address over Wi-Fi instead of looking the phone up (tests, and a manual address).
+    pub wifi_addr: Option<std::net::SocketAddr>,
     /// Run `adb forward` and hand over the token before connecting. Tests turn this off.
     pub setup_adb: bool,
     /// Replaces the ffmpeg command (program, args). Tests use it to capture the stream.
@@ -162,6 +197,9 @@ impl Config {
             token: random_token(),
             adb: "adb".into(),
             ffmpeg: "ffmpeg".into(),
+            transport: Transport::Usb,
+            wifi: None,
+            wifi_addr: None,
             // ENKI_NO_ADB=1 skips adb and the token hand-over: for talking to `enki-fakephone --accept-any-token`.
             setup_adb: std::env::var_os("ENKI_NO_ADB").is_none(),
             sink_override: None,
@@ -170,7 +208,7 @@ impl Config {
 }
 
 /// 32 random bytes from the kernel. Reading `/dev/urandom` cannot fail on a working Linux system.
-fn random_token() -> [u8; TOKEN_LEN] {
+pub(crate) fn random_token() -> [u8; TOKEN_LEN] {
     use std::io::Read;
     let mut token = [0u8; TOKEN_LEN];
     std::fs::File::open("/dev/urandom")
@@ -224,6 +262,12 @@ pub enum ProblemCode {
     VersionMismatch,
     /// The phone refused the session token.
     AuthRejected,
+    /// Wi-Fi: the phone no longer knows this computer (its pairing was removed or the app data was cleared).
+    NotPaired,
+    /// Wi-Fi: the phone shows another certificate than the one pinned at pairing.
+    CertificateChanged,
+    /// Wi-Fi: the selected phone is not paired, or the Wi-Fi transport has no phone chosen.
+    NoPairedPhone,
     FfmpegMissing,
     /// ffmpeg could not write to the V4L2 device (module not loaded, wrong number).
     OutputDevice,
@@ -238,7 +282,7 @@ pub struct Problem {
 }
 
 impl Problem {
-    fn new(code: ProblemCode, message: impl Into<String>) -> Self {
+    pub(crate) fn new(code: ProblemCode, message: impl Into<String>) -> Self {
         Problem {
             code,
             message: message.into(),
@@ -274,6 +318,11 @@ pub enum Event {
     },
     /// The phone's battery and temperature (sent when they change).
     Phone(PhoneInfo),
+    /// Wi-Fi: connected to this phone at this address; the window remembers it for next time.
+    WifiConnected {
+        id: String,
+        host: String,
+    },
     /// The session ended because of this; also logged.
     Problem(Problem),
 }
@@ -291,7 +340,7 @@ struct Shared {
     /// The phone on this connection announced settings sync in its `hello`.
     peer_settings: std::sync::atomic::AtomicBool,
     /// Write half of the current control connection (None while not connected).
-    writer: tokio::sync::Mutex<Option<OwnedWriteHalf>>,
+    writer: tokio::sync::Mutex<Option<WriteHalf<Conn>>>,
     epoch: Instant,
     /// Milliseconds since `epoch` at which the phone last sent anything on the control channel.
     last_seen_ms: AtomicU64,
@@ -301,6 +350,8 @@ struct Shared {
     bitrate_kbps: AtomicU32,
     /// Battery and temperature last reported by the phone.
     phone: std::sync::Mutex<PhoneInfo>,
+    /// Where the Wi-Fi control connection went, so the media connection goes to the same address.
+    wifi_addr: std::sync::Mutex<Option<std::net::SocketAddr>>,
     /// Sequence number of the last ping and when it was sent.
     ping: std::sync::Mutex<(u64, Option<Instant>)>,
 }
@@ -317,6 +368,7 @@ impl Shared {
             rtt_ms: AtomicU32::new(0),
             bitrate_kbps: AtomicU32::new(0),
             phone: std::sync::Mutex::new(PhoneInfo::default()),
+            wifi_addr: std::sync::Mutex::new(None),
             ping: std::sync::Mutex::new((0, None)),
         }
     }
@@ -740,7 +792,7 @@ fn handle_message(shared: &Shared, tx: &Tx, message: Message) -> Vec<Message> {
     replies
 }
 
-async fn write_message<W: AsyncWriteExt + Unpin>(
+pub(crate) async fn write_message<W: AsyncWriteExt + Unpin>(
     w: &mut W,
     message: &Message,
 ) -> std::io::Result<()> {
@@ -749,7 +801,7 @@ async fn write_message<W: AsyncWriteExt + Unpin>(
 }
 
 /// One control message. Text that is not a known message (a newer phone) comes back as [`Message::Unknown`].
-async fn read_message<R: AsyncReadExt + Unpin>(r: &mut R) -> std::io::Result<Message> {
+pub(crate) async fn read_message<R: AsyncReadExt + Unpin>(r: &mut R) -> std::io::Result<Message> {
     let mut len = [0u8; 4];
     r.read_exact(&mut len).await?;
     let len = u32::from_be_bytes(len) as usize;
@@ -766,7 +818,7 @@ async fn read_message<R: AsyncReadExt + Unpin>(r: &mut R) -> std::io::Result<Mes
 
 /// Why a connection to the phone did not become an authenticated Enki Link channel.
 #[derive(Debug, PartialEq, Eq)]
-enum ConnectError {
+pub(crate) enum ConnectError {
     /// Nothing is serving on the port (`adb forward` accepts the connection and closes it), or the phone is
     /// slow to answer. Not an error to show: the loop just tries again.
     NotListening,
@@ -774,12 +826,18 @@ enum ConnectError {
     OtherVersion(u8),
     /// The phone refused our answer to its challenge.
     Auth(AuthStatus),
+    /// Wi-Fi: the phone's certificate is not the pinned one.
+    CertificateChanged,
     Protocol(String),
 }
 
 impl ConnectError {
-    fn problem(&self) -> Problem {
+    pub(crate) fn problem(&self) -> Problem {
         let (code, message) = match self {
+            ConnectError::CertificateChanged => (
+                ProblemCode::CertificateChanged,
+                "شهادة الهاتف تغيّرت عمّا ثُبّت عند الاقتران: إما أن بيانات تطبيق Enki مُسحت على الهاتف، أو أن أحداً يعترض الاتصال. إن كنت متأكداً أن الهاتف هو هاتفك فاحذفه من القائمة واقرنه من جديد.".to_string(),
+            ),
             ConnectError::NotListening => (ProblemCode::Other, "الهاتف لا يستمع على المنفذ.".to_string()),
             ConnectError::OtherVersion(v) => (
                 ProblemCode::VersionMismatch,
@@ -802,48 +860,77 @@ impl ConnectError {
     }
 }
 
-async fn read_within(s: &mut TcpStream, buf: &mut [u8]) -> Result<(), ConnectError> {
-    match tokio::time::timeout(HANDSHAKE_TIMEOUT, s.read_exact(buf)).await {
-        Ok(Ok(_)) => Ok(()),
-        _ => Err(ConnectError::NotListening),
-    }
+/// Which way the session reaches the phone. Decided once per session (see [`Transport`]).
+#[derive(Clone)]
+enum Route {
+    /// `adb forward` to the phone's loopback listener, authenticated with the session token.
+    Usb,
+    /// TLS to a paired phone on the network, authenticated with the paired secret.
+    Wifi(PairedPhone),
 }
 
-/// Opens a connection for `channel`: preambles both ways, then the phone's random challenge, our HMAC answer
+/// Opens a connection for `channel`: preambles both ways, then the phone's random challenge, our answer
 /// and the phone's one-byte verdict (docs/protocol.md). The phone serves nothing before that succeeds.
-async fn connect_authenticated(cfg: &Config, channel: Channel) -> Result<TcpStream, ConnectError> {
-    let mut s = TcpStream::connect(("127.0.0.1", cfg.port))
-        .await
-        .map_err(|_| ConnectError::NotListening)?;
-    let _ = s.set_nodelay(true);
-    s.write_all(&Preamble::new(channel).encode())
-        .await
-        .map_err(|_| ConnectError::NotListening)?;
-    let mut reply = [0u8; PREAMBLE_LEN];
-    read_within(&mut s, &mut reply).await?;
-    match Preamble::decode(&reply) {
-        Ok(p) if p.channel == channel => {}
-        Ok(_) => return Err(ConnectError::Protocol("قناة غير متوقعة".into())),
-        Err(enki_protocol::Error::UnsupportedVersion(v)) => {
-            return Err(ConnectError::OtherVersion(v))
+/// Over Wi-Fi the connection is TLS pinned to the phone's certificate; the control channel looks for the
+/// phone first and the media channel goes to the address the control channel found.
+async fn connect_authenticated(
+    cfg: &Config,
+    route: &Route,
+    shared: &Shared,
+    channel: Channel,
+) -> Result<Conn, ConnectError> {
+    match route {
+        Route::Usb => {
+            let mut s = TcpStream::connect(("127.0.0.1", cfg.port))
+                .await
+                .map_err(|_| ConnectError::NotListening)?;
+            let _ = s.set_nodelay(true);
+            handshake(&mut s, channel, &AuthKey::Session(cfg.token)).await?;
+            Ok(Box::new(s))
         }
-        Err(e) => return Err(ConnectError::Protocol(e.to_string())),
-    }
-    let mut nonce = [0u8; NONCE_LEN];
-    read_within(&mut s, &mut nonce).await?;
-    let answer: [u8; MAC_LEN] = auth_mac(&cfg.token, channel, &nonce);
-    s.write_all(&answer)
-        .await
-        .map_err(|_| ConnectError::NotListening)?;
-    let mut verdict = [0u8; 1];
-    read_within(&mut s, &mut verdict).await?;
-    match AuthStatus::from_u8(verdict[0]) {
-        Some(AuthStatus::Ok) => Ok(s),
-        Some(status) => Err(ConnectError::Auth(status)),
-        None => Err(ConnectError::Protocol(format!(
-            "رمز توثيق غير معروف {}",
-            verdict[0]
-        ))),
+        Route::Wifi(phone) => {
+            let pin = phone.fingerprint_bytes().ok_or_else(|| {
+                ConnectError::Protocol("بصمة الهاتف المخزّنة تالفة؛ اقرن الهاتف من جديد".into())
+            })?;
+            let secret = phone.secret_bytes().ok_or_else(|| {
+                ConnectError::Protocol("سر الاقتران المخزّن تالف؛ اقرن الهاتف من جديد".into())
+            })?;
+            let addrs = match (channel, cfg.wifi_addr) {
+                (_, Some(fixed)) => vec![fixed],
+                (Channel::Media, None) => {
+                    shared.wifi_addr.lock().unwrap().iter().copied().collect()
+                }
+                (Channel::Control, None) => {
+                    wifi::candidates(phone, Duration::from_millis(1500)).await
+                }
+            };
+            let mut last = ConnectError::NotListening;
+            for addr in addrs {
+                match tls_connect(addr, Some(pin)).await {
+                    Ok((mut conn, fp)) => {
+                        handshake(
+                            &mut conn,
+                            channel,
+                            &AuthKey::Tls {
+                                key: secret,
+                                fingerprint: fp,
+                            },
+                        )
+                        .await?;
+                        if channel == Channel::Control {
+                            *shared.wifi_addr.lock().unwrap() = Some(addr);
+                        }
+                        return Ok(conn);
+                    }
+                    // Another certificate is final: do not go on to other addresses.
+                    Err(ConnectError::CertificateChanged) => {
+                        return Err(ConnectError::CertificateChanged)
+                    }
+                    Err(e) => last = e,
+                }
+            }
+            Err(last)
+        }
     }
 }
 
@@ -852,11 +939,12 @@ async fn connect_authenticated(cfg: &Config, channel: Channel) -> Result<TcpStre
 /// connection (rotation, bit rate, pongs, errors) until the phone closes it.
 async fn open_control(
     cfg: &Config,
+    route: &Route,
     shared: &Arc<Shared>,
     tx: &Tx,
 ) -> Result<tokio::task::JoinHandle<()>, ConnectError> {
     shared.reset_link();
-    let mut s = connect_authenticated(cfg, Channel::Control).await?;
+    let mut s = connect_authenticated(cfg, route, shared, Channel::Control).await?;
     let hello = tokio::time::timeout(HANDSHAKE_TIMEOUT, read_message(&mut s))
         .await
         .map_err(|_| ConnectError::NotListening)?
@@ -921,7 +1009,7 @@ async fn open_control(
         .await;
     }
 
-    let (mut read_half, write_half) = s.into_split();
+    let (mut read_half, write_half) = tokio::io::split(s);
     *shared.writer.lock().await = Some(write_half);
     let tx = tx.clone();
     let shared = shared.clone();
@@ -935,13 +1023,13 @@ async fn open_control(
 
 /// Pings the phone every second. Fires `dead` when the phone has said nothing for [`LINK_TIMEOUT`] (a pulled
 /// cable or a frozen app: TCP alone may not notice for minutes) or when a ping cannot be written.
-async fn heartbeat(shared: Arc<Shared>, dead: Arc<Notify>) {
+async fn heartbeat(shared: Arc<Shared>, dead: Arc<Notify>, timeout: Duration) {
     shared.touch();
     let mut tick = tokio::time::interval(PING_INTERVAL);
     tick.tick().await;
     loop {
         tick.tick().await;
-        if shared.since_seen() > LINK_TIMEOUT {
+        if shared.since_seen() > timeout {
             dead.notify_one();
             return;
         }
@@ -975,33 +1063,85 @@ async fn run_inner(cfg: &Config, tx: &Tx, shared: &Arc<Shared>) -> Result<(), Pr
     let mut link = LinkTracker(None);
     // True right after the token was handed to the phone: a refusal then is final, not a stale token.
     let mut fresh = false;
-    if cfg.setup_adb {
-        link.set(tx, LinkState::Preparing);
-        adb_forward(cfg).await?;
-        log(tx, format!("✓ adb forward على المنفذ {}\n", cfg.port));
-        provision(cfg).await?;
-        log(tx, "🔑 تم تزويد الهاتف بمفتاح جلسة جديد.\n");
-        fresh = true;
+    let no_phone = || {
+        Problem::new(
+            ProblemCode::NoPairedPhone,
+            "لا يوجد هاتف مقترن لاستعمال Wi-Fi. اقرن هاتفاً أولاً (زر «اقتران هاتف جديد»).",
+        )
+    };
+    let mut route = Route::Usb;
+    match cfg.transport {
+        Transport::Usb => {}
+        Transport::Wifi => route = Route::Wifi(cfg.wifi.clone().ok_or_else(no_phone)?),
+        Transport::Auto => {
+            if let (true, Some(phone)) = (cfg.setup_adb, &cfg.wifi) {
+                // A plugged-in phone wins; with none, use the paired one over the network.
+                link.set(tx, LinkState::Preparing);
+                match adb_forward(&cfg.adb, cfg.port).await {
+                    Ok(()) => {}
+                    Err(p) if matches!(p.code, ProblemCode::NoDevice | ProblemCode::AdbMissing) => {
+                        route = Route::Wifi(phone.clone())
+                    }
+                    Err(p) => return Err(p),
+                }
+            }
+        }
     }
+    match &route {
+        Route::Usb if cfg.setup_adb => {
+            link.set(tx, LinkState::Preparing);
+            adb_forward(&cfg.adb, cfg.port).await?;
+            log(tx, format!("✓ adb forward على المنفذ {}\n", cfg.port));
+            provision(&cfg.adb, &cfg.token).await?;
+            log(tx, "🔑 تم تزويد الهاتف بمفتاح جلسة جديد.\n");
+            fresh = true;
+        }
+        Route::Usb => {}
+        Route::Wifi(phone) => {
+            link.set(tx, LinkState::Preparing);
+            log(
+                tx,
+                format!(
+                    "📶 الاتصال عبر Wi-Fi بالهاتف «{}» (تشفير TLS).\n",
+                    phone.name
+                ),
+            );
+        }
+    }
+    let heartbeat_timeout = match route {
+        Route::Usb => LINK_TIMEOUT,
+        Route::Wifi(_) => WIFI_LINK_TIMEOUT,
+    };
     let mut hinted = false;
     loop {
         let _ = tx.send(Event::State(State::Connecting));
-        match open_control(cfg, shared, tx).await {
+        match open_control(cfg, &route, shared, tx).await {
             Err(ConnectError::NotListening) => {
                 link.set(tx, LinkState::WaitingForApp);
                 if !hinted {
-                    log(tx, "بانتظار الهاتف: افتح تطبيق Enki واضغط Start (وإن كان مفتوحاً فتأكد أنه من نفس إصدار برنامج الحاسوب).\n");
+                    match route {
+                        Route::Usb => log(tx, "بانتظار الهاتف: افتح تطبيق Enki واضغط Start (وإن كان مفتوحاً فتأكد أنه من نفس إصدار برنامج الحاسوب).\n"),
+                        Route::Wifi(_) => log(tx, "بانتظار الهاتف على الشبكة: افتح تطبيق Enki واضغط Start، وتأكد أن «السماح باتصال Wi-Fi» مفعّل وأن الهاتف والحاسوب على نفس الشبكة.\n"),
+                    }
                     hinted = true;
                 }
             }
-            Err(ConnectError::Auth(status)) if cfg.setup_adb && !fresh => {
+            Err(ConnectError::Auth(_)) if matches!(route, Route::Wifi(_)) => {
+                return Err(Problem::new(
+                    ProblemCode::NotPaired,
+                    "الهاتف لم يعد يعرف هذا الحاسوب (حُذف الاقتران أو مُسحت بيانات التطبيق). احذف الهاتف من القائمة واقرنه من جديد.",
+                ));
+            }
+            Err(ConnectError::Auth(status))
+                if cfg.setup_adb && !fresh && matches!(route, Route::Usb) =>
+            {
                 // The phone app was restarted since we gave it the token, so it lost it: give it again.
                 log(
                     tx,
                     format!("🔑 الهاتف لا يملك المفتاح الحالي ({status:?})، أعيد تزويده.\n"),
                 );
                 link.set(tx, LinkState::Preparing);
-                provision(cfg).await?;
+                provision(&cfg.adb, &cfg.token).await?;
                 fresh = true;
                 continue;
             }
@@ -1009,12 +1149,24 @@ async fn run_inner(cfg: &Config, tx: &Tx, shared: &Arc<Shared>) -> Result<(), Pr
             Ok(control_reader) => {
                 let mut control_reader = AbortOnDrop(control_reader);
                 fresh = false;
+                if let Route::Wifi(phone) = &route {
+                    if let Some(addr) = *shared.wifi_addr.lock().unwrap() {
+                        let _ = tx.send(Event::WifiConnected {
+                            id: phone.id.clone(),
+                            host: addr.ip().to_string(),
+                        });
+                    }
+                }
                 link.set(tx, LinkState::Ready);
                 let dead = Arc::new(Notify::new());
-                let _beat = AbortOnDrop(tokio::spawn(heartbeat(shared.clone(), dead.clone())));
+                let _beat = AbortOnDrop(tokio::spawn(heartbeat(
+                    shared.clone(),
+                    dead.clone(),
+                    heartbeat_timeout,
+                )));
                 let outcome = tokio::select! {
                     r = async {
-                        match connect_authenticated(cfg, Channel::Media).await {
+                        match connect_authenticated(cfg, &route, shared, Channel::Media).await {
                             Ok(stream) => session(cfg, stream, tx, shared).await,
                             Err(ConnectError::NotListening) => Ok(0),
                             Err(e) => Err(e.problem()),
@@ -1047,8 +1199,8 @@ async fn run_inner(cfg: &Config, tx: &Tx, shared: &Arc<Shared>) -> Result<(), Pr
 
 /// Gives the phone this session's token: `adb shell content call` on the app's provider, which accepts it only
 /// from the adb shell. Another app on the phone cannot do that, so it never learns the token.
-async fn provision(cfg: &Config) -> Result<(), Problem> {
-    let out = Command::new(&cfg.adb)
+async fn provision(adb: &str, token: &[u8; TOKEN_LEN]) -> Result<(), Problem> {
+    let out = Command::new(adb)
         .args([
             "shell",
             "content",
@@ -1058,7 +1210,7 @@ async fn provision(cfg: &Config) -> Result<(), Problem> {
             "--method",
             "provision",
             "--arg",
-            &to_hex(&cfg.token),
+            &to_hex(token),
         ])
         .stdin(Stdio::null())
         .output()
@@ -1093,9 +1245,9 @@ async fn provision(cfg: &Config) -> Result<(), Problem> {
     ))
 }
 
-async fn adb_forward(cfg: &Config) -> Result<(), Problem> {
-    let spec = format!("tcp:{}", cfg.port);
-    let out = Command::new(&cfg.adb)
+async fn adb_forward(adb: &str, port: u16) -> Result<(), Problem> {
+    let spec = format!("tcp:{port}");
+    let out = Command::new(adb)
         .args(["forward", &spec, &spec])
         .stdin(Stdio::null())
         .output()
@@ -1216,7 +1368,7 @@ impl Sink {
 /// the phone side went away at once). Fatal problems (bad protocol, ffmpeg failure) are returned as `Err`.
 async fn session(
     cfg: &Config,
-    mut stream: TcpStream,
+    mut stream: Conn,
     tx: &Tx,
     shared: &Arc<Shared>,
 ) -> Result<u64, Problem> {
@@ -1286,7 +1438,7 @@ enum PumpError {
 
 #[allow(clippy::too_many_arguments)]
 async fn pump_frames(
-    stream: &mut TcpStream,
+    stream: &mut Conn,
     sink: &mut Sink,
     counters: &Counters,
     cfg: &Config,
@@ -1476,3 +1628,5 @@ pub fn pick_default_device(devices: &[(String, String)]) -> Option<String> {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod wifi_tests;

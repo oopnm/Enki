@@ -14,7 +14,7 @@ screens, then the look.
 | 4 | Unified settings engine, i18n skeleton, design tokens | done, tested (PR #4) |
 | 5 | DroidCam-class camera settings and live preview | done, tested (PR #5) |
 | 6 | "Abzu" theme, wave animation, full translations | done, tested (PR #6) |
-| 7 | Wi-Fi, pairing and encryption (moved before audio, 2026-11-23) | planned |
+| 7 | Wi-Fi, pairing and encryption (moved before audio, 2026-11-23) | built, waiting for his phone test |
 | 8 | Microphone and audio | planned |
 | 9 | Polish and 1.0 | planned |
 
@@ -150,10 +150,10 @@ expected under 1%).
 
 ## Phase 7: Wi-Fi and pairing
 
-- mDNS discovery and pairing with a QR code carrying the address, the
-  certificate fingerprint and a one-time token.
-- Mutual TLS 1.3 with pinned certificates, so nobody on the network can see the
-  camera.
+- mDNS discovery and pairing with a one-time code typed on the phone (or over
+  USB). A QR code shown by the PC is a later add-on.
+- TLS with a pinned phone certificate plus a paired secret, so nobody on the
+  network can see or use the camera (see `docs/protocol.md`, "Wi-Fi").
 - USB, Wi-Fi and hotspot all use the same protocol from phase 3.
 
 ## Phase 8: Audio

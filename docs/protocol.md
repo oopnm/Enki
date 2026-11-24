@@ -181,3 +181,37 @@ last combination that produced a picture, through the normal settings path, so b
 ISO, shutter, white balance, torch, stabilisation, noise reduction, anti-flicker) are applied to the running stream
 without a restart; controls the camera does not report as supported are ignored. The `filter.*`, `video.flip` and
 `video.resolution` output size are applied by the PC's ffmpeg (the decoder restarts when they change).
+
+## Wi-Fi (phase 7)
+
+The phone listens on TCP port **28201** (when `wifi.enabled` is on). The connection is TLS (the PC is the client, the
+phone the server); the phone has a self-signed EC P-256 certificate created on first use. There is no certificate
+authority: trust comes from a **pin**, the SHA-256 of the phone's certificate (DER), stored by the PC when pairing.
+Inside TLS the normal preamble, challenge and channel layout of v1 apply unchanged.
+
+**Authentication.** `auth_mac_tls = HMAC-SHA256(secret, "ENKI-AUTH-2" || channel || fingerprint || nonce)`, where
+`fingerprint` is the certificate the PC actually saw. A man in the middle must present another certificate, so the PC's
+MAC contains the wrong fingerprint and the real phone rejects it. A PC that has a pin refuses any other certificate
+(`CertificateChanged`). The verdict byte is Ok / BadToken / NotProvisioned as on USB.
+
+**Pairing.** The phone shows nothing secret on the network: the user types the PC's one-time code on the phone, or pairs
+over USB.
+- Code: 10 symbols from `0123456789ABCDEFGHJKMNPQRSTVWXYZ`, shown `ABCDE-FGHJK`; normalised by upper-casing, dropping
+  spaces and dashes, O→0, I/L→1. Key = PBKDF2-HMAC-SHA256(code, salt `ENKI-PAIR-1`, 20000 rounds). The phone opens an
+  *offer* for 180 s (5 failed attempts close it); the offer only allows the `pair` message.
+- `pair {name, device}` (PC→phone) is answered with `paired {secret, fingerprint, name, device_id, port, hosts}`; the PC
+  saves it in `phones.toml` (mode 0600). Over USB the session token is enough to send `pair`.
+
+**Auth levels on the phone:** paired secret (whole protocol), offer key (pair only), session token over loopback (whole
+protocol, including `pair`).
+
+**Discovery.** mDNS service `_enki._tcp.local.` with the phone id in its attributes; the PC also tries the last known
+address and the `hosts` list from pairing.
+
+**Timeouts.** Heartbeat loss is declared after 6 s on the PC and 8 s on the phone over Wi-Fi (3 s / 5 s on USB).
+
+**Transport setting.** `link.transport` = auto (USB if adb sees a device, else a paired phone), usb or wifi.
+
+Deviation from the first roadmap text: authentication uses the paired secret plus the pin instead of a client
+certificate (TLS 1.2 on Android 9 anyway), and scanning a QR code on the phone is postponed; the PC could later show
+the same code as a QR.

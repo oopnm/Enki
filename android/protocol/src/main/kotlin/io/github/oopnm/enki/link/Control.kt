@@ -66,6 +66,10 @@ object ControlMessages {
     fun settingReject(key: String, hlc: Hlc, device: String, code: String, message: String): String =
         """{"type":"setting_reject","key":${quote(key)},"hlc":${hlc(hlc)},"device":${quote(device)},"code":${quote(code)},"message":${quote(message)}}"""
 
+    /** Answer to `pair` (docs/protocol.md): the secret for this computer, the certificate fingerprint, and where to find the phone. */
+    fun paired(secretHex: String, fingerprintHex: String, name: String, deviceId: String, port: Int, hosts: List<String>): String =
+        """{"type":"paired","secret":${quote(secretHex)},"fingerprint":${quote(fingerprintHex)},"name":${quote(name)},"device_id":${quote(deviceId)},"port":$port,"hosts":${strings(hosts)}}"""
+
     fun pong(seq: Long): String = """{"type":"pong","seq":$seq}"""
 
     fun stateInt(key: String, value: Int): String = """{"type":"state","key":${quote(key)},"value":$value}"""

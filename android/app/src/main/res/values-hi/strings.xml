@@ -109,4 +109,16 @@
     <string name="setting_ui_language__ja">日本語</string>
     <string name="setting_ui_language__hi">हिन्दी</string>
     <string name="setting_ui_reduce_motion">गति कम करें (शांत पानी, चलती लहरें नहीं)</string>
+    <string name="wifi_forget">भूलें</string>
+    <string name="setting_wifi_enabled">Wi-Fi कनेक्शन की अनुमति दें</string>
+    <string name="wifi_help">चालू होने पर, उसी नेटवर्क पर जोड़ा गया कंप्यूटर बिना केबल के कनेक्ट हो सकता है। कनेक्शन एन्क्रिप्टेड है।</string>
+    <string name="wifi_pair_title">कंप्यूटर जोड़ें</string>
+    <string name="wifi_pair_hint">कंप्यूटर पर दिखाया गया कोड</string>
+    <string name="wifi_pair_button">जोड़ें</string>
+    <string name="wifi_pair_bad">कोड में 10 अक्षर और अंक होते हैं</string>
+    <string name="wifi_waiting">अब कंप्यूटर पर जोड़ना शुरू करें (3 मिनट)…</string>
+    <string name="wifi_paired_computers">जोड़े गए कंप्यूटर</string>
+    <string name="wifi_no_computers">अभी कोई कंप्यूटर नहीं जोड़ा गया</string>
+    <string name="wifi_addresses">इस फ़ोन का पता:</string>
+    <string name="wifi_paired_ok">कंप्यूटर से जुड़ गया</string>
 </resources>

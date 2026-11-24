@@ -1,0 +1,8 @@
+# Pairing key vectors (shared by Rust and Android tests)
+# key = PBKDF2-HMAC-SHA256(password = normalized code, salt = "ENKI-PAIR-1", 20000 iterations, 32 bytes)
+# normalized: upper case, only the 32 symbols 0123456789ABCDEFGHJKMNPQRSTVWXYZ; O->0, I and L->1; spaces and dashes dropped
+# raw_code|normalized|key_hex
+ABCDE-FGHJK|ABCDEFGHJK|4d8968ccea30a0f277d1a9fe822f93cdeef6a919d791a188d164bf3c2748d985
+abcde fghjk|ABCDEFGHJK|4d8968ccea30a0f277d1a9fe822f93cdeef6a919d791a188d164bf3c2748d985
+0123456789|0123456789|d775454a8b53830f579b02c71eb47abad46b473b73992bf786a20138f9dcacfc
+OIL0O-1l1I1|0110011111|53ce54d8358433a2e4b798d1eb0dde82220dbc64e8d2c1656be9a7ee9402c606

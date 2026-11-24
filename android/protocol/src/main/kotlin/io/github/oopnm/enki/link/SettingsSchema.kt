@@ -41,6 +41,8 @@ object SettingsSchema {
         SettingDef("ui.reduce_motion", "app", SettingKind.Bool, false, Scope.LOCAL, Apply.PASSIVE, true),
         SettingDef("source.mode", "app", SettingKind.Choice(listOf("enki_camera", "scrcpy_camera", "screen_window", "screen_v4l2")), "enki_camera", Scope.LOCAL, Apply.PASSIVE, false),
         SettingDef("output.device", "app", SettingKind.Text(64), "/dev/video10", Scope.LOCAL, Apply.PASSIVE, false),
+        SettingDef("link.transport", "link", SettingKind.Choice(listOf("auto", "usb", "wifi")), "auto", Scope.LOCAL, Apply.PASSIVE, false),
+        SettingDef("wifi.enabled", "phone", SettingKind.Bool, false, Scope.LOCAL, Apply.PASSIVE, true),
     )
 
     fun get(key: String): SettingDef? = defs.firstOrNull { it.key == key }

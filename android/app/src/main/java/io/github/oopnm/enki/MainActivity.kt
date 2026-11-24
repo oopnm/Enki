@@ -19,7 +19,10 @@ import android.widget.FrameLayout
 import android.widget.SeekBar
 import android.widget.AdapterView
 import android.widget.ArrayAdapter
+import android.text.InputFilter
+import android.text.InputType
 import android.widget.Button
+import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.Spinner
@@ -52,6 +55,7 @@ class MainActivity : Activity() {
     /** True while the controls are being set from the stored values, so that does not count as a user change. */
     private var rendering = false
     private val redraw: () -> Unit = { runOnUiThread { renderSettings() } }
+    private val wifiRedraw: () -> Unit = { runOnUiThread { renderSettings() } }
 
     override fun attachBaseContext(base: Context) {
         super.attachBaseContext(LocaleHelper.wrap(base))
@@ -160,6 +164,7 @@ class MainActivity : Activity() {
         super.onStart()
         EnkiState.listener = { runOnUiThread { render() } }
         EnkiSettings.changeListeners.add(redraw)
+        WifiState.changeListeners.add(wifiRedraw)
         AbzuMotion.setForeground(hasWindowFocus())
         render()
         renderSettings()
@@ -175,6 +180,7 @@ class MainActivity : Activity() {
         AbzuMotion.setForeground(false)
         EnkiState.listener = null
         EnkiSettings.changeListeners.remove(redraw)
+        WifiState.changeListeners.remove(wifiRedraw)
         super.onStop()
     }
 
@@ -313,9 +319,86 @@ class MainActivity : Activity() {
             )
             card.addView(CuneiformView(this, group.key))
             for (def in group.value) card.addView(controlFor(def))
+            if (group.key == "phone") card.addView(wifiBlock())
             settingsBox.addView(card)
         }
         rendering = false
+    }
+
+    /** Under the Wi-Fi switch: what it does, this phone's address, typing the code from the computer, and the paired computers. */
+    private fun wifiBlock(): View {
+        val dp = resources.displayMetrics.density
+        val dim = withAlpha(getColor(R.color.enki_foam), 0.65f)
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(0, (4 * dp).toInt(), 0, (4 * dp).toInt())
+        }
+        fun text(value: String, size: Float, color: Int = dim, bold: Boolean = false) = TextView(this).apply {
+            this.text = value
+            textSize = size
+            setTextColor(color)
+            if (bold) typeface = Typeface.DEFAULT_BOLD
+            setPadding(0, (6 * dp).toInt(), 0, 0)
+        }
+        box.addView(text(getString(R.string.wifi_help), 13f))
+        val hosts = WifiState.hosts()
+        if (hosts.isNotEmpty()) box.addView(text(getString(R.string.wifi_addresses) + " " + hosts.joinToString(", "), 13f))
+
+        box.addView(text(getString(R.string.wifi_pair_title), 15f, getColor(R.color.enki_foam), bold = true))
+        val code = EditText(this).apply {
+            hint = getString(R.string.wifi_pair_hint)
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+            filters = arrayOf(InputFilter.LengthFilter(12))
+            setTextColor(getColor(R.color.enki_foam))
+            setHintTextColor(dim)
+            isSingleLine = true
+        }
+        val pair = Button(this).apply {
+            text = getString(R.string.wifi_pair_button)
+            styleButton(this, primary = true)
+            setOnClickListener {
+                if (!WifiState.openOffer(code.text.toString())) {
+                    Toast.makeText(this@MainActivity, R.string.wifi_pair_bad, Toast.LENGTH_LONG).show()
+                } else {
+                    // Pairing needs the Wi-Fi listener, which lives in the running service.
+                    if (!EnkiSettings.getBool("wifi.enabled")) EnkiSettings.setByUser("wifi.enabled", true)
+                    if (!EnkiState.running) onToggle()
+                    Toast.makeText(this@MainActivity, R.string.wifi_waiting, Toast.LENGTH_LONG).show()
+                }
+            }
+        }
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            addView(code, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+            addView(pair, LinearLayout.LayoutParams(-2, -2).apply { marginStart = (8 * dp).toInt() })
+        }
+        box.addView(row)
+        if (WifiState.offer() != null) box.addView(text(getString(R.string.wifi_waiting), 13f, getColor(R.color.enki_aqua)))
+
+        box.addView(text(getString(R.string.wifi_paired_computers), 15f, getColor(R.color.enki_foam), bold = true))
+        val computers = WifiState.computers()
+        if (computers.isEmpty()) box.addView(text(getString(R.string.wifi_no_computers), 13f))
+        for (computer in computers) {
+            val line = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
+            line.addView(
+                TextView(this).apply {
+                    text = computer.name
+                    textSize = 15f
+                    setTextColor(getColor(R.color.enki_foam))
+                },
+                LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f),
+            )
+            line.addView(
+                Button(this).apply {
+                    text = getString(R.string.wifi_forget)
+                    styleButton(this, primary = false)
+                    setOnClickListener { WifiState.forget(computer.id) }
+                },
+            )
+            box.addView(line)
+        }
+        return box
     }
 
     private fun controlFor(def: SettingDef): View {

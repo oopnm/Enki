@@ -109,4 +109,16 @@
     <string name="setting_ui_language__ja">日本語</string>
     <string name="setting_ui_language__hi">हिन्दी</string>
     <string name="setting_ui_reduce_motion">Уменьшить анимацию (спокойная вода, без движущихся волн)</string>
+    <string name="wifi_forget">Забыть</string>
+    <string name="setting_wifi_enabled">Разрешить подключения по Wi-Fi</string>
+    <string name="wifi_help">Если включено, сопряжённый компьютер в той же сети подключается без кабеля. Соединение зашифровано.</string>
+    <string name="wifi_pair_title">Сопрячь компьютер</string>
+    <string name="wifi_pair_hint">Код, показанный на компьютере</string>
+    <string name="wifi_pair_button">Сопрячь</string>
+    <string name="wifi_pair_bad">Код состоит из 10 букв и цифр</string>
+    <string name="wifi_waiting">Теперь начните сопряжение на компьютере (3 минуты)…</string>
+    <string name="wifi_paired_computers">Сопряжённые компьютеры</string>
+    <string name="wifi_no_computers">Компьютеров пока нет</string>
+    <string name="wifi_addresses">Адрес этого телефона:</string>
+    <string name="wifi_paired_ok">Сопряжено с компьютером</string>
 </resources>

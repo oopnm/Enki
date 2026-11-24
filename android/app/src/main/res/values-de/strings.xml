@@ -109,4 +109,16 @@
     <string name="setting_ui_language__ja">日本語</string>
     <string name="setting_ui_language__hi">हिन्दी</string>
     <string name="setting_ui_reduce_motion">Bewegung reduzieren (ruhiges Wasser, keine bewegten Wellen)</string>
+    <string name="wifi_forget">Vergessen</string>
+    <string name="setting_wifi_enabled">WLAN-Verbindungen erlauben</string>
+    <string name="wifi_help">Wenn aktiviert, kann sich ein gekoppelter Computer im selben Netzwerk ohne Kabel verbinden. Die Verbindung ist verschlüsselt.</string>
+    <string name="wifi_pair_title">Computer koppeln</string>
+    <string name="wifi_pair_hint">Code, der auf dem Computer steht</string>
+    <string name="wifi_pair_button">Koppeln</string>
+    <string name="wifi_pair_bad">Der Code hat 10 Buchstaben und Ziffern</string>
+    <string name="wifi_waiting">Starte jetzt die Kopplung am Computer (3 Minuten)…</string>
+    <string name="wifi_paired_computers">Gekoppelte Computer</string>
+    <string name="wifi_no_computers">Noch kein Computer gekoppelt</string>
+    <string name="wifi_addresses">Adresse dieses Telefons:</string>
+    <string name="wifi_paired_ok">Mit einem Computer gekoppelt</string>
 </resources>

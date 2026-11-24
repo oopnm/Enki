@@ -109,4 +109,16 @@
     <string name="setting_ui_language__ja">日本語</string>
     <string name="setting_ui_language__hi">हिन्दी</string>
     <string name="setting_ui_reduce_motion">Hareketi azalt (durgun su, hareketli dalga yok)</string>
+    <string name="wifi_forget">Unut</string>
+    <string name="setting_wifi_enabled">Wi-Fi bağlantılarına izin ver</string>
+    <string name="wifi_help">Açıkken aynı ağdaki eşleşmiş bir bilgisayar kablosuz bağlanabilir. Bağlantı şifrelidir.</string>
+    <string name="wifi_pair_title">Bilgisayar eşleştir</string>
+    <string name="wifi_pair_hint">Bilgisayarda gösterilen kod</string>
+    <string name="wifi_pair_button">Eşleştir</string>
+    <string name="wifi_pair_bad">Kod 10 harf ve rakamdan oluşur</string>
+    <string name="wifi_waiting">Şimdi bilgisayarda eşleştirmeyi başlatın (3 dakika)…</string>
+    <string name="wifi_paired_computers">Eşleşmiş bilgisayarlar</string>
+    <string name="wifi_no_computers">Henüz eşleşmiş bilgisayar yok</string>
+    <string name="wifi_addresses">Bu telefonun adresi:</string>
+    <string name="wifi_paired_ok">Bir bilgisayarla eşleşti</string>
 </resources>
